@@ -72,6 +72,10 @@ struct QSBIEAPI_EXPORT SSbieCaptureStart
     quint32 Flags = eIncludeFutureProcesses;
     quint32 ProcessId = 0;
     QString BoxName;
+    quint32 SnapLength = 0;
+    quint32 MaxFileBytes = 0;
+    quint32 MaxSeconds = 0;
+    quint32 RotateCount = 0;
 };
 
 

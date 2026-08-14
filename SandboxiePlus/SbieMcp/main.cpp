@@ -269,9 +269,9 @@ static bool ReadOptionalBool(
 }
 
 
-static bool ReadOptionalUInt32(
-    const QJsonObject& Object, const QString& Name, quint32 *Value,
-    bool *Present)
+static bool ReadOptionalUInt32Range(
+    const QJsonObject& Object, const QString& Name, double Minimum,
+    double Maximum, quint32 *Value, bool *Present)
 {
     *Present = Object.contains(Name);
     if (!*Present) {
@@ -284,12 +284,30 @@ static bool ReadOptionalUInt32(
         return false;
 
     const double Number = JsonValue.toDouble();
-    if (!std::isfinite(Number) || Number < 1 || Number > 4294967295.0 ||
-            std::floor(Number) != Number)
+    if (!std::isfinite(Number) || Number < Minimum ||
+            Number > Maximum || std::floor(Number) != Number)
         return false;
 
     *Value = (quint32)Number;
     return true;
+}
+
+
+static bool ReadOptionalUInt32(
+    const QJsonObject& Object, const QString& Name, quint32 *Value,
+    bool *Present)
+{
+    return ReadOptionalUInt32Range(
+        Object, Name, 1, 4294967295.0, Value, Present);
+}
+
+
+static bool ReadOptionalUInt32AllowZero(
+    const QJsonObject& Object, const QString& Name, quint32 *Value,
+    bool *Present)
+{
+    return ReadOptionalUInt32Range(
+        Object, Name, 0, 4294967295.0, Value, Present);
 }
 
 
@@ -445,7 +463,11 @@ private:
                     {"processId", QJsonObject{{"type", "integer"}, {"minimum", 1}, {"maximum", 4294967295.0}}},
                     {"mode", QJsonObject{{"type", "string"}, {"enum", QJsonArray{"connections", "packets", "https"}}}},
                     {"includeFutureProcesses", QJsonObject{{"type", "boolean"}}},
-                    {"includeLoopback", QJsonObject{{"type", "boolean"}}}
+                    {"includeLoopback", QJsonObject{{"type", "boolean"}}},
+                    {"snapLength", QJsonObject{{"type", "integer"}, {"minimum", 0}, {"maximum", 1514.0}}},
+                    {"maxFileBytes", QJsonObject{{"type", "integer"}, {"minimum", 0}, {"maximum", 4294967295.0}}},
+                    {"maxSeconds", QJsonObject{{"type", "integer"}, {"minimum", 0}, {"maximum", 86400}}},
+                    {"rotateCount", QJsonObject{{"type", "integer"}, {"minimum", 0}, {"maximum", 64}}}
                 }},
                 {"required", QJsonArray{"box"}},
                 {"additionalProperties", false}
@@ -570,7 +592,8 @@ private:
     {
         const QSet<QString> Allowed{
             "box", "processId", "mode", "includeFutureProcesses",
-            "includeLoopback"
+            "includeLoopback", "snapLength", "maxFileBytes", "maxSeconds",
+            "rotateCount"
         };
         if (!HasOnlyProperties(Arguments, Allowed) ||
                 !Arguments.value("box").isString() ||
@@ -604,6 +627,35 @@ private:
                                   &IncludeLoopback)) {
             return McpError(-32602, "Capture flags must be boolean");
         }
+
+        quint32 SnapLength = 0;
+        quint32 MaxFileBytes = 0;
+        quint32 MaxSeconds = 0;
+        quint32 RotateCount = 0;
+        bool HasSnapLength = false;
+        bool HasMaxFileBytes = false;
+        bool HasMaxSeconds = false;
+        bool HasRotateCount = false;
+        if (!ReadOptionalUInt32AllowZero(
+                    Arguments, "snapLength", &SnapLength, &HasSnapLength) ||
+                !ReadOptionalUInt32AllowZero(
+                    Arguments, "maxFileBytes", &MaxFileBytes,
+                    &HasMaxFileBytes) ||
+                !ReadOptionalUInt32AllowZero(
+                    Arguments, "maxSeconds", &MaxSeconds, &HasMaxSeconds) ||
+                !ReadOptionalUInt32AllowZero(
+                    Arguments, "rotateCount", &RotateCount,
+                    &HasRotateCount)) {
+            return McpError(
+                -32602,
+                "Capture limits must be unsigned 32-bit integers");
+        }
+        if ((HasSnapLength && SnapLength != 0 &&
+                    (SnapLength < 64 || SnapLength > 1514)) ||
+                (HasMaxSeconds && MaxSeconds > 86400) ||
+                (HasRotateCount && RotateCount > 64)) {
+            return McpError(-32602, "Capture limits are out of range");
+        }
         if (HasProcessId && IncludeFutureProcesses)
             return McpError(-32602,
                             "process-scoped capture cannot include future processes");
@@ -628,6 +680,10 @@ private:
             Options.Flags |= SSbieCaptureStart::eIncludeFutureProcesses;
         if (IncludeLoopback)
             Options.Flags |= SSbieCaptureStart::eIncludeLoopback;
+        Options.SnapLength = SnapLength;
+        Options.MaxFileBytes = MaxFileBytes;
+        Options.MaxSeconds = MaxSeconds;
+        Options.RotateCount = RotateCount;
 
         auto Result = m_Api.StartCapture(Options);
         if (Result.IsError())

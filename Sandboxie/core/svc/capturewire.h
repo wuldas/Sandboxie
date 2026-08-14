@@ -55,6 +55,11 @@
 #define CAPTURE_FLAG_INCLUDE_FUTURE_PROCESSES   0x00000001
 #define CAPTURE_FLAG_INCLUDE_LOOPBACK           0x00000002
 
+#define CAPTURE_SNAP_LENGTH_MIN                64
+#define CAPTURE_SNAP_LENGTH_MAX                1514
+#define CAPTURE_MAX_SECONDS                    86400
+#define CAPTURE_MAX_ROTATE_COUNT               64
+
 #define CAPTURE_ADDRESS_FAMILY_IPV4             2
 #define CAPTURE_ADDRESS_FAMILY_IPV6             23
 
@@ -153,8 +158,16 @@ typedef struct _CAPTURE_START_REQ {
     ULONG flags;
     ULONG target_pid;
     WCHAR box_name[BOXNAME_COUNT];
+    ULONG snap_length;
+    ULONG max_file_bytes;
+    ULONG max_seconds;
+    ULONG rotate_count;
+    ULONG reserved;
 
 } CAPTURE_START_REQ;
+
+#define CAPTURE_START_REQ_V1_SIZE \
+    ((ULONG)FIELD_OFFSET(CAPTURE_START_REQ, snap_length))
 
 
 typedef struct _CAPTURE_START_RPL {
@@ -275,6 +288,32 @@ typedef struct _CAPTURE_READ_EVENTS_RPL {
 } CAPTURE_READ_EVENTS_RPL;
 
 
+//---------------------------------------------------------------------------
+// Set Export File Handle
+//---------------------------------------------------------------------------
+
+
+typedef struct _CAPTURE_SET_EXPORT_REQ {
+
+    CAPTURE_VERSIONED_REQUEST v;
+    CAPTURE_SESSION_ID capture_id;
+    ULONG64 file_handle;
+    ULONG reserved;
+    ULONG reserved2;
+
+} CAPTURE_SET_EXPORT_REQ;
+
+
+typedef struct _CAPTURE_SET_EXPORT_RPL {
+
+    MSG_HEADER h;
+    ULONG wire_version;
+    ULONG struct_size;
+    CAPTURE_SESSION_INFO session;
+
+} CAPTURE_SET_EXPORT_RPL;
+
+
 #pragma pack(pop)
 
 
@@ -287,8 +326,16 @@ static_assert(sizeof(CAPTURE_SESSION_INFO) == 184,
               "capture session info size changed");
 static_assert(sizeof(CAPTURE_QUERY_CAPS_RPL) == 40,
               "capture capabilities reply size changed");
-static_assert(sizeof(CAPTURE_START_REQ) == 112,
+static_assert(sizeof(CAPTURE_START_REQ) == 132,
               "capture start request size changed");
+static_assert(CAPTURE_START_REQ_V1_SIZE == 112,
+              "capture start v1 size changed");
+static_assert(FIELD_OFFSET(CAPTURE_START_REQ, snap_length) == 112,
+              "capture start trailing fields moved");
+static_assert(sizeof(CAPTURE_SET_EXPORT_REQ) == 48,
+              "capture export request size changed");
+static_assert(sizeof(CAPTURE_SET_EXPORT_RPL) == 200,
+              "capture export reply size changed");
 static_assert(sizeof(CAPTURE_START_RPL) == 200,
               "capture start reply size changed");
 static_assert(sizeof(CAPTURE_SESSION_REQ) == 32,

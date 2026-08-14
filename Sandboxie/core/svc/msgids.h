@@ -158,6 +158,7 @@
 #define MSGID_CAPTURE_GET_STATUS                0x2004
 #define MSGID_CAPTURE_LIST                      0x2005
 #define MSGID_CAPTURE_READ_EVENTS               0x2006
+#define MSGID_CAPTURE_SET_EXPORT                0x2007
 #define MSGID_CAPTURE_NOTIFICATION              0x20FF
 
 //---------------------------------------------------------------------------

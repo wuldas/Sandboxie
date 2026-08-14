@@ -86,7 +86,24 @@ int main()
                      "list reply exceeds Capture reply limit") ||
             !Require(CAPTURE_DRIVER_MAX_READ_EVENTS ==
                      CAPTURE_MAX_EVENT_ENTRIES,
-                     "driver and service event batch limits differ")) {
+                     "driver and service event batch limits differ") ||
+            !Require(MSGID_CAPTURE_SET_EXPORT == 0x2007,
+                     "export msgid is not 0x2007") ||
+            !Require(CAPTURE_START_REQ_V1_SIZE == 112,
+                     "v1 start size changed") ||
+            !Require(FIELD_OFFSET(CAPTURE_START_REQ, snap_length) ==
+                     CAPTURE_START_REQ_V1_SIZE,
+                     "start trailing fields moved") ||
+            !Require(sizeof(CAPTURE_START_REQ) == 132,
+                     "extended start request size changed") ||
+            !Require(sizeof(CAPTURE_SET_EXPORT_REQ) == 48,
+                     "export request size changed") ||
+            !Require(sizeof(CAPTURE_SET_EXPORT_REQ) <=
+                     CAPTURE_MAX_REQUEST_SIZE,
+                     "export request exceeds service request limit") ||
+            !Require(sizeof(CAPTURE_SET_EXPORT_RPL) ==
+                     sizeof(CAPTURE_STATUS_RPL),
+                     "export reply size diverged from status")) {
         return 1;
     }
 
