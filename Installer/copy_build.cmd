@@ -100,6 +100,8 @@ copy %srcPath%\MiscHelpers.dll %instPath%\
 copy %srcPath%\MiscHelpers.pdb %instPath%\
 copy %srcPath%\QSbieAPI.dll %instPath%\
 copy %srcPath%\QSbieAPI.pdb %instPath%\
+copy /y %srcPath%\SbieMcp.exe %instPath%\ || exit /b 1
+copy /y %srcPath%\SbieMcp.pdb %instPath%\ || exit /b 1
 copy %srcPath%\QtSingleApp.dll %instPath%\
 copy %srcPath%\QtSingleApp.pdb %instPath%\
 copy %srcPath%\UGlobalHotkey.dll %instPath%\

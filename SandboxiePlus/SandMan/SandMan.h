@@ -20,6 +20,7 @@ class CFileView;
 class CBoxBorder;
 class CSbieTemplatesEx;
 class CTraceView;
+class CCaptureView;
 class CScriptManager;
 class CAddonManager;
 
@@ -216,6 +217,8 @@ public slots:
 	void				OpenCompat();
 
 	void				UpdateSettings(bool bRebuildUI);
+	void				OnBoxConnectionAudit();
+	void				OnProcessConnectionAudit();
 	void				RebuildUI();
 	void				OnIniReloaded();
 
@@ -282,6 +285,8 @@ private slots:
 	void				OnEditIni();
 	void				OnReloadIni();
 	void				OnMonitoring();
+	void				OnConnectionAudit();
+	void				ShowConnectionAudit(bool bStart);
 
 	void				OnSymbolStatus(const QString& Message);
 
@@ -374,6 +379,7 @@ private:
 	QTabWidget*			m_pLogTabs;
 	CPanelWidgetEx*		m_pMessageLog;
 	CTraceView*			m_pTraceView;
+	CCaptureView*		m_pCaptureView;
 	CPanelWidgetEx*		m_pRecoveryLog;
 	class CRecoveryLogWnd* m_pRecoveryLogWnd;
 
@@ -424,6 +430,7 @@ private:
 	QAction*			m_pCleanUpProcesses;
 	QAction*			m_pCleanUpMsgLog;
 	QAction*			m_pCleanUpTrace;
+	QAction*			m_pCleanUpCapture;
 	QAction*			m_pCleanUpRecovery;
 	QToolButton*		m_pCleanUpButton;
 	QToolButton*		m_pNewBoxButton;
@@ -443,6 +450,7 @@ private:
 	QAction*			m_pEditIni3;
 	QAction*			m_pReloadIni;
 	QAction*			m_pEnableMonitoring;
+	QAction*			m_pEnableCapture;
 
 	//QMenu*				m_pMenuTools;
 	QAction*			m_pBoxAssistant;

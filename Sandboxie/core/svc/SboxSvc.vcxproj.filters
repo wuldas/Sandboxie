@@ -44,6 +44,7 @@
       <Filter>NetProxy</Filter>
     </ClCompile>
     <ClCompile Include="EpMapperServer.cpp" />
+    <ClCompile Include="CaptureServer.cpp" />
     <ClCompile Include="fileserver.cpp" />
     <ClCompile Include="iphlpserver.cpp" />
     <ClCompile Include="namedpipeserver.cpp" />
@@ -127,6 +128,8 @@
     <ClInclude Include="terminalwire.h" />
     <ClInclude Include="EpMapperServer.h" />
     <ClInclude Include="EpMapperWire.h" />
+    <ClInclude Include="CaptureServer.h" />
+    <ClInclude Include="capturewire.h" />
     <ClInclude Include="fileserver.h" />
     <ClInclude Include="filewire.h" />
     <ClInclude Include="iphlpserver.h" />

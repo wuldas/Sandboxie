@@ -23,6 +23,7 @@
 #include "stdafx.h"
 
 #include "PipeServer.h"
+#include "capturewire.h"
 #include "misc.h"
 #include "msgids.h"
 #include "core/dll/sbiedll.h"
@@ -65,6 +66,7 @@ typedef struct tagCLIENT_PROCESS
 typedef struct tagCLIENT_THREAD
 {
     HANDLE idThread;
+    LARGE_INTEGER CreateTime;
     BOOLEAN replying;
     volatile BOOLEAN in_use;
     UCHAR sequence;
@@ -78,6 +80,7 @@ typedef struct tagCLIENT_TLS_DATA
 {
     HANDLE PortHandle;
     PORT_MESSAGE *PortMessage;
+    ULONG64 ProcessCreateTime;
 } CLIENT_TLS_DATA;
 
 
@@ -87,6 +90,29 @@ typedef struct tagCLIENT_TLS_DATA
 
 
 PipeServer *PipeServer::m_instance = NULL;
+
+
+static BOOLEAN PipeServer_QueryProcessCreateTime(
+    HANDLE idProcess, LARGE_INTEGER *createTime)
+{
+    createTime->QuadPart = 0;
+
+    HANDLE hProcess = OpenProcess(
+        PROCESS_QUERY_INFORMATION, FALSE, (ULONG)(ULONG_PTR)idProcess);
+    if (! hProcess)
+        return FALSE;
+
+    FILETIME time, time1, time2, time3;
+    BOOL ok = GetProcessTimes(hProcess, &time, &time1, &time2, &time3);
+    CloseHandle(hProcess);
+
+    if (! ok)
+        return FALSE;
+
+    createTime->HighPart = time.dwHighDateTime;
+    createTime->LowPart = time.dwLowDateTime;
+    return createTime->QuadPart != 0;
+}
 
 
 //---------------------------------------------------------------------------
@@ -437,12 +463,17 @@ void PipeServer::PortConnect(PORT_MESSAGE* msg)
     }
 
     client->idThread = msg->ClientId.UniqueThread;
+    client->idProcess = msg->ClientId.UniqueProcess;
+    client->CreateTime.QuadPart = 0;
     client->replying = FALSE;
     client->in_use = FALSE;
     client->sequence = 0;
     client->hPort = NULL;
     client->buf_hdr = NULL;
     client->buf_ptr = NULL;
+
+    PipeServer_QueryProcessCreateTime(
+        msg->ClientId.UniqueProcess, &client->CreateTime);
 
     //
 	// accept the connection, set the address of the client structure as PortContext
@@ -469,6 +500,10 @@ void PipeServer::PortConnect(PORT_MESSAGE *msg)
     NTSTATUS status;
     CLIENT_PROCESS *clientProcess;
     CLIENT_THREAD *clientThread;
+    LARGE_INTEGER connectionCreateTime;
+
+    PipeServer_QueryProcessCreateTime(
+        msg->ClientId.UniqueProcess, &connectionCreateTime);
 
     //
     // find a previous connection to that same client, or create a new one
@@ -477,6 +512,12 @@ void PipeServer::PortConnect(PORT_MESSAGE *msg)
     EnterCriticalSection(&m_lock);
 
     PortFindClientUnsafe(msg->ClientId, clientProcess, clientThread);
+
+    if (clientThread && connectionCreateTime.QuadPart &&
+            clientThread->CreateTime.QuadPart != connectionCreateTime.QuadPart) {
+        PortDisconnectHelper(clientProcess, clientThread);
+        PortFindClientUnsafe(msg->ClientId, clientProcess, clientThread);
+    }
 
     //
     // create new process and thread structures where needed
@@ -500,21 +541,7 @@ void PipeServer::PortConnect(PORT_MESSAGE *msg)
             // creation time, so it can be used later
             //
 
-            clientProcess->CreateTime.HighPart = 0;
-            clientProcess->CreateTime.LowPart = 0;
-            HANDLE hProcess = OpenProcess(
-                PROCESS_QUERY_INFORMATION, FALSE,
-                (ULONG)(ULONG_PTR)msg->ClientId.UniqueProcess);
-            if (hProcess) {
-                FILETIME time, time1, time2, time3;
-                BOOL ok = GetProcessTimes(
-                    hProcess, &time, &time1, &time2, &time3);
-                if (ok) {
-                    clientProcess->CreateTime.HighPart = time.dwHighDateTime;
-                    clientProcess->CreateTime.LowPart  = time.dwLowDateTime;
-                }
-                CloseHandle(hProcess);
-            }
+            clientProcess->CreateTime = connectionCreateTime;
 
             /*WCHAR msg[128];
             wsprintf(msg, L"PortConnect - Connected pid %d with timestamp %08X-%08X\n",
@@ -531,6 +558,7 @@ void PipeServer::PortConnect(PORT_MESSAGE *msg)
 
             memset(clientThread, 0, sizeof(CLIENT_THREAD));
             clientThread->idThread = msg->ClientId.UniqueThread;
+            clientThread->CreateTime = connectionCreateTime;
             map_insert(&clientProcess->thread_map, msg->ClientId.UniqueThread, clientThread, 0);
         }
     }
@@ -596,7 +624,12 @@ void PipeServer::PortDisconnectHelper(CLIENT_PROCESS *clientProcess, CLIENT_THRE
     if (!clientProcess)
         return;
 
+    HANDLE idProcess = clientProcess->idProcess;
+    ULONG64 processCreateTime = 0;
+
     if (clientThread) {
+
+        processCreateTime = (ULONG64)clientThread->CreateTime.QuadPart;
 
         while (clientThread->in_use)
             Sleep(3);
@@ -607,15 +640,24 @@ void PipeServer::PortDisconnectHelper(CLIENT_PROCESS *clientProcess, CLIENT_THRE
         if (clientThread->buf_hdr)
             FreeMsg(clientThread->buf_hdr);
         Pool_Free(clientThread, sizeof(CLIENT_THREAD));
+
+        BOOLEAN generationStillConnected = FALSE;
+        map_iter_t iter = map_iter();
+        while (map_next(&clientProcess->thread_map, &iter)) {
+            CLIENT_THREAD *otherThread = (CLIENT_THREAD *)iter.value;
+            if (otherThread->CreateTime.QuadPart ==
+                    (LONGLONG)processCreateTime) {
+                generationStillConnected = TRUE;
+                break;
+            }
+        }
+
+        if (! generationStillConnected)
+            NotifyTargets(idProcess, processCreateTime);
     }
 
-    
     if (clientProcess->thread_map.nnodes == 0) {
-
-        NotifyTargets(clientProcess->idProcess);
-
         map_remove(&m_client_map, clientProcess->idProcess);
-
         Pool_Free(clientProcess, sizeof(CLIENT_PROCESS));
     }
 }
@@ -630,11 +672,31 @@ void PipeServer::PortDisconnectHelper(CLIENT_PROCESS *clientProcess, CLIENT_THRE
 #ifdef USE_NEW_LPC_IMPL
 void PipeServer::PortDisconnect(PVOID PortContext)
 {
+    HANDLE idProcess = NULL;
+    ULONG64 processCreateTime = 0;
+    bool notify = false;
+
     EnterCriticalSection(&m_lock);
 
     auto F = m_Clients.find(PortContext);
-    if (F != m_Clients.end())
+    if (F != m_Clients.end()) {
+        idProcess = F->second->idProcess;
+        processCreateTime = (ULONG64)F->second->CreateTime.QuadPart;
 		m_Clients.erase(F);
+
+        notify = true;
+        for (const auto& pair : m_Clients) {
+            if (pair.second->idProcess == idProcess &&
+                    pair.second->CreateTime.QuadPart ==
+                    (LONGLONG)processCreateTime) {
+                notify = false;
+                break;
+            }
+        }
+
+        if (notify)
+            NotifyTargets(idProcess, processCreateTime);
+    }
 
     LeaveCriticalSection(&m_lock);
 }
@@ -719,47 +781,46 @@ void PipeServer::PortDisconnectByCreateTime(LARGE_INTEGER *CreateTime)
 	while (map_next(&m_client_map, &iter)) {
 
         clientProcess = (CLIENT_PROCESS *)iter.value;
-        if (clientProcess->CreateTime.HighPart == CreateTime->HighPart &&
-            clientProcess->CreateTime.LowPart  == CreateTime->LowPart) {
+        map_iter_t sub_iter = map_iter();
+	    while (map_next(&clientProcess->thread_map, &sub_iter)) {
 
-            map_iter_t sub_iter = map_iter();
-	        while (map_next(&clientProcess->thread_map, &sub_iter)) {
-
-                clientThread = (CLIENT_THREAD *)sub_iter.value;
-
-                //
-                // for each thread in the process, assume it is stale,
-                // unless we can open it, and it still has the same
-                // process id
-                //
-
-                BOOLEAN DeleteThread = TRUE;
-
-                HANDLE hThread = OpenThread(
-                    THREAD_QUERY_INFORMATION, FALSE,
-                    (ULONG)(ULONG_PTR)clientThread->idThread);
-                if (hThread) {
-                    HANDLE ThreadProcessId = pGetProcessIdOfThread(hThread);
-                    if (ThreadProcessId == clientProcess->idProcess)
-                        DeleteThread = FALSE;
-                    CloseHandle(hThread);
-                }
-
-                //
-                // fix-me: when closing the port without waiting some ms after the 
-                //          thread terminated this fails and the client object is not cleared
-                //
-
-                if (DeleteThread) {
-
-                    break;
-                }
-
+            clientThread = (CLIENT_THREAD *)sub_iter.value;
+            if (clientThread->CreateTime.QuadPart != CreateTime->QuadPart) {
                 clientThread = NULL;
+                continue;
             }
 
-            break;
+            //
+            // for each thread in the process, assume it is stale,
+            // unless we can open it, and it still has the same
+            // process id
+            //
+
+            BOOLEAN DeleteThread = TRUE;
+
+            HANDLE hThread = OpenThread(
+                THREAD_QUERY_INFORMATION, FALSE,
+                (ULONG)(ULONG_PTR)clientThread->idThread);
+            if (hThread) {
+                HANDLE ThreadProcessId = pGetProcessIdOfThread(hThread);
+                if (ThreadProcessId == clientProcess->idProcess)
+                    DeleteThread = FALSE;
+                CloseHandle(hThread);
+            }
+
+            //
+            // fix-me: when closing the port without waiting some ms after the
+            //          thread terminated this fails and the client object is not cleared
+            //
+
+            if (DeleteThread)
+                break;
+
+            clientThread = NULL;
         }
+
+        if (clientThread)
+            break;
 
         clientProcess = NULL;
     }
@@ -790,6 +851,9 @@ void PipeServer::PortRequest(HANDLE PortHandle, PORT_MESSAGE *msg, void *voidCli
 
     if (! client->buf_hdr) {
 
+        if (msg->u1.s1.DataLength < sizeof(MSG_HEADER))
+            goto finish;
+
         ULONG *msg_Data = (ULONG *)msg->Data;
         ULONG msgid = msg_Data[1];
 
@@ -798,8 +862,12 @@ void PipeServer::PortRequest(HANDLE PortHandle, PORT_MESSAGE *msg, void *voidCli
 
         buf_len = msg_Data[0];
 
+        ULONG maxRequestLength = MAX_REQUEST_LENGTH;
+        if ((msgid & 0xFFFFFF00) == MSGID_CAPTURE)
+            maxRequestLength = CAPTURE_MAX_REQUEST_SIZE;
+
         if (msgid && buf_len &&
-                buf_len < MAX_REQUEST_LENGTH &&
+                buf_len <= maxRequestLength &&
                 buf_len >= sizeof(MSG_HEADER) &&
                 buf_len >= msg->u1.s1.DataLength) {
 
@@ -949,6 +1017,7 @@ MSG_HEADER *PipeServer::CallTarget(
     CLIENT_TLS_DATA TlsData;
     TlsData.PortHandle = PortHandle;
     TlsData.PortMessage = PortMessage;
+    TlsData.ProcessCreateTime = 0;
     TlsSetValue(m_TlsIndex, &TlsData);
 
     MSG_HEADER *msgOut = NULL;
@@ -1022,7 +1091,7 @@ void PipeServer::PortReply(PORT_MESSAGE *msg, void *voidClient)
 //---------------------------------------------------------------------------
 
 
-void PipeServer::NotifyTargets(HANDLE idProcess)
+void PipeServer::NotifyTargets(HANDLE idProcess, ULONG64 processCreateTime)
 {
     PORT_MESSAGE PortMsg;
     PortMsg.ClientId.UniqueProcess = idProcess;
@@ -1031,6 +1100,8 @@ void PipeServer::NotifyTargets(HANDLE idProcess)
     CLIENT_TLS_DATA TlsData;
     TlsData.PortHandle = NULL;
     TlsData.PortMessage = &PortMsg;
+    TlsData.ProcessCreateTime = processCreateTime;
+    void *oldTlsData = TlsGetValue(m_TlsIndex);
     TlsSetValue(m_TlsIndex, &TlsData);
 
     MSG_HEADER msg;
@@ -1056,6 +1127,8 @@ void PipeServer::NotifyTargets(HANDLE idProcess)
         target = (TARGET *)List_Next(target);
     }
 #endif
+
+    TlsSetValue(m_TlsIndex, oldTlsData);
 }
 
 
@@ -1145,6 +1218,71 @@ ULONG PipeServer::GetCallerSessionId()
     if (! ProcessIdToSessionId(GetCallerProcessId(), &SessionId))
         SessionId = 0;
     return SessionId;
+}
+
+
+//---------------------------------------------------------------------------
+// GetCallerProcessCreateTime
+//---------------------------------------------------------------------------
+
+
+bool PipeServer::GetCallerProcessCreateTime(ULONG64 *createTime)
+{
+    if (! createTime)
+        return false;
+
+    *createTime = 0;
+
+    CLIENT_TLS_DATA *TlsData =
+                (CLIENT_TLS_DATA *)TlsGetValue(m_instance->m_TlsIndex);
+    if (! TlsData || ! TlsData->PortMessage)
+        return false;
+
+    if (TlsData->ProcessCreateTime) {
+        *createTime = TlsData->ProcessCreateTime;
+        return true;
+    }
+
+    HANDLE idProcess = TlsData->PortMessage->ClientId.UniqueProcess;
+    HANDLE idThread = TlsData->PortMessage->ClientId.UniqueThread;
+    LARGE_INTEGER recordedTime;
+    recordedTime.QuadPart = 0;
+
+    EnterCriticalSection(&m_instance->m_lock);
+
+#ifdef USE_NEW_LPC_IMPL
+    for (const auto& pair : m_instance->m_Clients) {
+        const SClientPtr& client = pair.second;
+        if (client->idProcess == idProcess &&
+                (! idThread || client->idThread == idThread)) {
+            recordedTime = client->CreateTime;
+            break;
+        }
+    }
+#else
+    CLIENT_PROCESS *clientProcess = (CLIENT_PROCESS *)map_get(
+        &m_instance->m_client_map, idProcess);
+    if (clientProcess) {
+        CLIENT_THREAD *clientThread = (CLIENT_THREAD *)map_get(
+            &clientProcess->thread_map, idThread);
+        if (clientThread)
+            recordedTime = clientThread->CreateTime;
+    }
+#endif
+
+    LeaveCriticalSection(&m_instance->m_lock);
+
+    LARGE_INTEGER liveTime;
+    if (! PipeServer_QueryProcessCreateTime(idProcess, &liveTime))
+        return false;
+
+    if (recordedTime.QuadPart &&
+            recordedTime.QuadPart != liveTime.QuadPart) {
+        return false;
+    }
+
+    *createTime = (ULONG64)liveTime.QuadPart;
+    return true;
 }
 
 

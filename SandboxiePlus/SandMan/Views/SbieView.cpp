@@ -234,6 +234,7 @@ void CSbieView::CreateMenu()
 		m_pMenuRegEdit = m_pMenuContent->addAction(CSandMan::GetIcon("RegEdit"), tr("Open Registry"), this, SLOT(OnSandBoxAction()));
 	m_pMenuSnapshots = m_pMenuBox->addAction(CSandMan::GetIcon("Snapshots"), tr("Snapshots Manager"), this, SLOT(OnSandBoxAction()));
 	m_pMenuBox->addSeparator();
+	m_pMenuCapture = m_pMenuBox->addAction(CSandMan::GetIcon("Connect"), tr("Connection Audit"), this, SLOT(OnSandBoxAction()));
 	m_pMenuOptions = m_pMenuBox->addAction(CSandMan::GetIcon("Options"), tr("Sandbox Options"), this, SLOT(OnSandBoxAction()));
 	QFont f = m_pMenuOptions->font();
 	f.setBold(true);
@@ -293,6 +294,7 @@ void CSbieView::CreateMenu()
 	m_pMenuProcess = new QMenu();
 	m_pMenuTerminate = m_pMenuProcess->addAction(CSandMan::GetIcon("Remove"), tr("Terminate"), this, SLOT(OnProcessAction()));
 	this->addAction(m_pMenuTerminate);
+	m_pMenuProcCapture = m_pMenuProcess->addAction(CSandMan::GetIcon("Connect"), tr("Connection Audit"), this, SLOT(OnProcessAction()));
 	m_pMenuLinkTo = m_pMenuProcess->addAction(CSandMan::GetIcon("MkLink"), tr("Create Shortcut"), this, SLOT(OnProcessAction()));
 	m_pMenuPreset = m_pMenuProcess->addMenu(CSandMan::GetIcon("Presets"), tr("Preset"));
 		m_pMenuPinToRun = m_pMenuPreset->addAction(tr("Pin to Run Menu"), this, SLOT(OnProcessAction()));
@@ -394,6 +396,7 @@ void CSbieView::CreateOldMenu()
 	m_pMenuExplore = m_pMenuBox->addAction(CSandMan::GetIcon("Explore"), tr("Explore Content"), this, SLOT(OnSandBoxAction()));
 
 	m_pMenuBox->addSeparator();
+	m_pMenuCapture = m_pMenuBox->addAction(CSandMan::GetIcon("Connect"), tr("Connection Audit"), this, SLOT(OnSandBoxAction()));
 	m_pMenuOptions = m_pMenuBox->addAction(CSandMan::GetIcon("Options"), tr("Sandbox Settings"), this, SLOT(OnSandBoxAction()));
 
 	m_pMenuTools = m_pMenuBox->addMenu(CSandMan::GetIcon("Maintenance"), tr("Sandbox Tools"));
@@ -451,6 +454,7 @@ void CSbieView::CreateOldMenu()
 	m_pMenuProcess = new QMenu();
 	m_pMenuTerminate = m_pMenuProcess->addAction(CSandMan::GetIcon("Remove"), tr("Terminate"), this, SLOT(OnProcessAction()));
 	this->addAction(m_pMenuTerminate);
+	m_pMenuProcCapture = m_pMenuProcess->addAction(CSandMan::GetIcon("Connect"), tr("Connection Audit"), this, SLOT(OnProcessAction()));
 	m_pMenuLinkTo = m_pMenuProcess->addAction(CSandMan::GetIcon("MkLink"), tr("Create Shortcut"), this, SLOT(OnProcessAction()));
 	m_pMenuPreset = NULL;
 		m_pMenuPinToRun = NULL;
@@ -719,6 +723,8 @@ bool CSbieView::UpdateMenu(bool bAdvanced, const CSandBoxPtr &pBox, int iSandBox
 	m_pMenuRename->setEnabled(iSandBoxeCount == 1 && pBoxEx->GetMountRoot().isEmpty());
 
 	m_pMenuOptions->setEnabled(iSandBoxeCount == 1);
+	if (m_pMenuCapture)
+		m_pMenuCapture->setEnabled(iSandBoxeCount == 1 && theAPI && theAPI->IsConnected());
 
 	if (m_pMenuPresets) {
 		m_pMenuPresets->setEnabled(iSandBoxeCount == 1);
@@ -764,6 +770,8 @@ bool CSbieView::UpdateMenu(bool bAdvanced, const CSandBoxPtr &pBox, int iSandBox
 void CSbieView::UpdateProcMenu(const CBoxedProcessPtr& pProcess, int iProcessCount, int iSuspendedCount)
 {
 	m_pMenuLinkTo->setEnabled(iProcessCount == 1);
+	if (m_pMenuProcCapture)
+		m_pMenuProcCapture->setEnabled(iProcessCount == 1 && theAPI && theAPI->IsConnected());
 
 	CSandBoxPlus* pBoxPlus = pProcess.objectCast<CSbieProcess>()->GetBox();
 	QStringList RunOptions = pBoxPlus->GetTextList("RunCommand", true);
@@ -1552,6 +1560,8 @@ void CSbieView::OnSandBoxAction(QAction* Action, const QList<CSandBoxPtr>& SandB
 		m_pMenuPresetsForce->setChecked(SandBoxes.first()->SetBoolSafe("DisableForceRules", m_pMenuPresetsForce->isChecked()));
 	else if (Action == m_pMenuOptions)
 		ShowOptions(SandBoxes.first());
+	else if (Action == m_pMenuCapture)
+		theGUI->OnBoxConnectionAudit();
 	else if (Action == m_pMenuBrowse)
 		ShowBrowse(SandBoxes.first());
 	else if (Action == m_pMenuBrowseNT)
@@ -2002,6 +2012,11 @@ void CSbieView::OnProcessAction()
 
 void CSbieView::OnProcessAction(QAction* Action, const QList<CBoxedProcessPtr>& Processes)
 {
+	if (Action == m_pMenuProcCapture) {
+		theGUI->OnProcessConnectionAudit();
+		return;
+	}
+
 	QList<SB_STATUS> Results;
 
 	if (Action == m_pMenuTerminate || Action == m_pMenuBlackList)

@@ -45,6 +45,7 @@
 #include "util.h"
 #include "token.h"
 #include "wfp.h"
+#include "capture.h"
 #include "dyn_data.h"
 
 NTSTATUS File_TranslateSymlinks(WCHAR *name, ULONG max_len);
@@ -275,6 +276,9 @@ _FX NTSTATUS DriverEntry(
 
     if (ok)
         ok = Api_Init();
+
+    if (ok)
+        ok = Capture_Init();
 
     //
     // initializing Windows Filtering Platform callouts
@@ -863,6 +867,7 @@ _FX void SbieDrv_DriverUnload(DRIVER_OBJECT *DriverObject)
         KeDelayExecutionThread(KernelMode, FALSE, &time);
 
         WFP_Unload();
+        Capture_Unload();
         Session_Unload();
         Dll_Unload();
         Conf_Unload();

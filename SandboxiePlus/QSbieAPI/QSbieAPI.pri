@@ -9,6 +9,7 @@ HEADERS += ./qsbieapi_global.h \
     ./SbieDefs.h \
     ./SbieUtils.h \
     ./SbieAPI.h \
+    ./SbieCapture.h \
     ./SbieTrace.h \
     ./SbieStatus.h \
     ./Sandboxie/BoxedProcess.h \

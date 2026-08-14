@@ -18,6 +18,7 @@
 #include "../MiscHelpers/Common/TreeItemModel.h"
 #include "../MiscHelpers/Common/ListItemModel.h"
 #include "Views/TraceView.h"
+#include "Views/CaptureView.h"
 #include "Windows/SelectBoxWindow.h"
 #include "../UGlobalHotkey/uglobalhotkeys.h"
 #include "Wizards/SetupWizard.h"
@@ -917,6 +918,7 @@ void CSandMan::CreateMenus(bool bAdvanced)
 			m_pCleanUpMenu->addSeparator();
 			m_pCleanUpMsgLog = m_pCleanUpMenu->addAction(tr("Cleanup Message Log"), this, SLOT(OnCleanUp()));
 			m_pCleanUpTrace = m_pCleanUpMenu->addAction(tr("Cleanup Trace Log"), this, SLOT(OnCleanUp()));
+			m_pCleanUpCapture = m_pCleanUpMenu->addAction(tr("Cleanup Connection Audit"), this, SLOT(OnCleanUp()));
 			m_pCleanUpRecovery = m_pCleanUpMenu->addAction(tr("Cleanup Recovery Log"), this, SLOT(OnCleanUp()));
 
 		m_pKeepTerminated = m_pMenuView->addAction(CSandMan::GetIcon("Keep"), tr("Keep terminated"), this, SLOT(OnProcView()));
@@ -930,6 +932,7 @@ void CSandMan::CreateMenus(bool bAdvanced)
 			m_pCleanUpProcesses = NULL;
 			m_pCleanUpMsgLog = NULL;
 			m_pCleanUpTrace = NULL;
+			m_pCleanUpCapture = NULL;
 			m_pCleanUpRecovery = NULL;
 
 		m_pKeepTerminated = NULL;
@@ -940,6 +943,7 @@ void CSandMan::CreateMenus(bool bAdvanced)
 		m_pEnableMonitoring = m_pMenuView->addAction(CSandMan::GetIcon("SetLogging"), tr("Trace Logging"), this, SLOT(OnMonitoring()));
 	if (bAdvanced)
 		m_pEnableMonitoring->setCheckable(true);
+		m_pEnableCapture = m_pMenuView->addAction(CSandMan::GetIcon("Connect"), tr("Connection Audit"), this, SLOT(OnConnectionAudit()));
 	if (!bAdvanced)
 		m_pMenuView->addAction(CSandMan::GetIcon("Recover"), tr("Recovery Log"), this, SLOT(OnRecoveryLog()));
 
@@ -1014,6 +1018,7 @@ void CSandMan::CreateOldMenus()
 		m_pMenuFile->addSeparator();
 		m_pWndFinder = m_pMenuFile->addAction(CSandMan::GetIcon("finder"), tr("Is Window Sandboxed?"), this, SLOT(OnWndFinder()));
 		m_pEnableMonitoring = m_pMenuFile->addAction(CSandMan::GetIcon("SetLogging"), tr("Resource Access Monitor"), this, SLOT(OnMonitoring()));
+		m_pEnableCapture = m_pMenuFile->addAction(CSandMan::GetIcon("Connect"), tr("Connection Audit"), this, SLOT(OnConnectionAudit()));
 
 		m_pMenuFile->addSeparator();
 
@@ -1066,6 +1071,7 @@ void CSandMan::CreateOldMenus()
 			m_pCleanUpProcesses = NULL;
 			m_pCleanUpMsgLog = NULL;
 			m_pCleanUpTrace = NULL;
+			m_pCleanUpCapture = NULL;
 			m_pCleanUpRecovery = NULL;
 		m_pKeepTerminated = NULL;
 		m_pAutoExpand = NULL;
@@ -1552,6 +1558,7 @@ void CSandMan::CreateView(int iViewMode)
 
 		m_pMessageLog = NULL;
 		m_pTraceView = NULL;
+		m_pCaptureView = NULL;
 		m_pRecoveryLog = NULL;
 
 		return;
@@ -1621,6 +1628,9 @@ void CSandMan::CreateView(int iViewMode)
 
 		m_pLogTabs->addTab(m_pTraceView, tr("Trace Log"));
 
+		m_pCaptureView = new CCaptureView(false, this);
+		m_pLogTabs->addTab(m_pCaptureView, tr("Connection Audit"));
+
 
 		// Recovery Log
 		m_pRecoveryLog = new CPanelWidgetEx();
@@ -1651,6 +1661,7 @@ void CSandMan::CreateView(int iViewMode)
 
 		m_pMessageLog = NULL;
 		m_pTraceView = NULL;
+		m_pCaptureView = NULL;
 		m_pRecoveryLog = NULL;
 	}
 }
@@ -3103,6 +3114,7 @@ void CSandMan::UpdateState()
 	if(m_pEditIni2) m_pEditIni2->setEnabled(isConnected);
 	m_pReloadIni->setEnabled(isConnected);
 	if(m_pEnableMonitoring) m_pEnableMonitoring->setEnabled(isConnected);
+	if(m_pEnableCapture) m_pEnableCapture->setEnabled(isConnected);
 
 	if (m_pNewBoxButton) m_pNewBoxButton->setEnabled(isConnected);
 	if (m_pEditIniButton) m_pEditIniButton->setEnabled(isConnected);
@@ -4165,6 +4177,10 @@ void CSandMan::OnCleanUp()
 			m_pTraceInfo->clear();
 		}
 
+	if (sender() == m_pCleanUpCapture || sender() == m_pCleanUpButton)
+		if (m_pCaptureView)
+			m_pCaptureView->Clear();
+
 	if (sender() == m_pCleanUpRecovery || sender() == m_pCleanUpButton)
 		if(m_pRecoveryLog) m_pRecoveryLog->GetTree()->clear();
 
@@ -4513,6 +4529,81 @@ void CSandMan::OnMonitoring()
 			SafeShow(pTraceWindow);
 		}
 	}
+}
+
+void CSandMan::OnConnectionAudit()
+{
+	ShowConnectionAudit(false);
+}
+
+void CSandMan::OnBoxConnectionAudit()
+{
+	ShowConnectionAudit(true);
+}
+
+void CSandMan::OnProcessConnectionAudit()
+{
+	ShowConnectionAudit(false);
+
+	if (!m_pBoxView)
+		return;
+	QList<CBoxedProcessPtr> Processes = m_pBoxView->GetSelectedProcesses();
+	if (Processes.count() != 1 || Processes.first().isNull())
+		return;
+
+	const CBoxedProcessPtr pProcess = Processes.first();
+	CCaptureView* pView = m_pCaptureView;
+	if (!pView) {
+		if (CCaptureWindow* pWindow = findChild<CCaptureWindow*>())
+			pView = pWindow->findChild<CCaptureView*>();
+	}
+	if (pView)
+		pView->StartForProcess(pProcess->GetBoxName(), pProcess->GetProcessId());
+}
+
+void CSandMan::ShowConnectionAudit(bool bStart)
+{
+	QString PreferredBox;
+	if (m_pBoxView) {
+		QList<CSandBoxPtr> Boxes = m_pBoxView->GetSelectedBoxes();
+		if (Boxes.count() == 1 && !Boxes.first().isNull())
+			PreferredBox = Boxes.first()->GetName();
+	}
+
+	CCaptureView* pView = NULL;
+	if (m_pCaptureView)
+	{
+		pView = m_pCaptureView;
+		pView->RefreshBoxes();
+		pView->SetPreferredBox(PreferredBox);
+		if (m_pLogTabs) {
+			if (!m_pToolBar->isVisible())
+				m_pLogTabs->show();
+			int Index = m_pLogTabs->indexOf(m_pCaptureView);
+			if (Index >= 0)
+				m_pLogTabs->setCurrentIndex(Index);
+		}
+	}
+	else
+	{
+		static CCaptureWindow* pCaptureWindow = NULL;
+		if (!pCaptureWindow) {
+			pCaptureWindow = new CCaptureWindow();
+			connect(this, SIGNAL(Closed()), pCaptureWindow, SLOT(close()));
+			connect(pCaptureWindow, &CCaptureWindow::Closed, [&]() {
+				pCaptureWindow = NULL;
+			});
+			SafeShow(pCaptureWindow);
+		}
+		pView = pCaptureWindow->findChild<CCaptureView*>();
+		if (pView) {
+			pView->RefreshBoxes();
+			pView->SetPreferredBox(PreferredBox);
+		}
+	}
+
+	if (bStart && pView && !PreferredBox.isEmpty())
+		pView->StartForBox(PreferredBox);
 }
 
 void CSandMan::OnSymbolStatus(const QString& Message)

@@ -501,6 +501,22 @@
     </ClCompile>
     <ClCompile Include="api.c" />
     <ClCompile Include="box.c" />
+    <ClCompile Include="capture.c" />
+    <ClCompile Include="capture_filter.c">
+      <PreprocessorDefinitions>KERNEL_MODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="capture_network.c">
+      <PreprocessorDefinitions>KERNEL_MODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="capture_queue.c">
+      <PreprocessorDefinitions>KERNEL_MODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="capture_packet.c">
+      <PreprocessorDefinitions>KERNEL_MODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
+    <ClCompile Include="capture_stream.c">
+      <PreprocessorDefinitions>KERNEL_MODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
     <ClCompile Include="conf.c" />
     <ClCompile Include="conf_expand.c" />
     <ClCompile Include="conf_user.c" />
@@ -745,6 +761,12 @@
     <ClInclude Include="api_defs.h" />
     <ClInclude Include="api_flags.h" />
     <ClInclude Include="box.h" />
+    <ClInclude Include="capture.h" />
+    <ClInclude Include="capture_filter.h" />
+    <ClInclude Include="capture_network.h" />
+    <ClInclude Include="capture_queue.h" />
+    <ClInclude Include="capture_packet.h" />
+    <ClInclude Include="capture_stream.h" />
     <ClInclude Include="conf.h" />
     <ClInclude Include="dll.h" />
     <ClInclude Include="driver.h" />

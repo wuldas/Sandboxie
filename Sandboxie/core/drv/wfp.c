@@ -31,6 +31,8 @@
 #define NO_IP_DEFS
 #include "common/my_wsa.h"
 #include "util.h"
+#include "capture.h"
+#include "capture_network.h"
 
 
 extern DEVICE_OBJECT *Api_DeviceObject;
@@ -98,6 +100,11 @@ typedef struct _WFP_PROCESS {
 	BOOLEAN LogTraffic;
 	BOOLEAN BlockInternet;
 	BOOLEAN BlockLoopback;
+	BOOLEAN CaptureEligible;
+	ULONG SessionId;
+	ULONG64 ProcessCreateTime;
+	WCHAR BoxName[BOXNAME_COUNT];
+	WCHAR SidString[96];
 	LIST NetFwRules;
 
 } WFP_PROCESS;
@@ -167,7 +174,8 @@ void GetNetwork5TupleIndexesForLayer(
 	_Out_ UINT* remoteAddressIndex,
 	_Out_ UINT* localPortIndex,
 	_Out_ UINT* remotePortIndex,
-	_Out_ UINT* protocolIndex);
+	_Out_ UINT* protocolIndex,
+	_Out_ UINT* flagsIndex);
 
 
 //---------------------------------------------------------------------------
@@ -289,6 +297,17 @@ _FX BOOLEAN WFP_Load(void)
 		DbgPrint("Sbie WFP is not ready\r\n");
 
 	return TRUE;
+}
+
+
+//---------------------------------------------------------------------------
+// WFP_IsReady
+//---------------------------------------------------------------------------
+
+
+_FX BOOLEAN WFP_IsReady(void)
+{
+	return WFP_Enabled && WFP_engine_handle != NULL;
 }
 
 
@@ -649,6 +668,17 @@ BOOLEAN WFP_InitProcess(PROCESS* proc)
 	memzero(wfp_proc, sizeof(WFP_PROCESS));
 
 	wfp_proc->ProcessId = proc->pid;
+	wfp_proc->ProcessCreateTime = proc->create_time;
+	if (! proc->bHostInject && proc->box && proc->box->sid) {
+		wfp_proc->CaptureEligible = TRUE;
+		wfp_proc->SessionId = proc->box->session_id;
+		memcpy(wfp_proc->BoxName, proc->box->name, sizeof(wfp_proc->BoxName));
+		ULONG sidLength = proc->box->sid_len;
+		if (sidLength > sizeof(wfp_proc->SidString))
+			sidLength = sizeof(wfp_proc->SidString);
+		memcpy(wfp_proc->SidString, proc->box->sid, sidLength);
+		wfp_proc->SidString[RTL_NUMBER_OF(wfp_proc->SidString) - 1] = L'\0';
+	}
 
 	List_Init(&wfp_proc->NetFwRules);
 
@@ -797,11 +827,15 @@ BOOLEAN WFP_isLoopback(const IP_ADDRESS* ip)
 		return TRUE;
 	}
 
-	// Check IPv4-mapped IPv6 ::FFFF:127.0.0.1
-	if (ip->Data32[0] == 0 &&
-		ip->Data32[1] == 0 &&
-		ip->Data32[2] == 0xFFFF0000 &&
-		((ip->Data32[3] & 0xFF000000) == 0x7F000000)) // 127.x.x.x
+	// Check IPv4-mapped IPv6 ::FFFF:127.0.0.0/8.  The address bytes are
+	// stored in network order even on little-endian hosts.
+	if (ip->Data[0] == 0 && ip->Data[1] == 0 &&
+		ip->Data[2] == 0 && ip->Data[3] == 0 &&
+		ip->Data[4] == 0 && ip->Data[5] == 0 &&
+		ip->Data[6] == 0 && ip->Data[7] == 0 &&
+		ip->Data[8] == 0 && ip->Data[9] == 0 &&
+		ip->Data[10] == 0xFF && ip->Data[11] == 0xFF &&
+		ip->Data[12] == 0x7F)
 	{
 		return TRUE;
 	}
@@ -828,58 +862,99 @@ void WFP_classify(
 {
 	// https://docs.microsoft.com/en-us/windows-hardware/drivers/network/metadata-fields-at-each-filtering-layer
 
-	UNREFERENCED_PARAMETER(inMetaValues);
 	UNREFERENCED_PARAMETER(layerData);
 	UNREFERENCED_PARAMETER(classifyContext);
 	UNREFERENCED_PARAMETER(flowContext);
-	UNREFERENCED_PARAMETER(filter);
 
 	//
-	// We don't have the necessary right to alter the classify, exit.
+	// Observation must not depend on being allowed to change the verdict.
+	// Only the permit/block write-back below is gated on WRITE rights.
 	//
-	if ((classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) == 0)
-	{
-		return;
-	}
+	BOOLEAN canWrite =
+		(classifyOut->rights & FWPS_RIGHT_ACTION_WRITE) != 0;
 
 	if (FWPS_IS_METADATA_FIELD_PRESENT(inMetaValues, FWPS_METADATA_FIELD_PROCESS_ID))
 	{
-		UINT localAddrIndex, remoteAddrIndex, localPortIndex, remotePortIndex, protocolIndex;
+		UINT localAddrIndex, remoteAddrIndex, localPortIndex;
+		UINT remotePortIndex, protocolIndex, flagsIndex;
 		GetNetwork5TupleIndexesForLayer(inFixedValues->layerId,
-		  &localAddrIndex, &remoteAddrIndex, &localPortIndex, &remotePortIndex,&protocolIndex);
+		  &localAddrIndex, &remoteAddrIndex, &localPortIndex,
+		  &remotePortIndex, &protocolIndex, &flagsIndex);
 
+		BOOLEAN send =
+			(filter->filterId == WFP_send_filter_id_v4) ||
+			(filter->filterId == WFP_send_filter_id_v6);
+		BOOLEAN v6 =
+			(filter->filterId == WFP_send_filter_id_v6) ||
+			(filter->filterId == WFP_recv_filter_id_v6);
+		UINT32 connectionFlags = flagsIndex != (UINT)-1 ?
+			inFixedValues->incomingValue[flagsIndex].value.uint32 : 0;
+		UCHAR protocol =
+			inFixedValues->incomingValue[protocolIndex].value.uint8;
+		USHORT local_port =
+			inFixedValues->incomingValue[localPortIndex].value.uint16;
+		USHORT remote_port =
+			inFixedValues->incomingValue[remotePortIndex].value.uint16;
 
-		int protocol = inFixedValues->incomingValue[protocolIndex].value.uint8;
+		CAPTURE_QUEUE_RECORD captureRecord;
+		memzero(&captureRecord, sizeof(captureRecord));
+		captureRecord.address_family = v6 ? AF_INET6 : AF_INET;
+		captureRecord.protocol = protocol;
+		captureRecord.event_type = send ?
+			CAPTURE_QUEUE_EVENT_CONNECT : CAPTURE_QUEUE_EVENT_ACCEPT;
+		captureRecord.direction = send ?
+			CAPTURE_QUEUE_DIRECTION_OUTBOUND :
+			CAPTURE_QUEUE_DIRECTION_INBOUND;
+		captureRecord.local_port = local_port;
+		captureRecord.remote_port = remote_port;
+
 		IP_ADDRESS remote_ip;
-		if ((filter->filterId == WFP_send_filter_id_v6) || (filter->filterId == WFP_recv_filter_id_v6))
+		memzero(&remote_ip, sizeof(remote_ip));
+		BOOLEAN haveAddresses = TRUE;
+		if (v6)
 		{
-			//remote_ip.Type = AF_INET6;
-			//UINT8* local_address = inFixedValues->incomingValue[localAddrIndex].value.byteArray16->byteArray16;
-			UINT8* remote_address = inFixedValues->incomingValue[remoteAddrIndex].value.byteArray16->byteArray16;
+			const FWP_BYTE_ARRAY16 *localArray =
+				inFixedValues->incomingValue[localAddrIndex].value.byteArray16;
+			const FWP_BYTE_ARRAY16 *remoteArray =
+				inFixedValues->incomingValue[remoteAddrIndex].value.byteArray16;
+			if (! localArray || ! remoteArray)
+			{
+				haveAddresses = FALSE;
+			}
+			else
+			{
+				const UINT8* local_address = localArray->byteArray16;
+				const UINT8* remote_address = remoteArray->byteArray16;
 
-			memcpy(remote_ip.Data, remote_address, 16);
+				memcpy(captureRecord.local_address, local_address, 16);
+				memcpy(captureRecord.remote_address, remote_address, 16);
+				memcpy(remote_ip.Data, remote_address, 16);
+			}
 		}
 		else
 		{
-			//remote_ip.Type = AF_INET;
-			//UINT32 local_address = inFixedValues->incomingValue[localAddrIndex].value.uint32;
+			UINT32 local_address = inFixedValues->incomingValue[localAddrIndex].value.uint32;
 			UINT32 remote_address = inFixedValues->incomingValue[remoteAddrIndex].value.uint32;
+			CaptureNetwork_EncodeIpv4(
+				captureRecord.local_address, local_address);
+			CaptureNetwork_EncodeIpv4(
+				captureRecord.remote_address, remote_address);
 
 			// IPv4-mapped IPv6 addresses, eg. ::FFFF:192.168.0.1
-            remote_ip.Data32[0] = 0;
-            remote_ip.Data32[1] = 0;
-            remote_ip.Data32[2] = 0xFFFF0000;
-            remote_ip.Data32[3] = _ntohl(remote_address); // to network order, as ipv6 is also in network order
-			//*((ULONG*)remote_ip.Data) = _ntohl(remote_address);
+			remote_ip.Data[10] = 0xFF;
+			remote_ip.Data[11] = 0xFF;
+			memcpy(
+				remote_ip.Data + 12, captureRecord.remote_address, 4);
 		}
-		//UINT16 local_port = inFixedValues->incomingValue[localPortIndex].value.uint16;
-		UINT16 remote_port = inFixedValues->incomingValue[remotePortIndex].value.uint16;
 
-
-		BOOLEAN log = FALSE;
 		BOOLEAN block = FALSE;
 		BOOLEAN noloop = FALSE;
-		BOOLEAN isloopback = FALSE;
+		BOOLEAN isloopback =
+			(connectionFlags & FWP_CONDITION_FLAG_IS_LOOPBACK) != 0 ||
+			(haveAddresses && WFP_isLoopback(&remote_ip));
+		BOOLEAN captureIdentityValid = FALSE;
+		CAPTURE_FILTER_IDENTITY captureIdentity;
+		memzero(&captureIdentity, sizeof(captureIdentity));
 
 
 		KIRQL irql; 
@@ -895,21 +970,52 @@ void WFP_classify(
 		wfp_proc = map_get(&WFP_Processes, processId);
 		if (wfp_proc) {
 
-			log = wfp_proc->LogTraffic;
 			block = wfp_proc->BlockInternet;
 			noloop = wfp_proc->BlockLoopback;
-			isloopback = WFP_isLoopback(&remote_ip);
 			if (isloopback && noloop) {
 				block = TRUE;
 			}
 
-			if (!block) {
+			if (!block && haveAddresses) {
 
 				block = NetFw_BlockTraffic(&wfp_proc->NetFwRules, &remote_ip, remote_port, protocol);
+			}
+
+			if (haveAddresses && wfp_proc->CaptureEligible &&
+					!(connectionFlags & FWP_CONDITION_FLAG_IS_REAUTHORIZE)) {
+				captureIdentityValid = TRUE;
+				captureIdentity.process_id =
+					(ULONG)(ULONG_PTR)wfp_proc->ProcessId;
+				captureIdentity.session_id = wfp_proc->SessionId;
+				captureIdentity.process_create_time =
+					wfp_proc->ProcessCreateTime;
+				captureIdentity.loopback = isloopback;
+				memcpy(
+					captureIdentity.box_name,
+					wfp_proc->BoxName,
+					sizeof(captureIdentity.box_name));
+				memcpy(
+					captureIdentity.sid_string,
+					wfp_proc->SidString,
+					sizeof(captureIdentity.sid_string));
+
+				captureRecord.process_id = captureIdentity.process_id;
+				captureRecord.session_id = captureIdentity.session_id;
+				captureRecord.process_create_time =
+					captureIdentity.process_create_time;
 			}
 		}
     
 		KeReleaseSpinLock(&WFP_MapLock, irql);
+
+		if (captureIdentityValid) {
+			LARGE_INTEGER timestamp;
+			KeQuerySystemTime(&timestamp);
+			captureRecord.timestamp = timestamp.QuadPart;
+			captureRecord.blocked = block;
+			captureRecord.loopback = isloopback;
+			Capture_RecordEvent(&captureIdentity, &captureRecord);
+		}
 
 		// TODO: Fix-Me, no ETW logging for now, we are here at DISPATCH_LEVEL but Session_MonitorPut is using pagable memory,
 		// we need either to create a logging proxy using non-paged pool, or change the tracking mechanism to use non-paged pool itself.
@@ -960,13 +1066,16 @@ void WFP_classify(
 
 		if (block) {
 
-			classifyOut->actionType = FWP_ACTION_BLOCK;
-			classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+			if (canWrite) {
+				classifyOut->actionType = FWP_ACTION_BLOCK;
+				classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
+			}
 			return;
 		}
 	}
 
-	classifyOut->actionType = FWP_ACTION_PERMIT;
+	if (canWrite)
+		classifyOut->actionType = FWP_ACTION_PERMIT;
 	return;
 }
 
@@ -1014,7 +1123,8 @@ GetNetwork5TupleIndexesForLayer(
    _Out_ UINT* remoteAddressIndex,
    _Out_ UINT* localPortIndex,
    _Out_ UINT* remotePortIndex,
-   _Out_ UINT* protocolIndex
+   _Out_ UINT* protocolIndex,
+   _Out_ UINT* flagsIndex
    )
 {
    switch (layerId)
@@ -1025,6 +1135,7 @@ GetNetwork5TupleIndexesForLayer(
       *localPortIndex = FWPS_FIELD_ALE_AUTH_CONNECT_V4_IP_LOCAL_PORT;
       *remotePortIndex = FWPS_FIELD_ALE_AUTH_CONNECT_V4_IP_REMOTE_PORT;
       *protocolIndex = FWPS_FIELD_ALE_AUTH_CONNECT_V4_IP_PROTOCOL;
+      *flagsIndex = FWPS_FIELD_ALE_AUTH_CONNECT_V4_FLAGS;
       break;
    case FWPS_LAYER_ALE_AUTH_CONNECT_V6:
       *localAddressIndex = FWPS_FIELD_ALE_AUTH_CONNECT_V6_IP_LOCAL_ADDRESS;
@@ -1032,6 +1143,7 @@ GetNetwork5TupleIndexesForLayer(
       *localPortIndex = FWPS_FIELD_ALE_AUTH_CONNECT_V6_IP_LOCAL_PORT;
       *remotePortIndex = FWPS_FIELD_ALE_AUTH_CONNECT_V6_IP_REMOTE_PORT;
       *protocolIndex = FWPS_FIELD_ALE_AUTH_CONNECT_V6_IP_PROTOCOL;
+      *flagsIndex = FWPS_FIELD_ALE_AUTH_CONNECT_V6_FLAGS;
       break;
    case FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V4:
       *localAddressIndex = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4_IP_LOCAL_ADDRESS;
@@ -1039,6 +1151,7 @@ GetNetwork5TupleIndexesForLayer(
       *localPortIndex = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4_IP_LOCAL_PORT;
       *remotePortIndex = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4_IP_REMOTE_PORT;
       *protocolIndex = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4_IP_PROTOCOL;
+      *flagsIndex = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4_FLAGS;
       break;
    case FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V6:
       *localAddressIndex = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V6_IP_LOCAL_ADDRESS;
@@ -1046,6 +1159,7 @@ GetNetwork5TupleIndexesForLayer(
       *localPortIndex = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V6_IP_LOCAL_PORT;
       *remotePortIndex = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V6_IP_REMOTE_PORT;
       *protocolIndex = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V6_IP_PROTOCOL;
+      *flagsIndex = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V6_FLAGS;
       break;
    case FWPS_LAYER_OUTBOUND_TRANSPORT_V4:
       *localAddressIndex = FWPS_FIELD_OUTBOUND_TRANSPORT_V4_IP_LOCAL_ADDRESS;
@@ -1053,6 +1167,7 @@ GetNetwork5TupleIndexesForLayer(
       *localPortIndex = FWPS_FIELD_OUTBOUND_TRANSPORT_V4_IP_LOCAL_PORT;
       *remotePortIndex = FWPS_FIELD_OUTBOUND_TRANSPORT_V4_IP_REMOTE_PORT;
       *protocolIndex = FWPS_FIELD_OUTBOUND_TRANSPORT_V4_IP_PROTOCOL;
+      *flagsIndex = (UINT)-1;
       break;
    case FWPS_LAYER_OUTBOUND_TRANSPORT_V6:
       *localAddressIndex = FWPS_FIELD_OUTBOUND_TRANSPORT_V6_IP_LOCAL_ADDRESS;
@@ -1060,6 +1175,7 @@ GetNetwork5TupleIndexesForLayer(
       *localPortIndex = FWPS_FIELD_OUTBOUND_TRANSPORT_V6_IP_LOCAL_PORT;
       *remotePortIndex = FWPS_FIELD_OUTBOUND_TRANSPORT_V6_IP_REMOTE_PORT;
       *protocolIndex = FWPS_FIELD_OUTBOUND_TRANSPORT_V6_IP_PROTOCOL;
+      *flagsIndex = (UINT)-1;
       break;
    case FWPS_LAYER_INBOUND_TRANSPORT_V4:
       *localAddressIndex = FWPS_FIELD_INBOUND_TRANSPORT_V4_IP_LOCAL_ADDRESS;
@@ -1067,6 +1183,7 @@ GetNetwork5TupleIndexesForLayer(
       *localPortIndex = FWPS_FIELD_INBOUND_TRANSPORT_V4_IP_LOCAL_PORT;
       *remotePortIndex = FWPS_FIELD_INBOUND_TRANSPORT_V4_IP_REMOTE_PORT;
       *protocolIndex = FWPS_FIELD_INBOUND_TRANSPORT_V4_IP_PROTOCOL;
+      *flagsIndex = (UINT)-1;
       break;
    case FWPS_LAYER_INBOUND_TRANSPORT_V6:
       *localAddressIndex = FWPS_FIELD_INBOUND_TRANSPORT_V6_IP_LOCAL_ADDRESS;
@@ -1074,13 +1191,15 @@ GetNetwork5TupleIndexesForLayer(
       *localPortIndex = FWPS_FIELD_INBOUND_TRANSPORT_V6_IP_LOCAL_PORT;
       *remotePortIndex = FWPS_FIELD_INBOUND_TRANSPORT_V6_IP_REMOTE_PORT;
       *protocolIndex = FWPS_FIELD_INBOUND_TRANSPORT_V6_IP_PROTOCOL;
+      *flagsIndex = (UINT)-1;
       break;
    default:
       *localAddressIndex = -1;
       *remoteAddressIndex = -1;
       *localPortIndex = -1;
       *remotePortIndex = -1;
-      *protocolIndex = -1;      
+      *protocolIndex = -1;
+      *flagsIndex = -1;
       NT_ASSERT(0);
    }
 }

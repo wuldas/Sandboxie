@@ -19,12 +19,18 @@
 
 #include <QThread>
 #include <QFileSystemWatcher>
+#include <QMutex>
+#include <QMutexLocker>
+#include <QProcess>
+#include <QReadWriteLock>
+#include <QWaitCondition>
 
 #include "qsbieapi_global.h"
 
 #include "SbieStatus.h"
 
 #include "SbieTrace.h"
+#include "SbieCapture.h"
 
 #include "./Sandboxie/SandBox.h"
 #include "./Sandboxie/BoxedProcess.h"
@@ -144,6 +150,14 @@ public:
 	virtual const QVector<CTraceEntryPtr>& GetTrace();
 	virtual int				GetTraceCount() const { return m_TraceList.count(); }
 	virtual void			ClearTrace() { m_TraceList.clear(); QMutexLocker Lock(&m_TraceMutex); m_TraceCache.clear(); }
+
+	// Capture
+	SB_RESULT(SSbieCaptureCapabilities) QueryCaptureCapabilities();
+	SB_RESULT(SSbieCaptureSession) StartCapture(const SSbieCaptureStart& Options);
+	SB_RESULT(SSbieCaptureSession) StopCapture(const SSbieCaptureId& CaptureId);
+	SB_RESULT(SSbieCaptureSession) GetCaptureStatus(const SSbieCaptureId& CaptureId);
+	SB_RESULT(SSbieCaptureList) ListCaptures(quint32 StartIndex = 0, quint32 MaxEntries = 0);
+	SB_RESULT(SSbieCaptureEvents) ReadCaptureEvents(const SSbieCaptureId& CaptureId, quint32 MaxEvents = 0);
 
 	// Other
 	virtual quint64			QueryProcessInfo(quint32 ProcessId, quint32 InfoClass = 0);

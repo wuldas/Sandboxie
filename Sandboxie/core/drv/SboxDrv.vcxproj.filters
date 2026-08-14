@@ -3,6 +3,24 @@
   <ItemGroup>
     <ClCompile Include="api.c" />
     <ClCompile Include="box.c" />
+    <ClCompile Include="capture.c">
+      <Filter>net</Filter>
+    </ClCompile>
+    <ClCompile Include="capture_filter.c">
+      <Filter>net</Filter>
+    </ClCompile>
+    <ClCompile Include="capture_network.c">
+      <Filter>net</Filter>
+    </ClCompile>
+    <ClCompile Include="capture_queue.c">
+      <Filter>net</Filter>
+    </ClCompile>
+    <ClCompile Include="capture_packet.c">
+      <Filter>net</Filter>
+    </ClCompile>
+    <ClCompile Include="capture_stream.c">
+      <Filter>net</Filter>
+    </ClCompile>
     <ClCompile Include="conf.c" />
     <ClCompile Include="conf_expand.c" />
     <ClCompile Include="conf_user.c" />
@@ -166,6 +184,24 @@
     <ClInclude Include="api_defs.h" />
     <ClInclude Include="api_flags.h" />
     <ClInclude Include="box.h" />
+    <ClInclude Include="capture.h">
+      <Filter>net</Filter>
+    </ClInclude>
+    <ClInclude Include="capture_filter.h">
+      <Filter>net</Filter>
+    </ClInclude>
+    <ClInclude Include="capture_network.h">
+      <Filter>net</Filter>
+    </ClInclude>
+    <ClInclude Include="capture_queue.h">
+      <Filter>net</Filter>
+    </ClInclude>
+    <ClInclude Include="capture_packet.h">
+      <Filter>net</Filter>
+    </ClInclude>
+    <ClInclude Include="capture_stream.h">
+      <Filter>net</Filter>
+    </ClInclude>
     <ClInclude Include="conf.h" />
     <ClInclude Include="driver.h" />
     <ClInclude Include="gui.h" />

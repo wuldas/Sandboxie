@@ -151,6 +151,15 @@
 #define MSGID_EPMAPPER                          0x1F00
 #define MSGID_EPMAPPER_GET_PORT_NAME            0x1F01
 
+#define MSGID_CAPTURE                           0x2000
+#define MSGID_CAPTURE_QUERY_CAPS                0x2001
+#define MSGID_CAPTURE_START                     0x2002
+#define MSGID_CAPTURE_STOP                      0x2003
+#define MSGID_CAPTURE_GET_STATUS                0x2004
+#define MSGID_CAPTURE_LIST                      0x2005
+#define MSGID_CAPTURE_READ_EVENTS               0x2006
+#define MSGID_CAPTURE_NOTIFICATION              0x20FF
+
 //---------------------------------------------------------------------------
 // Structures
 //---------------------------------------------------------------------------

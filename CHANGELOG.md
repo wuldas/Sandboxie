@@ -9,6 +9,15 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 ### Added
 - added outside sandboxed-window border modes (`onoutside`, `ttloutside`, and `alloutside`) in SandMan; these draw the configured border outside the application frame, while the new `BorderInsideMaximized=y` setting (enabled by default) moves the border and label inside maximized or snapped windows so they remain visible
 - added persistence for manually expanded and collapsed SandMan process-tree branches across task-list refreshes and UI restarts [#5491](https://github.com/sandboxie-plus/Sandboxie/pull/5491)
+- added the versioned, owner-scoped foundation for sandbox network-capture control, QSbieAPI integration, and a local MCP stdio server; packet and HTTPS backends remain capability-gated and disabled until their isolation tests pass
+- added a bounded WFP ALE connection-audit backend that records sandbox-scoped connect/accept authorization metadata without packet payloads; SbieSvc exclusively drains fixed-size driver queues and exposes bounded batches through QSbieAPI and MCP
+- added a SandMan Connection Audit view that starts an owner-scoped box capture, polls authorization-attempt metadata, and does not advertise packet or HTTPS capture
+- added a sandbox context-menu entry that opens Connection Audit for the selected box and starts recording
+- added a process context-menu entry that starts a process-scoped Connection Audit bound to that PID and creation time
+- added a Connection Audit toolbar filter that hides rows that do not match PID, process, address, or result text
+- added a Connection Audit Save action that exports the currently visible rows as UTF-8 CSV metadata, not packet capture
+- added a bounded Connection Audit UI queue so high-rate connect floods (for example a sandboxed download client) drain from the driver without painting every row immediately
+- verified Connection Audit process-churn on a personal host: later boxed children appear in a box-scoped session, host traffic does not, and a process-scoped session stays bound to PID plus creation time after the target exits
 
 ### Changed
 - changed SandMan's Auto Expand Tree to temporarily expand box groups, sandboxes, and process branches without overwriting their saved manual expansion states; set the SandMan UI configuration option `Options/LegacyAutoExpandTree=true` to retain the previous expand-all/collapse-all behaviour [#5491](https://github.com/sandboxie-plus/Sandboxie/pull/5491)
@@ -21,6 +30,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 - fixed SandMan Box Groups collapsing during refreshes, restarts, and sandbox moves despite remembered group state [#5477](https://github.com/sandboxie-plus/Sandboxie/issues/5477)
 - fixed driver incompatibility with latest Windows Insider build
 - fixed SandMan File Panel treating registry hive log files such as `RegHive.LOG1` and `RegHive.LOG2` as descendants of `RegHive` because of their shared filename prefix, causing them to be omitted when deleting the selection together [#4788](https://github.com/sandboxie-plus/Sandboxie/issues/4788)
+- fixed Connection Audit Start returning access denied when the box combo sent the lowercase map key (`defaultbox`) instead of the canonical section name (`DefaultBox`)
 
 
 

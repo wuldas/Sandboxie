@@ -40,6 +40,7 @@
 #include "netapiserver.h"
 #include "queueserver.h"
 #include "EpMapperServer.h"
+#include "CaptureServer.h"
 #include "misc.h"
 #include "core/dll/sbiedll.h"
 #include "common/my_version.h"
@@ -248,6 +249,7 @@ DWORD InitializePipe(void)
     new QueueServer(pipeServer);
     new MountManager(pipeServer);
     new EpMapperServer(pipeServer);
+    new CaptureServer(pipeServer);
 
     if (! pipeServer->Start())
         return (0x00200000 + GetLastError());

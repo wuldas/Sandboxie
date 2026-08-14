@@ -1,0 +1,615 @@
+/*
+ * Copyright 2026 David Xanatos, xanasoft.com
+ *
+ * This program is free software: you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ *   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+//---------------------------------------------------------------------------
+// Capture Connection Audit
+//---------------------------------------------------------------------------
+
+#include "driver.h"
+#include "capture.h"
+
+#include "api.h"
+#include "box.h"
+#include "wfp.h"
+
+
+//---------------------------------------------------------------------------
+// Structures and Types
+//---------------------------------------------------------------------------
+
+
+typedef struct _CAPTURE_SESSION {
+
+    LIST_ENTRY link;
+    CAPTURE_DRIVER_SESSION_ID capture_id;
+    CAPTURE_FILTER_TARGET target;
+    CAPTURE_QUEUE *queue;
+    CAPTURE_FILTER_PROCESS_KEY initial_processes[1];
+
+} CAPTURE_SESSION;
+
+
+//---------------------------------------------------------------------------
+// Variables
+//---------------------------------------------------------------------------
+
+
+static BOOLEAN Capture_Initialized = FALSE;
+static BOOLEAN Capture_Unloading = FALSE;
+static KSPIN_LOCK Capture_Lock;
+static LIST_ENTRY Capture_Sessions;
+static ULONG Capture_SessionCount = 0;
+
+
+//---------------------------------------------------------------------------
+// Compile-time invariants
+//---------------------------------------------------------------------------
+
+
+C_ASSERT(CAPTURE_FILTER_SCOPE_BOX == CAPTURE_DRIVER_SCOPE_BOX);
+C_ASSERT(CAPTURE_FILTER_SCOPE_PROCESS == CAPTURE_DRIVER_SCOPE_PROCESS);
+C_ASSERT(CAPTURE_FILTER_FLAG_INCLUDE_FUTURE == CAPTURE_DRIVER_FLAG_INCLUDE_FUTURE);
+C_ASSERT(CAPTURE_FILTER_FLAG_INCLUDE_LOOPBACK == CAPTURE_DRIVER_FLAG_INCLUDE_LOOPBACK);
+C_ASSERT(CAPTURE_QUEUE_EVENT_CONNECT == CAPTURE_DRIVER_EVENT_CONNECT);
+C_ASSERT(CAPTURE_QUEUE_EVENT_ACCEPT == CAPTURE_DRIVER_EVENT_ACCEPT);
+C_ASSERT(CAPTURE_QUEUE_DIRECTION_OUTBOUND == CAPTURE_DRIVER_DIRECTION_OUTBOUND);
+C_ASSERT(CAPTURE_QUEUE_DIRECTION_INBOUND == CAPTURE_DRIVER_DIRECTION_INBOUND);
+C_ASSERT(sizeof(CAPTURE_FILTER_PROCESS_KEY) == sizeof(CAPTURE_DRIVER_PROCESS_KEY));
+C_ASSERT(sizeof(CAPTURE_QUEUE_RECORD) == sizeof(CAPTURE_DRIVER_EVENT));
+C_ASSERT(FIELD_OFFSET(CAPTURE_QUEUE_RECORD, sequence) ==
+         FIELD_OFFSET(CAPTURE_DRIVER_EVENT, sequence));
+C_ASSERT(FIELD_OFFSET(CAPTURE_QUEUE_RECORD, local_address) ==
+         FIELD_OFFSET(CAPTURE_DRIVER_EVENT, local_address));
+C_ASSERT(FIELD_OFFSET(CAPTURE_QUEUE_RECORD, remote_address) ==
+         FIELD_OFFSET(CAPTURE_DRIVER_EVENT, remote_address));
+
+
+//---------------------------------------------------------------------------
+// Local helpers
+//---------------------------------------------------------------------------
+
+
+static void *Capture_Alloc(SIZE_T size)
+{
+    return ExAllocatePoolWithTag(NonPagedPool, size, tzuk);
+}
+
+
+static void Capture_Free(void *ptr)
+{
+    ExFreePoolWithTag(ptr, tzuk);
+}
+
+
+static BOOLEAN Capture_IdIsZero(const CAPTURE_DRIVER_SESSION_ID *captureId)
+{
+    return captureId->high == 0 && captureId->low == 0;
+}
+
+
+static BOOLEAN Capture_IdEquals(
+    const CAPTURE_DRIVER_SESSION_ID *left,
+    const CAPTURE_DRIVER_SESSION_ID *right)
+{
+    return left->high == right->high && left->low == right->low;
+}
+
+
+static BOOLEAN Capture_StringIsTerminated(
+    const WCHAR *string, ULONG capacity, BOOLEAN allowEmpty)
+{
+    ULONG index;
+    for (index = 0; index < capacity; ++index) {
+        if (! string[index])
+            return allowEmpty || index != 0;
+    }
+
+    return FALSE;
+}
+
+
+static CAPTURE_SESSION *Capture_FindSessionLocked(
+    const CAPTURE_DRIVER_SESSION_ID *captureId)
+{
+    PLIST_ENTRY entry = Capture_Sessions.Flink;
+    while (entry != &Capture_Sessions) {
+        CAPTURE_SESSION *session = CONTAINING_RECORD(
+            entry, CAPTURE_SESSION, link);
+        if (Capture_IdEquals(&session->capture_id, captureId))
+            return session;
+        entry = entry->Flink;
+    }
+
+    return NULL;
+}
+
+
+static void Capture_FreeSession(CAPTURE_SESSION *session)
+{
+    if (session->queue)
+        CaptureQueue_Destroy(session->queue, Capture_Free);
+    Capture_Free(session);
+}
+
+
+static void Capture_ReleaseAll(BOOLEAN unloading)
+{
+    LIST_ENTRY staleSessions;
+    InitializeListHead(&staleSessions);
+
+    if (! Capture_Initialized)
+        return;
+
+    KIRQL irql;
+    KeAcquireSpinLock(&Capture_Lock, &irql);
+
+    if (unloading)
+        Capture_Unloading = TRUE;
+
+    while (! IsListEmpty(&Capture_Sessions)) {
+        PLIST_ENTRY entry = RemoveHeadList(&Capture_Sessions);
+        InsertTailList(&staleSessions, entry);
+    }
+    Capture_SessionCount = 0;
+
+    if (unloading)
+        Capture_Initialized = FALSE;
+
+    KeReleaseSpinLock(&Capture_Lock, irql);
+
+    while (! IsListEmpty(&staleSessions)) {
+        PLIST_ENTRY entry = RemoveHeadList(&staleSessions);
+        Capture_FreeSession(CONTAINING_RECORD(entry, CAPTURE_SESSION, link));
+    }
+}
+
+
+static NTSTATUS Capture_ValidateStartControl(
+    const CAPTURE_DRIVER_CONTROL *control)
+{
+    const ULONG knownFlags =
+        CAPTURE_DRIVER_FLAG_INCLUDE_FUTURE |
+        CAPTURE_DRIVER_FLAG_INCLUDE_LOOPBACK;
+
+    if (Capture_IdIsZero(&control->capture_id) ||
+            control->reserved ||
+            (control->flags & ~knownFlags) ||
+            (control->queue_capacity != 0 &&
+             control->queue_capacity != CAPTURE_DRIVER_QUEUE_CAPACITY) ||
+            ! Box_IsValidName(control->box_name) ||
+            ! Capture_StringIsTerminated(control->sid_string, 96, FALSE) ||
+            control->initial_process_count >
+                CAPTURE_DRIVER_MAX_INITIAL_PROCESSES) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    ULONG expectedSize = CAPTURE_DRIVER_CONTROL_BASE_SIZE +
+        control->initial_process_count * sizeof(CAPTURE_DRIVER_PROCESS_KEY);
+    if (control->size != expectedSize)
+        return STATUS_INFO_LENGTH_MISMATCH;
+
+    if (control->scope == CAPTURE_DRIVER_SCOPE_PROCESS) {
+        if (! control->target_pid ||
+                ! control->target_process_create_time ||
+                control->initial_process_count ||
+                (control->flags & CAPTURE_DRIVER_FLAG_INCLUDE_FUTURE)) {
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+    else if (control->scope == CAPTURE_DRIVER_SCOPE_BOX) {
+        if (control->target_pid || control->target_process_create_time)
+            return STATUS_INVALID_PARAMETER;
+        if ((control->flags & CAPTURE_DRIVER_FLAG_INCLUDE_FUTURE) &&
+                control->initial_process_count) {
+            return STATUS_INVALID_PARAMETER;
+        }
+    }
+    else {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    for (ULONG index = 0;
+            index < control->initial_process_count;
+            ++index) {
+        const CAPTURE_DRIVER_PROCESS_KEY *key =
+            &control->initial_processes[index];
+        if (! key->process_id || ! key->process_create_time || key->reserved)
+            return STATUS_INVALID_PARAMETER;
+    }
+
+    return STATUS_SUCCESS;
+}
+
+
+static NTSTATUS Capture_Start(const CAPTURE_DRIVER_CONTROL *control)
+{
+    NTSTATUS status = Capture_ValidateStartControl(control);
+    if (! NT_SUCCESS(status))
+        return status;
+
+    if (! WFP_IsReady())
+        return STATUS_DEVICE_NOT_READY;
+
+    SIZE_T sessionSize = FIELD_OFFSET(CAPTURE_SESSION, initial_processes) +
+        (SIZE_T)control->initial_process_count *
+            sizeof(CAPTURE_FILTER_PROCESS_KEY);
+    CAPTURE_SESSION *session =
+        (CAPTURE_SESSION *)Capture_Alloc(sessionSize);
+    if (! session)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    RtlZeroMemory(session, sessionSize);
+    session->capture_id = control->capture_id;
+    session->target.scope = control->scope;
+    session->target.flags = control->flags;
+    session->target.process_id = control->target_pid;
+    session->target.session_id = control->target_session_id;
+    session->target.process_create_time =
+        control->target_process_create_time;
+    RtlCopyMemory(
+        session->target.box_name,
+        control->box_name,
+        sizeof(session->target.box_name));
+    RtlCopyMemory(
+        session->target.sid_string,
+        control->sid_string,
+        sizeof(session->target.sid_string));
+    session->target.initial_process_count = control->initial_process_count;
+    session->target.initial_processes = session->initial_processes;
+
+    for (ULONG index = 0;
+            index < control->initial_process_count;
+            ++index) {
+        session->initial_processes[index].process_id =
+            control->initial_processes[index].process_id;
+        session->initial_processes[index].reserved = 0;
+        session->initial_processes[index].process_create_time =
+            control->initial_processes[index].process_create_time;
+    }
+
+    session->queue = CaptureQueue_Create(
+        CAPTURE_DRIVER_QUEUE_CAPACITY, Capture_Alloc);
+    if (! session->queue) {
+        Capture_Free(session);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    KIRQL irql;
+    KeAcquireSpinLock(&Capture_Lock, &irql);
+
+    if (! Capture_Initialized || Capture_Unloading) {
+        status = STATUS_DELETE_PENDING;
+    }
+    else if (Capture_FindSessionLocked(&control->capture_id)) {
+        status = STATUS_OBJECT_NAME_COLLISION;
+    }
+    else if (Capture_SessionCount >= CAPTURE_DRIVER_MAX_SESSIONS) {
+        status = STATUS_QUOTA_EXCEEDED;
+    }
+    else {
+        InsertTailList(&Capture_Sessions, &session->link);
+        ++Capture_SessionCount;
+        session = NULL;
+        status = STATUS_SUCCESS;
+    }
+
+    KeReleaseSpinLock(&Capture_Lock, irql);
+
+    if (session)
+        Capture_FreeSession(session);
+
+    return status;
+}
+
+
+static NTSTATUS Capture_Stop(
+    const CAPTURE_DRIVER_SESSION_ID *captureId)
+{
+    CAPTURE_SESSION *session = NULL;
+
+    KIRQL irql;
+    KeAcquireSpinLock(&Capture_Lock, &irql);
+
+    session = Capture_FindSessionLocked(captureId);
+    if (session) {
+        RemoveEntryList(&session->link);
+        --Capture_SessionCount;
+    }
+
+    KeReleaseSpinLock(&Capture_Lock, irql);
+
+    if (! session)
+        return STATUS_NOT_FOUND;
+
+    Capture_FreeSession(session);
+    return STATUS_SUCCESS;
+}
+
+
+//---------------------------------------------------------------------------
+// Driver API
+//---------------------------------------------------------------------------
+
+
+static NTSTATUS Capture_Api_Control(PROCESS *proc, ULONG64 *parms)
+{
+    API_CAPTURE_CONTROL_ARGS *args =
+        (API_CAPTURE_CONTROL_ARGS *)parms;
+
+    if (proc || PsGetCurrentProcessId() != Api_ServiceProcessId)
+        return STATUS_ACCESS_DENIED;
+
+    CAPTURE_DRIVER_CONTROL *userControl = args->control.val;
+    if (! userControl)
+        return STATUS_INVALID_PARAMETER;
+
+    ULONG controlSize = 0;
+    ULONG version = 0;
+    __try {
+        ProbeForRead(userControl, sizeof(ULONG) * 2, sizeof(ULONG));
+        version = userControl->version;
+        controlSize = userControl->size;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+
+    if (version != CAPTURE_DRIVER_VERSION)
+        return STATUS_REVISION_MISMATCH;
+
+    ULONG maxControlSize = CAPTURE_DRIVER_CONTROL_BASE_SIZE +
+        CAPTURE_DRIVER_MAX_INITIAL_PROCESSES *
+            sizeof(CAPTURE_DRIVER_PROCESS_KEY);
+    if (controlSize < CAPTURE_DRIVER_CONTROL_BASE_SIZE ||
+            controlSize > maxControlSize) {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+
+    CAPTURE_DRIVER_CONTROL *control =
+        (CAPTURE_DRIVER_CONTROL *)ExAllocatePoolWithTag(
+            PagedPool, controlSize, tzuk);
+    if (! control)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    NTSTATUS status = STATUS_SUCCESS;
+    __try {
+        ProbeForRead(userControl, controlSize, sizeof(ULONG));
+        RtlCopyMemory(control, userControl, controlSize);
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+
+    if (! NT_SUCCESS(status)) {
+        ExFreePoolWithTag(control, tzuk);
+        return status;
+    }
+
+    if (control->version != version || control->size != controlSize) {
+        ExFreePoolWithTag(control, tzuk);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    if (control->operation == CAPTURE_DRIVER_CONTROL_QUERY) {
+        if (controlSize != CAPTURE_DRIVER_CONTROL_BASE_SIZE) {
+            status = STATUS_INFO_LENGTH_MISMATCH;
+        }
+        else if (! WFP_IsReady()) {
+            status = STATUS_DEVICE_NOT_READY;
+        }
+        else {
+            control->flags =
+                CAPTURE_DRIVER_FLAG_INCLUDE_FUTURE |
+                CAPTURE_DRIVER_FLAG_INCLUDE_LOOPBACK;
+            control->queue_capacity = CAPTURE_DRIVER_QUEUE_CAPACITY;
+            control->initial_process_count = 0;
+            control->reserved = 0;
+
+            __try {
+                ProbeForWrite(userControl, controlSize, sizeof(ULONG));
+                RtlCopyMemory(userControl, control, controlSize);
+            }
+            __except (EXCEPTION_EXECUTE_HANDLER) {
+                status = GetExceptionCode();
+            }
+        }
+    }
+    else if (control->operation == CAPTURE_DRIVER_CONTROL_START) {
+        status = Capture_Start(control);
+    }
+    else if (control->operation == CAPTURE_DRIVER_CONTROL_STOP) {
+        if (controlSize != CAPTURE_DRIVER_CONTROL_BASE_SIZE ||
+                Capture_IdIsZero(&control->capture_id)) {
+            status = STATUS_INVALID_PARAMETER;
+        }
+        else {
+            status = Capture_Stop(&control->capture_id);
+        }
+    }
+    else {
+        status = STATUS_INVALID_PARAMETER;
+    }
+
+    ExFreePoolWithTag(control, tzuk);
+    return status;
+}
+
+
+static NTSTATUS Capture_Api_Read(PROCESS *proc, ULONG64 *parms)
+{
+    API_CAPTURE_READ_ARGS *args = (API_CAPTURE_READ_ARGS *)parms;
+
+    if (proc || PsGetCurrentProcessId() != Api_ServiceProcessId)
+        return STATUS_ACCESS_DENIED;
+
+    CAPTURE_DRIVER_READ *userRead = args->read.val;
+    ULONG readSize = args->read_size.val;
+    const ULONG maxReadSize = CAPTURE_DRIVER_READ_BASE_SIZE +
+        CAPTURE_DRIVER_MAX_READ_EVENTS * sizeof(CAPTURE_DRIVER_EVENT);
+
+    if (! userRead || readSize < CAPTURE_DRIVER_READ_BASE_SIZE ||
+            readSize > maxReadSize) {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+
+    CAPTURE_DRIVER_READ request;
+    RtlZeroMemory(&request, sizeof(request));
+
+    __try {
+        ProbeForRead(userRead, CAPTURE_DRIVER_READ_BASE_SIZE, sizeof(ULONG));
+        RtlCopyMemory(&request, userRead, CAPTURE_DRIVER_READ_BASE_SIZE);
+        ProbeForWrite(userRead, readSize, sizeof(ULONG));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+
+    if (request.version != CAPTURE_DRIVER_VERSION)
+        return STATUS_REVISION_MISMATCH;
+    if (request.size != readSize || request.reserved ||
+            Capture_IdIsZero(&request.capture_id) ||
+            ! request.max_events ||
+            request.max_events > CAPTURE_DRIVER_MAX_READ_EVENTS ||
+            readSize != CAPTURE_DRIVER_READ_BASE_SIZE +
+                request.max_events * sizeof(CAPTURE_DRIVER_EVENT)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    SIZE_T eventBytes =
+        (SIZE_T)request.max_events * sizeof(CAPTURE_QUEUE_RECORD);
+    CAPTURE_QUEUE_RECORD *events =
+        (CAPTURE_QUEUE_RECORD *)Capture_Alloc(eventBytes);
+    if (! events)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    ULONG64 nextSequence = 0;
+    ULONG64 oldestSequence = 0;
+    ULONG64 newestSequence = 0;
+    ULONG64 droppedCount = 0;
+    ULONG remainingEvents = 0;
+    ULONG returnedEvents = 0;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    KIRQL irql;
+    KeAcquireSpinLock(&Capture_Lock, &irql);
+
+    CAPTURE_SESSION *session =
+        Capture_FindSessionLocked(&request.capture_id);
+    if (! session) {
+        status = STATUS_NOT_FOUND;
+    }
+    else {
+        returnedEvents = CaptureQueue_Drain(
+            session->queue,
+            events,
+            request.max_events,
+            &nextSequence,
+            &oldestSequence,
+            &newestSequence,
+            &droppedCount,
+            &remainingEvents);
+    }
+
+    KeReleaseSpinLock(&Capture_Lock, irql);
+
+    if (NT_SUCCESS(status)) {
+        CAPTURE_DRIVER_READ output;
+        RtlZeroMemory(&output, sizeof(output));
+        output.version = CAPTURE_DRIVER_VERSION;
+        output.size = readSize;
+        output.capture_id = request.capture_id;
+        output.next_sequence = nextSequence;
+        output.oldest_sequence = oldestSequence;
+        output.newest_sequence = newestSequence;
+        output.dropped_count = droppedCount;
+        output.max_events = request.max_events;
+        output.returned_events = returnedEvents;
+        output.remaining_events = remainingEvents;
+
+        __try {
+            RtlCopyMemory(userRead, &output, CAPTURE_DRIVER_READ_BASE_SIZE);
+            if (returnedEvents) {
+                RtlCopyMemory(
+                    userRead->events,
+                    events,
+                    returnedEvents * sizeof(CAPTURE_DRIVER_EVENT));
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = GetExceptionCode();
+        }
+    }
+
+    Capture_Free(events);
+    return status;
+}
+
+
+//---------------------------------------------------------------------------
+// Public functions
+//---------------------------------------------------------------------------
+
+
+BOOLEAN Capture_Init(void)
+{
+    KeInitializeSpinLock(&Capture_Lock);
+    InitializeListHead(&Capture_Sessions);
+    Capture_SessionCount = 0;
+    Capture_Unloading = FALSE;
+    Capture_Initialized = TRUE;
+
+    Api_SetFunction(API_CAPTURE_CONTROL, Capture_Api_Control);
+    Api_SetFunction(API_CAPTURE_READ, Capture_Api_Read);
+    return TRUE;
+}
+
+
+void Capture_Unload(void)
+{
+    Capture_ReleaseAll(TRUE);
+}
+
+
+void Capture_Reset(void)
+{
+    Capture_ReleaseAll(FALSE);
+}
+
+
+void Capture_RecordEvent(
+    const CAPTURE_FILTER_IDENTITY *identity,
+    const CAPTURE_QUEUE_RECORD *record)
+{
+    if (! identity || ! record || ! Capture_Initialized)
+        return;
+
+    KIRQL irql;
+    KeAcquireSpinLock(&Capture_Lock, &irql);
+
+    if (! Capture_Unloading) {
+        PLIST_ENTRY entry = Capture_Sessions.Flink;
+        while (entry != &Capture_Sessions) {
+            CAPTURE_SESSION *session = CONTAINING_RECORD(
+                entry, CAPTURE_SESSION, link);
+            if (CaptureFilter_Matches(&session->target, identity))
+                CaptureQueue_Push(session->queue, record);
+            entry = entry->Flink;
+        }
+    }
+
+    KeReleaseSpinLock(&Capture_Lock, irql);
+}

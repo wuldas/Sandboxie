@@ -511,6 +511,7 @@
       <ExcludedFromBuild Condition="'$(Configuration)|$(Platform)'=='SbieRelease|ARM64'">true</ExcludedFromBuild>
     </ClCompile>
     <ClCompile Include="EpMapperServer.cpp" />
+    <ClCompile Include="CaptureServer.cpp" />
     <ClCompile Include="fileserver.cpp" />
     <ClCompile Include="GuiServer.cpp" />
     <ClCompile Include="HostInjectProcessUtil.cpp">
@@ -613,6 +614,8 @@
     </ClInclude>
     <ClInclude Include="comserver.h" />
     <ClInclude Include="comwire.h" />
+    <ClInclude Include="CaptureServer.h" />
+    <ClInclude Include="capturewire.h" />
     <ClInclude Include="DriverAssist.h" />
     <ClInclude Include="EpMapperServer.h" />
     <ClInclude Include="EpMapperWire.h" />

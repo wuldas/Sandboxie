@@ -300,6 +300,7 @@
     <QtMoc Include="Sandboxie\SbieTemplates.h" />
     <ClInclude Include="resource.h" />
     <ClInclude Include="SbieDefs.h" />
+    <ClInclude Include="SbieCapture.h" />
     <QtMoc Include="SbieStatus.h" />
     <ClInclude Include="SbieTrace.h" />
     <ClInclude Include="SbieUtils.h" />

@@ -19,6 +19,7 @@
 #include <QDebug>
 #include <QStandardPaths>
 #include "SbieAPI.h"
+#include <stddef.h>
 
 #include <ntstatus.h>
 #define WIN32_NO_STATUS
@@ -40,10 +41,74 @@ typedef long NTSTATUS;
 #include "..\..\Sandboxie\core\svc\QueueWire.h"
 #include "..\..\Sandboxie\core\svc\InteractiveWire.h"
 #include "..\..\Sandboxie\core\svc\MountManagerWire.h"
+#include "..\..\Sandboxie\core\svc\capturewire.h"
 
 #include "../../SandboxieTools/ImBox/ImBox.h"
 
 int _SB_STATUS_type = qRegisterMetaType<SB_STATUS>("SB_STATUS");
+
+
+static SB_STATUS CSbieAPI__ValidateCaptureReply(
+	ULONG WireVersion, ULONG StructSize, size_t ActualSize,
+	size_t MinimumSize)
+{
+	if (WireVersion != CAPTURE_WIRE_VERSION)
+		return SB_ERR(STATUS_REVISION_MISMATCH);
+	if (StructSize < MinimumSize || StructSize > ActualSize)
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	return SB_OK;
+}
+
+
+static SB_RESULT(SSbieCaptureSession) CSbieAPI__CaptureSessionFromWire(
+	const CAPTURE_SESSION_INFO& Wire)
+{
+	const size_t BoxNameLength = wcsnlen_s(Wire.box_name, BOXNAME_COUNT);
+	if (BoxNameLength == BOXNAME_COUNT)
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+	if ((Wire.capture_id.high == 0 && Wire.capture_id.low == 0) ||
+		Wire.state < CAPTURE_STATE_STARTING ||
+		Wire.state > CAPTURE_STATE_FAILED ||
+		(Wire.scope != CAPTURE_SCOPE_BOX &&
+		 Wire.scope != CAPTURE_SCOPE_PROCESS) ||
+		!Wire.mode ||
+		(Wire.mode & ~(CAPTURE_MODE_CONNECTIONS |
+		 CAPTURE_MODE_PACKETS | CAPTURE_MODE_HTTPS)) ||
+		(Wire.flags & ~(CAPTURE_FLAG_INCLUDE_FUTURE_PROCESSES |
+		 CAPTURE_FLAG_INCLUDE_LOOPBACK)) ||
+		(Wire.scope == CAPTURE_SCOPE_BOX && Wire.target_pid) ||
+		(Wire.scope == CAPTURE_SCOPE_PROCESS &&
+		 (!Wire.target_pid || !Wire.target_process_create_time ||
+		  (Wire.flags & CAPTURE_FLAG_INCLUDE_FUTURE_PROCESSES)))) {
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+	}
+
+	QString BoxName = QString::fromWCharArray(
+		Wire.box_name, (int)BoxNameLength);
+	SB_STATUS BoxStatus = CSbieAPI::ValidateName(BoxName);
+	if (!BoxStatus)
+		return BoxStatus;
+
+	SSbieCaptureSession Session;
+	Session.Id.High = Wire.capture_id.high;
+	Session.Id.Low = Wire.capture_id.low;
+	Session.State = Wire.state;
+	Session.Scope = Wire.scope;
+	Session.Mode = Wire.mode;
+	Session.Flags = Wire.flags;
+	Session.TargetProcessId = Wire.target_pid;
+	Session.TargetSessionId = Wire.target_session_id;
+	Session.TargetProcessCreateTime = Wire.target_process_create_time;
+	Session.StartedTime = Wire.started_time;
+	Session.StoppedTime = Wire.stopped_time;
+	Session.EventCount = Wire.event_count;
+	Session.PacketCount = Wire.packet_count;
+	Session.ByteCount = Wire.byte_count;
+	Session.DroppedCount = Wire.dropped_count;
+	Session.BackendStatus = Wire.backend_status;
+	Session.BoxName = BoxName;
+	return Session;
+}
 
 struct SSbieAPI
 {
@@ -519,15 +584,21 @@ SB_STATUS CSbieAPI__CallServer(SSbieAPI* m, MSG_HEADER* req, CSbieAPI::SScopedVo
 			return SB_ERR(SB_ServiceFail, QVariantList() << QString("request %1").arg(status, 8, 16), status); // 2203
 		}
 
-		if (BuffLen && ResHeader->u1.s1.DataLength)
+		if (BuffLen && ResHeader->u1.s1.DataLength) {
+			NtClose(m->PortHandle);
+			m->PortHandle = NULL;
 			return SB_ERR(SB_ServiceFail, QVariantList() << QString("early reply")); // 2203
+		}
 	}
 
 	// the last call to NtRequestWaitReplyPort should return the first chunk of the reply
 	if (ResHeader->u1.s1.DataLength >= sizeof(MSG_HEADER))
 	{
-		if (ResData[3] != CurSeqNumber)
+		if (ResData[3] != CurSeqNumber) {
+			NtClose(m->PortHandle);
+			m->PortHandle = NULL;
 			return SB_ERR(SB_ServiceFail, QVariantList() << QString("mismatched reply")); // 2203
+		}
 
 		// clear highest byte of the size field
 		ResData[3] = 0;
@@ -535,11 +606,28 @@ SB_STATUS CSbieAPI__CallServer(SSbieAPI* m, MSG_HEADER* req, CSbieAPI::SScopedVo
 	}
 	else
 		BuffLen = 0;
-	if (BuffLen == 0)
+	if (BuffLen == 0) {
+		NtClose(m->PortHandle);
+		m->PortHandle = NULL;
 		return SB_ERR(SB_ServiceFail, QVariantList() << QString("null reply (msg %1 len %2)").arg(req->msgid, 8, 16).arg(req->length)); // 2203
+	}
+
+	ULONG MaxReplyLength = 0x40000000;
+	if ((req->msgid & 0xFFFFFF00) == MSGID_CAPTURE)
+		MaxReplyLength = CAPTURE_MAX_REPLY_SIZE;
+	if (BuffLen > MaxReplyLength) {
+		NtClose(m->PortHandle);
+		m->PortHandle = NULL;
+		return SB_ERR(SB_ServiceFail, QVariantList() << QString("oversized reply (msg %1 len %2)").arg(req->msgid, 8, 16).arg(BuffLen), STATUS_PORT_MESSAGE_TOO_LONG);
+	}
 
 	// read remaining chunks
 	MSG_HEADER* rpl = (MSG_HEADER*)malloc(BuffLen);
+	if (!rpl) {
+		NtClose(m->PortHandle);
+		m->PortHandle = NULL;
+		return SB_ERR(STATUS_INSUFFICIENT_RESOURCES);
+	}
 	Buffer = (UCHAR*)rpl;
 	for (;;)
 	{
@@ -3158,6 +3246,333 @@ bool CSbieAPI::GetMonitor()
 
 	return status == STATUS_MORE_ENTRIES;
 #endif
+}
+
+///////////////////////////////////////////////////////////////////////////////
+// Capture
+//
+
+SB_RESULT(SSbieCaptureCapabilities) CSbieAPI::QueryCaptureCapabilities()
+{
+	CAPTURE_QUERY_CAPS_REQ req = {};
+	req.v.h.length = sizeof(req);
+	req.v.h.msgid = MSGID_CAPTURE_QUERY_CAPS;
+	req.v.wire_version = CAPTURE_WIRE_VERSION;
+	req.v.struct_size = sizeof(req);
+
+	SScoped<CAPTURE_QUERY_CAPS_RPL> rpl;
+	SB_STATUS Status = CallServer(&req.v.h, &rpl);
+	if (!Status || !rpl)
+		return Status;
+	if (rpl.Size() < sizeof(MSG_HEADER))
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	if (!NT_SUCCESS(rpl->h.status))
+		return SB_ERR(rpl->h.status);
+	if (rpl.Size() < sizeof(CAPTURE_QUERY_CAPS_RPL) ||
+		rpl->min_wire_version > rpl->max_wire_version)
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	Status = CSbieAPI__ValidateCaptureReply(
+		rpl->wire_version, rpl->struct_size, rpl.Size(),
+		sizeof(CAPTURE_QUERY_CAPS_RPL));
+	if (!Status)
+		return Status;
+	if (CAPTURE_WIRE_VERSION < rpl->min_wire_version ||
+		CAPTURE_WIRE_VERSION > rpl->max_wire_version)
+		return SB_ERR(STATUS_REVISION_MISMATCH);
+	if (rpl->max_sessions_per_owner == 0 ||
+		rpl->max_list_entries == 0 ||
+		rpl->max_event_entries == 0 ||
+		rpl->max_event_entries > CAPTURE_MAX_EVENT_ENTRIES)
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+
+	SSbieCaptureCapabilities Caps;
+	Caps.WireVersion = rpl->wire_version;
+	Caps.MinWireVersion = rpl->min_wire_version;
+	Caps.MaxWireVersion = rpl->max_wire_version;
+	Caps.Flags = rpl->capabilities;
+	Caps.MaxSessionsPerOwner = rpl->max_sessions_per_owner;
+	Caps.MaxListEntries = rpl->max_list_entries;
+	Caps.MaxEventEntries = rpl->max_event_entries;
+	return Caps;
+}
+
+SB_RESULT(SSbieCaptureSession) CSbieAPI::StartCapture(
+	const SSbieCaptureStart& Options)
+{
+	SB_STATUS Status = ValidateName(Options.BoxName);
+	if (!Status)
+		return Status;
+	if (Options.BoxName.contains(QChar::Null))
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+
+	if (Options.Scope != SSbieCaptureStart::eBox &&
+		Options.Scope != SSbieCaptureStart::eProcess)
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+	if ((Options.Mode & ~(SSbieCaptureStart::eConnections |
+			SSbieCaptureStart::ePackets | SSbieCaptureStart::eHttps)) != 0 ||
+		Options.Mode == 0)
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+	if (Options.Mode != SSbieCaptureStart::eConnections)
+		return SB_ERR(STATUS_NOT_SUPPORTED);
+	if ((Options.Flags & ~(SSbieCaptureStart::eIncludeFutureProcesses |
+			SSbieCaptureStart::eIncludeLoopback)) != 0)
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+	if ((Options.Scope == SSbieCaptureStart::eProcess && !Options.ProcessId) ||
+		(Options.Scope == SSbieCaptureStart::eBox && Options.ProcessId))
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+	if (Options.Scope == SSbieCaptureStart::eProcess &&
+		(Options.Flags & SSbieCaptureStart::eIncludeFutureProcesses))
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+	if (Options.Scope == SSbieCaptureStart::eBox &&
+		!(Options.Flags & SSbieCaptureStart::eIncludeFutureProcesses))
+		return SB_ERR(STATUS_NOT_SUPPORTED);
+
+	CAPTURE_START_REQ req = {};
+	req.v.h.length = sizeof(req);
+	req.v.h.msgid = MSGID_CAPTURE_START;
+	req.v.wire_version = CAPTURE_WIRE_VERSION;
+	req.v.struct_size = sizeof(req);
+	req.scope = Options.Scope;
+	req.mode = Options.Mode;
+	req.flags = Options.Flags;
+	req.target_pid = Options.ProcessId;
+	Options.BoxName.toWCharArray(req.box_name);
+	req.box_name[Options.BoxName.length()] = L'\0';
+
+	SScoped<CAPTURE_START_RPL> rpl;
+	Status = CallServer(&req.v.h, &rpl);
+	if (!Status || !rpl)
+		return Status;
+	if (rpl.Size() < sizeof(MSG_HEADER))
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	if (!NT_SUCCESS(rpl->h.status))
+		return SB_ERR(rpl->h.status);
+	if (rpl.Size() < offsetof(CAPTURE_START_RPL, session))
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	Status = CSbieAPI__ValidateCaptureReply(
+		rpl->wire_version, rpl->struct_size, rpl.Size(),
+		sizeof(CAPTURE_START_RPL));
+	if (!Status)
+		return Status;
+
+	return CSbieAPI__CaptureSessionFromWire(rpl->session);
+}
+
+static void CSbieAPI__InitCaptureSessionReq(
+	CAPTURE_SESSION_REQ& req, ULONG msgid, const SSbieCaptureId& CaptureId)
+{
+	memset(&req, 0, sizeof(req));
+	req.v.h.length = sizeof(req);
+	req.v.h.msgid = msgid;
+	req.v.wire_version = CAPTURE_WIRE_VERSION;
+	req.v.struct_size = sizeof(req);
+	req.capture_id.high = CaptureId.High;
+	req.capture_id.low = CaptureId.Low;
+}
+
+SB_RESULT(SSbieCaptureSession) CSbieAPI::StopCapture(
+	const SSbieCaptureId& CaptureId)
+{
+	if (CaptureId.IsNull())
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+
+	CAPTURE_SESSION_REQ req;
+	CSbieAPI__InitCaptureSessionReq(req, MSGID_CAPTURE_STOP, CaptureId);
+
+	SScoped<CAPTURE_STATUS_RPL> rpl;
+	SB_STATUS Status = CallServer(&req.v.h, &rpl);
+	if (!Status || !rpl)
+		return Status;
+	if (rpl.Size() < sizeof(MSG_HEADER))
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	if (!NT_SUCCESS(rpl->h.status))
+		return SB_ERR(rpl->h.status);
+	if (rpl.Size() < offsetof(CAPTURE_STATUS_RPL, session))
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	Status = CSbieAPI__ValidateCaptureReply(
+		rpl->wire_version, rpl->struct_size, rpl.Size(),
+		sizeof(CAPTURE_STATUS_RPL));
+	if (!Status)
+		return Status;
+
+	return CSbieAPI__CaptureSessionFromWire(rpl->session);
+}
+
+SB_RESULT(SSbieCaptureSession) CSbieAPI::GetCaptureStatus(
+	const SSbieCaptureId& CaptureId)
+{
+	if (CaptureId.IsNull())
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+
+	CAPTURE_SESSION_REQ req;
+	CSbieAPI__InitCaptureSessionReq(req, MSGID_CAPTURE_GET_STATUS, CaptureId);
+
+	SScoped<CAPTURE_STATUS_RPL> rpl;
+	SB_STATUS Status = CallServer(&req.v.h, &rpl);
+	if (!Status || !rpl)
+		return Status;
+	if (rpl.Size() < sizeof(MSG_HEADER))
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	if (!NT_SUCCESS(rpl->h.status))
+		return SB_ERR(rpl->h.status);
+	if (rpl.Size() < offsetof(CAPTURE_STATUS_RPL, session))
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	Status = CSbieAPI__ValidateCaptureReply(
+		rpl->wire_version, rpl->struct_size, rpl.Size(),
+		sizeof(CAPTURE_STATUS_RPL));
+	if (!Status)
+		return Status;
+
+	return CSbieAPI__CaptureSessionFromWire(rpl->session);
+}
+
+SB_RESULT(SSbieCaptureList) CSbieAPI::ListCaptures(
+	quint32 StartIndex, quint32 MaxEntries)
+{
+	CAPTURE_LIST_REQ req = {};
+	req.v.h.length = sizeof(req);
+	req.v.h.msgid = MSGID_CAPTURE_LIST;
+	req.v.wire_version = CAPTURE_WIRE_VERSION;
+	req.v.struct_size = sizeof(req);
+	req.start_index = StartIndex;
+	req.max_entries = MaxEntries;
+
+	SScoped<CAPTURE_LIST_RPL> rpl;
+	SB_STATUS Status = CallServer(&req.v.h, &rpl);
+	if (!Status || !rpl)
+		return Status;
+	if (rpl.Size() < sizeof(MSG_HEADER))
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	if (!NT_SUCCESS(rpl->h.status))
+		return SB_ERR(rpl->h.status);
+
+	const size_t HeaderSize = offsetof(CAPTURE_LIST_RPL, sessions);
+	if (rpl.Size() < HeaderSize)
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	Status = CSbieAPI__ValidateCaptureReply(
+		rpl->wire_version, rpl->struct_size, rpl.Size(), HeaderSize);
+	if (!Status)
+		return Status;
+	if (rpl->struct_size != HeaderSize)
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+
+	if (rpl->returned_count > (rpl.Size() - HeaderSize) /
+			sizeof(CAPTURE_SESSION_INFO))
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	if (rpl->returned_count > rpl->total_count ||
+		(rpl->next_index && rpl->next_index > rpl->total_count))
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+
+	SSbieCaptureList List;
+	List.TotalCount = rpl->total_count;
+	List.NextIndex = rpl->next_index;
+	for (ULONG i = 0; i < rpl->returned_count; ++i) {
+		auto Session = CSbieAPI__CaptureSessionFromWire(rpl->sessions[i]);
+		if (Session.IsError())
+			return Session;
+		List.Sessions.append(Session.GetValue());
+	}
+
+	return List;
+}
+
+
+SB_RESULT(SSbieCaptureEvents) CSbieAPI::ReadCaptureEvents(
+	const SSbieCaptureId& CaptureId, quint32 MaxEvents)
+{
+	if (CaptureId.IsNull() || MaxEvents > CAPTURE_MAX_EVENT_ENTRIES)
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+
+	CAPTURE_READ_EVENTS_REQ req = {};
+	req.v.h.length = sizeof(req);
+	req.v.h.msgid = MSGID_CAPTURE_READ_EVENTS;
+	req.v.wire_version = CAPTURE_WIRE_VERSION;
+	req.v.struct_size = sizeof(req);
+	req.capture_id.high = CaptureId.High;
+	req.capture_id.low = CaptureId.Low;
+	req.max_events = MaxEvents;
+
+	SScoped<CAPTURE_READ_EVENTS_RPL> rpl;
+	SB_STATUS Status = CallServer(&req.v.h, &rpl);
+	if (!Status || !rpl)
+		return Status;
+	if (rpl.Size() < sizeof(MSG_HEADER))
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	if (!NT_SUCCESS(rpl->h.status))
+		return SB_ERR(rpl->h.status);
+
+	const size_t HeaderSize = offsetof(CAPTURE_READ_EVENTS_RPL, events);
+	if (rpl.Size() < HeaderSize)
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	Status = CSbieAPI__ValidateCaptureReply(
+		rpl->wire_version, rpl->struct_size, rpl.Size(), HeaderSize);
+	if (!Status)
+		return Status;
+	if (rpl->struct_size != HeaderSize ||
+		rpl->capture_id.high != CaptureId.High ||
+		rpl->capture_id.low != CaptureId.Low)
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+
+	quint32 EffectiveMax = MaxEvents ? MaxEvents : CAPTURE_MAX_EVENT_ENTRIES;
+	if (rpl->returned_events > EffectiveMax ||
+		rpl->returned_events > (rpl.Size() - HeaderSize) /
+			sizeof(CAPTURE_CONNECTION_EVENT) ||
+		rpl->remaining_events > CAPTURE_DRIVER_QUEUE_CAPACITY)
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+
+	SSbieCaptureEvents Result;
+	Result.Id = CaptureId;
+	Result.NextSequence = rpl->next_sequence;
+	Result.OldestSequence = rpl->oldest_sequence;
+	Result.NewestSequence = rpl->newest_sequence;
+	Result.DroppedCount = rpl->dropped_count;
+	Result.RemainingEvents = rpl->remaining_events;
+
+	quint64 PreviousSequence = 0;
+	for (ULONG index = 0; index < rpl->returned_events; ++index) {
+		const CAPTURE_CONNECTION_EVENT& Wire = rpl->events[index];
+		if (!Wire.sequence ||
+			(PreviousSequence && Wire.sequence <= PreviousSequence) ||
+			(Wire.address_family != CAPTURE_ADDRESS_FAMILY_IPV4 &&
+			 Wire.address_family != CAPTURE_ADDRESS_FAMILY_IPV6) ||
+			(Wire.event_type != SSbieCaptureEvent::eConnectAttempt &&
+			 Wire.event_type != SSbieCaptureEvent::eAcceptAttempt) ||
+			(Wire.direction != SSbieCaptureEvent::eOutbound &&
+			 Wire.direction != SSbieCaptureEvent::eInbound) ||
+			Wire.blocked > 1 || Wire.loopback > 1 ||
+			Wire.reserved1 || Wire.reserved2) {
+			return SB_ERR(STATUS_INVALID_PARAMETER);
+		}
+
+		SSbieCaptureEvent Event;
+		Event.Sequence = Wire.sequence;
+		Event.Timestamp = Wire.timestamp;
+		Event.ProcessCreateTime = Wire.process_create_time;
+		Event.ProcessId = Wire.process_id;
+		Event.SessionId = Wire.session_id;
+		Event.AddressFamily = Wire.address_family;
+		Event.Protocol = Wire.protocol;
+		Event.Type = Wire.event_type;
+		Event.Direction = Wire.direction;
+		Event.Blocked = Wire.blocked != 0;
+		Event.Loopback = Wire.loopback != 0;
+		Event.LocalPort = Wire.local_port;
+		Event.RemotePort = Wire.remote_port;
+		const int AddressSize = Wire.address_family ==
+			CAPTURE_ADDRESS_FAMILY_IPV4 ? 4 : 16;
+		Event.LocalAddress = QByteArray(
+			reinterpret_cast<const char *>(Wire.local_address), AddressSize);
+		Event.RemoteAddress = QByteArray(
+			reinterpret_cast<const char *>(Wire.remote_address), AddressSize);
+		Result.Events.append(Event);
+		PreviousSequence = Wire.sequence;
+	}
+
+	if (rpl->returned_events &&
+		Result.NextSequence != Result.Events.constLast().Sequence)
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+
+	return Result;
 }
 
 const QVector<CTraceEntryPtr>& CSbieAPI::GetTrace()

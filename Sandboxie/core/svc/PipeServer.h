@@ -121,6 +121,12 @@ public:
     static ULONG GetCallerSessionId();
 
     /*
+     * Get the creation time recorded when the caller connected.
+     */
+
+    static bool GetCallerProcessCreateTime(ULONG64 *createTime);
+
+    /*
      * Impersonate caller security context
      */
 
@@ -156,7 +162,9 @@ protected:
 
     struct SClient
     {
+        HANDLE idProcess;
         HANDLE idThread;
+        LARGE_INTEGER CreateTime;
         BOOLEAN replying;
         volatile BOOLEAN in_use;
         UCHAR sequence;
@@ -254,7 +262,7 @@ protected:
      * Notify registered sub-servers of an ended process
      */
 
-    void NotifyTargets(HANDLE idProcess);
+    void NotifyTargets(HANDLE idProcess, ULONG64 processCreateTime = 0);
 
 protected:
 

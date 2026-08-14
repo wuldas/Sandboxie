@@ -1,0 +1,95 @@
+/*
+ * Copyright 2026 David Xanatos, xanasoft.com
+ *
+ * This program is free software: you can redistribute it and/or modify
+ *   it under the terms of the GNU General Public License as published by
+ *   the Free Software Foundation, either version 3 of the License, or
+ *   (at your option) any later version.
+ *
+ * This program is distributed in the hope that it will be useful,
+ *   but WITHOUT ANY WARRANTY; without even the implied warranty of
+ *   MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the
+ *   GNU General Public License for more details.
+ *
+ * You should have received a copy of the GNU General Public License
+ *   along with this program.  If not, see <https://www.gnu.org/licenses/>.
+ */
+
+//---------------------------------------------------------------------------
+// Capture Wire Boundary Tests
+//---------------------------------------------------------------------------
+
+#include <ntstatus.h>
+#define WIN32_NO_STATUS
+typedef long NTSTATUS;
+
+#include <windows.h>
+#include <stddef.h>
+#include <stdio.h>
+
+#include "../../Sandboxie/common/win32_ntddk.h"
+#include "../../Sandboxie/common/defines.h"
+
+#undef C_ASSERT
+#define C_ASSERT(expression) static_assert((expression), #expression)
+
+#include "../../Sandboxie/core/drv/api_defs.h"
+#include "../../Sandboxie/core/svc/capturewire.h"
+
+
+static_assert(sizeof(CAPTURE_DRIVER_EVENT) ==
+              sizeof(CAPTURE_CONNECTION_EVENT),
+              "driver and service event sizes differ");
+static_assert(offsetof(CAPTURE_DRIVER_EVENT, sequence) ==
+              offsetof(CAPTURE_CONNECTION_EVENT, sequence),
+              "driver and service sequence offsets differ");
+static_assert(offsetof(CAPTURE_DRIVER_EVENT, local_address) ==
+              offsetof(CAPTURE_CONNECTION_EVENT, local_address),
+              "driver and service local-address offsets differ");
+static_assert(offsetof(CAPTURE_DRIVER_EVENT, remote_address) ==
+              offsetof(CAPTURE_CONNECTION_EVENT, remote_address),
+              "driver and service remote-address offsets differ");
+static_assert(CAPTURE_DRIVER_EVENT_CONNECT == 1,
+              "driver connect event value changed");
+static_assert(CAPTURE_DRIVER_EVENT_ACCEPT == 2,
+              "driver accept event value changed");
+static_assert(CAPTURE_DRIVER_DIRECTION_OUTBOUND == 1,
+              "driver outbound value changed");
+static_assert(CAPTURE_DRIVER_DIRECTION_INBOUND == 2,
+              "driver inbound value changed");
+
+
+static int Require(bool condition, const char *message)
+{
+    if (! condition) {
+        fprintf(stderr, "FAILED: %s\n", message);
+        return 0;
+    }
+    return 1;
+}
+
+
+int main()
+{
+    const size_t maximumEventReply =
+        offsetof(CAPTURE_READ_EVENTS_RPL, events) +
+        CAPTURE_MAX_EVENT_ENTRIES * sizeof(CAPTURE_CONNECTION_EVENT);
+    const size_t maximumListReply =
+        offsetof(CAPTURE_LIST_RPL, sessions) +
+        64 * sizeof(CAPTURE_SESSION_INFO);
+
+    if (!Require(sizeof(CAPTURE_READ_EVENTS_REQ) <= CAPTURE_MAX_REQUEST_SIZE,
+                 "event request exceeds service request limit") ||
+            !Require(maximumEventReply <= CAPTURE_MAX_REPLY_SIZE,
+                     "event reply exceeds Capture reply limit") ||
+            !Require(maximumListReply <= CAPTURE_MAX_REPLY_SIZE,
+                     "list reply exceeds Capture reply limit") ||
+            !Require(CAPTURE_DRIVER_MAX_READ_EVENTS ==
+                     CAPTURE_MAX_EVENT_ENTRIES,
+                     "driver and service event batch limits differ")) {
+        return 1;
+    }
+
+    printf("capture wire tests passed\n");
+    return 0;
+}

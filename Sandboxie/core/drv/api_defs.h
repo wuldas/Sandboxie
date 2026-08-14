@@ -166,6 +166,8 @@ enum {
     API_MONITOR_PUT_EX,
     API_UPDATE_CONF,
     API_VERIFY,
+    API_CAPTURE_CONTROL,
+    API_CAPTURE_READ,
 
     API_LAST
 };
@@ -491,6 +493,135 @@ API_ARGS_FIELD(ULONG,info_class)
 API_ARGS_FIELD(VOID *,info_data)
 API_ARGS_FIELD(ULONG ,info_len)
 API_ARGS_CLOSE(API_QUERY_DRIVER_INFO_ARGS)
+
+
+#define CAPTURE_DRIVER_VERSION                  1
+
+#define CAPTURE_DRIVER_CONTROL_QUERY            1
+#define CAPTURE_DRIVER_CONTROL_START            2
+#define CAPTURE_DRIVER_CONTROL_STOP             3
+
+#define CAPTURE_DRIVER_SCOPE_BOX                1
+#define CAPTURE_DRIVER_SCOPE_PROCESS            2
+
+#define CAPTURE_DRIVER_FLAG_INCLUDE_FUTURE      0x00000001
+#define CAPTURE_DRIVER_FLAG_INCLUDE_LOOPBACK    0x00000002
+
+#define CAPTURE_DRIVER_EVENT_CONNECT            1
+#define CAPTURE_DRIVER_EVENT_ACCEPT             2
+
+#define CAPTURE_DRIVER_DIRECTION_OUTBOUND       1
+#define CAPTURE_DRIVER_DIRECTION_INBOUND        2
+
+#define CAPTURE_DRIVER_MAX_SESSIONS             32
+#define CAPTURE_DRIVER_QUEUE_CAPACITY           256
+#define CAPTURE_DRIVER_MAX_READ_EVENTS          32
+#define CAPTURE_DRIVER_MAX_INITIAL_PROCESSES    512
+
+
+#pragma pack(push, 8)
+
+typedef struct _CAPTURE_DRIVER_SESSION_ID {
+
+    ULONG64 high;
+    ULONG64 low;
+
+} CAPTURE_DRIVER_SESSION_ID;
+
+
+typedef struct _CAPTURE_DRIVER_PROCESS_KEY {
+
+    ULONG process_id;
+    ULONG reserved;
+    ULONG64 process_create_time;
+
+} CAPTURE_DRIVER_PROCESS_KEY;
+
+
+typedef struct _CAPTURE_DRIVER_CONTROL {
+
+    ULONG version;
+    ULONG size;
+    ULONG operation;
+    ULONG scope;
+    ULONG flags;
+    ULONG target_pid;
+    ULONG target_session_id;
+    ULONG queue_capacity;
+    ULONG64 target_process_create_time;
+    CAPTURE_DRIVER_SESSION_ID capture_id;
+    WCHAR box_name[BOXNAME_COUNT];
+    WCHAR sid_string[96];
+    ULONG initial_process_count;
+    ULONG reserved;
+    CAPTURE_DRIVER_PROCESS_KEY initial_processes[1];
+
+} CAPTURE_DRIVER_CONTROL;
+
+
+typedef struct _CAPTURE_DRIVER_EVENT {
+
+    ULONG64 sequence;
+    ULONG64 timestamp;
+    ULONG64 process_create_time;
+    ULONG process_id;
+    ULONG session_id;
+    USHORT address_family;
+    UCHAR protocol;
+    UCHAR event_type;
+    UCHAR direction;
+    UCHAR blocked;
+    UCHAR loopback;
+    UCHAR reserved1;
+    USHORT local_port;
+    USHORT remote_port;
+    ULONG reserved2;
+    UCHAR local_address[16];
+    UCHAR remote_address[16];
+
+} CAPTURE_DRIVER_EVENT;
+
+
+typedef struct _CAPTURE_DRIVER_READ {
+
+    ULONG version;
+    ULONG size;
+    CAPTURE_DRIVER_SESSION_ID capture_id;
+    ULONG64 next_sequence;
+    ULONG64 oldest_sequence;
+    ULONG64 newest_sequence;
+    ULONG64 dropped_count;
+    ULONG max_events;
+    ULONG returned_events;
+    ULONG remaining_events;
+    ULONG reserved;
+    CAPTURE_DRIVER_EVENT events[1];
+
+} CAPTURE_DRIVER_READ;
+
+#pragma pack(pop)
+
+#define CAPTURE_DRIVER_CONTROL_BASE_SIZE \
+    ((ULONG)FIELD_OFFSET(CAPTURE_DRIVER_CONTROL, initial_processes))
+#define CAPTURE_DRIVER_READ_BASE_SIZE \
+    ((ULONG)FIELD_OFFSET(CAPTURE_DRIVER_READ, events))
+
+C_ASSERT(sizeof(CAPTURE_DRIVER_SESSION_ID) == 16);
+C_ASSERT(sizeof(CAPTURE_DRIVER_PROCESS_KEY) == 16);
+C_ASSERT(CAPTURE_DRIVER_CONTROL_BASE_SIZE == 336);
+C_ASSERT(sizeof(CAPTURE_DRIVER_EVENT) == 80);
+C_ASSERT(CAPTURE_DRIVER_READ_BASE_SIZE == 72);
+
+
+API_ARGS_BEGIN(API_CAPTURE_CONTROL_ARGS)
+API_ARGS_FIELD(CAPTURE_DRIVER_CONTROL *,control)
+API_ARGS_CLOSE(API_CAPTURE_CONTROL_ARGS)
+
+
+API_ARGS_BEGIN(API_CAPTURE_READ_ARGS)
+API_ARGS_FIELD(CAPTURE_DRIVER_READ *,read)
+API_ARGS_FIELD(ULONG,read_size)
+API_ARGS_CLOSE(API_CAPTURE_READ_ARGS)
 
 
 API_ARGS_BEGIN(API_SECURE_PARAM_ARGS)

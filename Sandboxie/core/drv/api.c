@@ -30,6 +30,7 @@
 #include "session.h"
 #include "common/my_version.h"
 #include "log_buff.h"
+#include "capture.h"
 #define KERNEL_MODE
 #include "verify.h"
 #include "dyn_data.h"
@@ -837,6 +838,7 @@ _FX void Api_ResetServiceProcess(void)
     }
 
     InterlockedExchangePointer(&Api_ServiceProcessId, NULL);
+    Capture_Reset();
 }
 
 

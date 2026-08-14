@@ -606,6 +606,8 @@ const wchar_t* Trace_SbieDrvFunc2Str(ULONG func)
         case API_GET_DYNAMIC_PORT_FROM_PID:     return L"API_GET_DYNAMIC_PORT_FROM_PID";
         case API_OPEN_DYNAMIC_PORT:             return L"API_OPEN_DYNAMIC_PORT";
         case API_QUERY_DRIVER_INFO:             return L"API_QUERY_DRIVER_INFO";
+        case API_CAPTURE_CONTROL:               return L"API_CAPTURE_CONTROL";
+        case API_CAPTURE_READ:                  return L"API_CAPTURE_READ";
         default:                                return L"API_UNKNOWN";
     }
 }
@@ -712,6 +714,13 @@ const wchar_t* Trace_SbieSvcFunc2Str(ULONG func)
         case MSGID_QUEUE_NOTIFICATION:          return L"MSGID_QUEUE_NOTIFICATION";
 
         case MSGID_EPMAPPER_GET_PORT_NAME:      return L"MSGID_EPMAPPER_GET_PORT_NAME";
+
+        case MSGID_CAPTURE_QUERY_CAPS:          return L"MSGID_CAPTURE_QUERY_CAPS";
+        case MSGID_CAPTURE_START:               return L"MSGID_CAPTURE_START";
+        case MSGID_CAPTURE_STOP:                return L"MSGID_CAPTURE_STOP";
+        case MSGID_CAPTURE_GET_STATUS:          return L"MSGID_CAPTURE_GET_STATUS";
+        case MSGID_CAPTURE_LIST:                return L"MSGID_CAPTURE_LIST";
+        case MSGID_CAPTURE_NOTIFICATION:        return L"MSGID_CAPTURE_NOTIFICATION";
 
         default:                                return L"MSGID_UNKNOWN";
     }
