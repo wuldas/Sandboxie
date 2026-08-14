@@ -21,6 +21,7 @@ class CBoxBorder;
 class CSbieTemplatesEx;
 class CTraceView;
 class CCaptureView;
+class CPacketCaptureView;
 class CScriptManager;
 class CAddonManager;
 
@@ -286,6 +287,7 @@ private slots:
 	void				OnReloadIni();
 	void				OnMonitoring();
 	void				OnConnectionAudit();
+	void				OnPacketCapture();
 	void				ShowConnectionAudit(bool bStart);
 
 	void				OnSymbolStatus(const QString& Message);
@@ -380,6 +382,7 @@ private:
 	CPanelWidgetEx*		m_pMessageLog;
 	CTraceView*			m_pTraceView;
 	CCaptureView*		m_pCaptureView;
+	CPacketCaptureView*	m_pPacketCaptureView;
 	CPanelWidgetEx*		m_pRecoveryLog;
 	class CRecoveryLogWnd* m_pRecoveryLogWnd;
 
@@ -451,6 +454,7 @@ private:
 	QAction*			m_pReloadIni;
 	QAction*			m_pEnableMonitoring;
 	QAction*			m_pEnableCapture;
+	QAction*			m_pEnablePacketCapture;
 
 	//QMenu*				m_pMenuTools;
 	QAction*			m_pBoxAssistant;

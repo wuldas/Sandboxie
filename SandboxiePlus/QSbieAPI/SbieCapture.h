@@ -36,6 +36,16 @@ struct QSBIEAPI_EXPORT SSbieCaptureId
 
 struct QSBIEAPI_EXPORT SSbieCaptureCapabilities
 {
+    enum EFlags
+    {
+        eControl = 0x00000001,
+        eConnectionAudit = 0x00000002,
+        ePacketCapture = 0x00000004,
+        eHttpsInspection = 0x00000008,
+        ePcapngExport = 0x00000010,
+        eHarExport = 0x00000020,
+    };
+
     quint32 WireVersion = 0;
     quint32 MinWireVersion = 0;
     quint32 MaxWireVersion = 0;
@@ -81,6 +91,15 @@ struct QSBIEAPI_EXPORT SSbieCaptureStart
 
 struct QSBIEAPI_EXPORT SSbieCaptureSession
 {
+    enum EState
+    {
+        eStarting = 1,
+        eWaitingForBackend = 2,
+        eRunning = 3,
+        eStopped = 4,
+        eFailed = 5,
+    };
+
     SSbieCaptureId Id;
     quint32 State = 0;
     quint32 Scope = 0;

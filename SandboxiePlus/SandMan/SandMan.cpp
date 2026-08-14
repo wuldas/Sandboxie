@@ -19,6 +19,7 @@
 #include "../MiscHelpers/Common/ListItemModel.h"
 #include "Views/TraceView.h"
 #include "Views/CaptureView.h"
+#include "Views/PacketCaptureView.h"
 #include "Windows/SelectBoxWindow.h"
 #include "../UGlobalHotkey/uglobalhotkeys.h"
 #include "Wizards/SetupWizard.h"
@@ -944,6 +945,7 @@ void CSandMan::CreateMenus(bool bAdvanced)
 	if (bAdvanced)
 		m_pEnableMonitoring->setCheckable(true);
 		m_pEnableCapture = m_pMenuView->addAction(CSandMan::GetIcon("Connect"), tr("Connection Audit"), this, SLOT(OnConnectionAudit()));
+		m_pEnablePacketCapture = m_pMenuView->addAction(CSandMan::GetIcon("Connect"), tr("Packet Capture"), this, SLOT(OnPacketCapture()));
 	if (!bAdvanced)
 		m_pMenuView->addAction(CSandMan::GetIcon("Recover"), tr("Recovery Log"), this, SLOT(OnRecoveryLog()));
 
@@ -1019,6 +1021,7 @@ void CSandMan::CreateOldMenus()
 		m_pWndFinder = m_pMenuFile->addAction(CSandMan::GetIcon("finder"), tr("Is Window Sandboxed?"), this, SLOT(OnWndFinder()));
 		m_pEnableMonitoring = m_pMenuFile->addAction(CSandMan::GetIcon("SetLogging"), tr("Resource Access Monitor"), this, SLOT(OnMonitoring()));
 		m_pEnableCapture = m_pMenuFile->addAction(CSandMan::GetIcon("Connect"), tr("Connection Audit"), this, SLOT(OnConnectionAudit()));
+		m_pEnablePacketCapture = m_pMenuFile->addAction(CSandMan::GetIcon("Connect"), tr("Packet Capture"), this, SLOT(OnPacketCapture()));
 
 		m_pMenuFile->addSeparator();
 
@@ -1559,6 +1562,7 @@ void CSandMan::CreateView(int iViewMode)
 		m_pMessageLog = NULL;
 		m_pTraceView = NULL;
 		m_pCaptureView = NULL;
+		m_pPacketCaptureView = NULL;
 		m_pRecoveryLog = NULL;
 
 		return;
@@ -1631,6 +1635,9 @@ void CSandMan::CreateView(int iViewMode)
 		m_pCaptureView = new CCaptureView(false, this);
 		m_pLogTabs->addTab(m_pCaptureView, tr("Connection Audit"));
 
+		m_pPacketCaptureView = new CPacketCaptureView(false, this);
+		m_pLogTabs->addTab(m_pPacketCaptureView, tr("Packet Capture"));
+
 
 		// Recovery Log
 		m_pRecoveryLog = new CPanelWidgetEx();
@@ -1662,6 +1669,7 @@ void CSandMan::CreateView(int iViewMode)
 		m_pMessageLog = NULL;
 		m_pTraceView = NULL;
 		m_pCaptureView = NULL;
+		m_pPacketCaptureView = NULL;
 		m_pRecoveryLog = NULL;
 	}
 }
@@ -3115,6 +3123,7 @@ void CSandMan::UpdateState()
 	m_pReloadIni->setEnabled(isConnected);
 	if(m_pEnableMonitoring) m_pEnableMonitoring->setEnabled(isConnected);
 	if(m_pEnableCapture) m_pEnableCapture->setEnabled(isConnected);
+	if(m_pEnablePacketCapture) m_pEnablePacketCapture->setEnabled(isConnected);
 
 	if (m_pNewBoxButton) m_pNewBoxButton->setEnabled(isConnected);
 	if (m_pEditIniButton) m_pEditIniButton->setEnabled(isConnected);
@@ -4534,6 +4543,32 @@ void CSandMan::OnMonitoring()
 void CSandMan::OnConnectionAudit()
 {
 	ShowConnectionAudit(false);
+}
+
+void CSandMan::OnPacketCapture()
+{
+    if (m_pPacketCaptureView) {
+        m_pPacketCaptureView->RefreshBoxes();
+        m_pPacketCaptureView->RefreshCapabilities();
+        if (m_pLogTabs) {
+            if (!m_pToolBar->isVisible())
+                m_pLogTabs->show();
+            int index = m_pLogTabs->indexOf(m_pPacketCaptureView);
+            if (index >= 0)
+                m_pLogTabs->setCurrentIndex(index);
+        }
+        return;
+    }
+
+    static CPacketCaptureWindow* pPacketWindow = NULL;
+    if (!pPacketWindow) {
+        pPacketWindow = new CPacketCaptureWindow();
+        connect(this, SIGNAL(Closed()), pPacketWindow, SLOT(close()));
+        connect(pPacketWindow, &CPacketCaptureWindow::Closed, [&]() {
+            pPacketWindow = NULL;
+        });
+        SafeShow(pPacketWindow);
+    }
 }
 
 void CSandMan::OnBoxConnectionAudit()
