@@ -504,6 +504,46 @@ static int TestRotationWritesFreshShbIdb(void)
 }
 
 
+static int TestOpenHandleUsesCallerFile(void)
+{
+    WCHAR path[MAX_PATH];
+    MakeTempPath(path, MAX_PATH, L"sbie-pcapng-handle.pcapng");
+    DeleteFileW(path);
+
+    HANDLE file = CreateFileW(
+        path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (! Require(file != INVALID_HANDLE_VALUE, "open caller output handle"))
+        return 0;
+
+    PCAPNG_WRITER *writer = PcapngWriter_OpenHandle(
+        file, path, 256, 1024 * 1024, 0);
+    if (! Require(writer != NULL, "open writer from caller handle")) {
+        CloseHandle(file);
+        DeleteFileW(path);
+        return 0;
+    }
+
+    int status = WriteMinimalPacket(writer);
+    PcapngWriter_Close(writer);
+    if (! Require(status == PCAPNG_OK, "write through caller handle")) {
+        DeleteFileW(path);
+        return 0;
+    }
+
+    UCHAR *bytes = NULL;
+    DWORD size = 0;
+    int ok = Require(ReadAll(path, &bytes, &size), "read caller-handle output");
+    if (ok)
+        ok = Require(size >= 32 && ReadU32(bytes, 0) == PCAPNG_SHB_TYPE,
+                     "caller-handle output has SHB");
+
+    free(bytes);
+    DeleteFileW(path);
+    return ok;
+}
+
+
 int main(int argc, char **argv)
 {
     if (argc >= 3 && strcmp(argv[1], "--write") == 0) {
@@ -523,7 +563,8 @@ int main(int argc, char **argv)
             ! TestEpbCommentContainsProcessMetadata() ||
             ! TestSnaplenClampsCapturedButKeepsOriginal() ||
             ! TestSizeLimitStopsWhenRotationDisabled() ||
-            ! TestRotationWritesFreshShbIdb())
+            ! TestRotationWritesFreshShbIdb() ||
+            ! TestOpenHandleUsesCallerFile())
         return 1;
 
     printf("pcapng tests passed\n");

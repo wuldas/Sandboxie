@@ -243,13 +243,24 @@ static BOOL Pcapng_OpenIndex(PCAPNG_WRITER *writer, ULONG index)
 }
 
 
-PCAPNG_WRITER *PcapngWriter_OpenPath(
+static BOOL Pcapng_GetPathFromHandle(
+    HANDLE file, WCHAR *path, ULONG capacity)
+{
+    DWORD length = GetFinalPathNameByHandleW(
+        file, path, capacity, FILE_NAME_NORMALIZED);
+    return length != 0 && length < capacity;
+}
+
+
+static PCAPNG_WRITER *Pcapng_AllocateWriter(
+    HANDLE file,
     const WCHAR *path,
     ULONG snaplen,
     ULONG max_file_bytes,
     ULONG rotate_count)
 {
-    if (! path || ! path[0])
+    if ((file == NULL || file == INVALID_HANDLE_VALUE) &&
+            (! path || ! path[0]))
         return NULL;
 
     if (snaplen == 0)
@@ -264,16 +275,76 @@ PCAPNG_WRITER *PcapngWriter_OpenPath(
     if (! writer)
         return NULL;
 
-    writer->file = INVALID_HANDLE_VALUE;
+    writer->file = file;
     writer->snaplen = snaplen;
     writer->max_file_bytes = max_file_bytes;
     writer->rotate_count = rotate_count;
-    if (wcscpy_s(writer->path, ARRAYSIZE(writer->path), path) != 0) {
+    if (path && path[0] &&
+            wcscpy_s(writer->path, ARRAYSIZE(writer->path), path) != 0) {
+        HeapFree(GetProcessHeap(), 0, writer);
+        return NULL;
+    }
+    if ((! path || ! path[0]) && rotate_count != 0 &&
+            ! Pcapng_GetPathFromHandle(
+                file, writer->path, ARRAYSIZE(writer->path))) {
         HeapFree(GetProcessHeap(), 0, writer);
         return NULL;
     }
 
+    return writer;
+}
+
+
+static BOOL Pcapng_InitializeHandle(PCAPNG_WRITER *writer)
+{
+    if (SetFilePointer(writer->file, 0, NULL, FILE_BEGIN) == INVALID_SET_FILE_POINTER &&
+            GetLastError() != NO_ERROR)
+        return FALSE;
+    if (! SetEndOfFile(writer->file))
+        return FALSE;
+    writer->file_index = 0;
+    writer->file_bytes = 0;
+    return Pcapng_WriteHeaders(writer);
+}
+
+
+PCAPNG_WRITER *PcapngWriter_OpenPath(
+    const WCHAR *path,
+    ULONG snaplen,
+    ULONG max_file_bytes,
+    ULONG rotate_count)
+{
+    if (! path || ! path[0])
+        return NULL;
+
+    PCAPNG_WRITER *writer = Pcapng_AllocateWriter(
+        INVALID_HANDLE_VALUE, path, snaplen, max_file_bytes, rotate_count);
+    if (! writer)
+        return NULL;
+    writer->file = INVALID_HANDLE_VALUE;
+
     if (! Pcapng_OpenIndex(writer, 0)) {
+        PcapngWriter_Close(writer);
+        return NULL;
+    }
+
+    return writer;
+}
+
+
+PCAPNG_WRITER *PcapngWriter_OpenHandle(
+    HANDLE file,
+    const WCHAR *rotation_path,
+    ULONG snaplen,
+    ULONG max_file_bytes,
+    ULONG rotate_count)
+{
+    PCAPNG_WRITER *writer = Pcapng_AllocateWriter(
+        file, rotation_path, snaplen, max_file_bytes, rotate_count);
+    if (! writer)
+        return NULL;
+
+    if (! Pcapng_InitializeHandle(writer)) {
         PcapngWriter_Close(writer);
         return NULL;
     }

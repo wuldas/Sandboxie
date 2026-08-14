@@ -9,6 +9,8 @@ Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "ImBox", "ImBox\ImBox.vcxpro
 EndProject
 Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "MiniDump", "MiniDump\MiniDump.vcxproj", "{A3B5C8D1-2E4F-6A7B-9C0D-1E2F3A4B5C6D}"
 EndProject
+Project("{8BC9CEB8-8B4A-11D0-8D11-00A0C91BC942}") = "SbieCapture", "SbieCapture\SbieCapture.vcxproj", "{B59F5C6B-2A4D-4FE8-9D6B-0D15AFC45F67}"
+EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
 		Debug|ARM64 = Debug|ARM64
@@ -54,6 +56,10 @@ Global
 		{A3B5C8D1-2E4F-6A7B-9C0D-1E2F3A4B5C6D}.Release|x64.Build.0 = Release|x64
 		{A3B5C8D1-2E4F-6A7B-9C0D-1E2F3A4B5C6D}.Release|x86.ActiveCfg = Release|Win32
 		{A3B5C8D1-2E4F-6A7B-9C0D-1E2F3A4B5C6D}.Release|x86.Build.0 = Release|Win32
+		{B59F5C6B-2A4D-4FE8-9D6B-0D15AFC45F67}.Debug|x64.ActiveCfg = Debug|x64
+		{B59F5C6B-2A4D-4FE8-9D6B-0D15AFC45F67}.Debug|x64.Build.0 = Debug|x64
+		{B59F5C6B-2A4D-4FE8-9D6B-0D15AFC45F67}.Release|x64.ActiveCfg = Release|x64
+		{B59F5C6B-2A4D-4FE8-9D6B-0D15AFC45F67}.Release|x64.Build.0 = Release|x64
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

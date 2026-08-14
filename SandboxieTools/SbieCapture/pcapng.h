@@ -60,6 +60,13 @@ PCAPNG_WRITER *PcapngWriter_OpenPath(
     ULONG max_file_bytes,
     ULONG rotate_count);
 
+PCAPNG_WRITER *PcapngWriter_OpenHandle(
+    HANDLE file,
+    const WCHAR *rotation_path,
+    ULONG snaplen,
+    ULONG max_file_bytes,
+    ULONG rotate_count);
+
 void PcapngWriter_Close(PCAPNG_WRITER *writer);
 
 int PcapngWriter_Write(PCAPNG_WRITER *writer, const PCAPNG_PACKET *packet);
