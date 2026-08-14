@@ -42,10 +42,10 @@ static BOOL CaptureBroker_ValidateSection(
             section->version != CAPTURE_BROKER_SECTION_VERSION ||
             section->record_capacity == 0 ||
             section->record_capacity > CAPTURE_BROKER_MAX_RECORD_CAPACITY ||
-            section->size < CAPTURE_BROKER_SECTION_BASE_SIZE ||
-            section->record_capacity >
-                (section->size - CAPTURE_BROKER_SECTION_BASE_SIZE) /
-                sizeof(CAPTURE_PACKET_RECORD) ||
+            section->size != CAPTURE_BROKER_SECTION_SIZE(
+                section->record_capacity) ||
+            section->reserved != 0 ||
+            section->reserved2 != 0 ||
             ! CaptureBroker_StringTerminated(
                 section->box_name, ARRAYSIZE(section->box_name)) ||
             ! CaptureBroker_StringTerminated(
@@ -142,13 +142,22 @@ int CaptureBroker_Run(
     CAPTURE_BROKER_SECTION *section,
     const CAPTURE_BROKER_OPTIONS *options)
 {
-    if (! options || options->output_file == NULL ||
-            options->output_file == INVALID_HANDLE_VALUE ||
-            ! CaptureBroker_ValidateSection(section)) {
+    if (! section || ! CaptureBroker_ValidateSection(section)) {
+        if (section) {
+            section->broker_status = CAPTURE_BROKER_STATE_FAILED;
+            section->error_status = ERROR_INVALID_DATA;
+        }
         if (options && options->output_file &&
                 options->output_file != INVALID_HANDLE_VALUE) {
             CloseHandle(options->output_file);
         }
+        return CAPTURE_BROKER_INVALID;
+    }
+
+    if (! options || options->output_file == NULL ||
+            options->output_file == INVALID_HANDLE_VALUE) {
+        section->broker_status = CAPTURE_BROKER_STATE_FAILED;
+        section->error_status = ERROR_INVALID_PARAMETER;
         return CAPTURE_BROKER_INVALID;
     }
 

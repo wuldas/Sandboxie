@@ -210,11 +210,50 @@ static int TestBrokerRotatesAtFileLimit(void)
 }
 
 
+static int TestBrokerRejectsMalformedSection(void)
+{
+    WCHAR path[MAX_PATH];
+    MakeTempPath(path, MAX_PATH, L"sbie-broker-invalid.pcapng");
+    DeleteFileW(path);
+
+    CAPTURE_BROKER_SECTION *section = CreateSection(4);
+    if (! Require(section != NULL, "allocate invalid section"))
+        return 0;
+    section->size = CAPTURE_BROKER_SECTION_BASE_SIZE;
+
+    HANDLE file = CreateFileW(
+        path, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (! Require(file != INVALID_HANDLE_VALUE, "open invalid output")) {
+        free(section);
+        return 0;
+    }
+
+    CAPTURE_BROKER_OPTIONS options;
+    memset(&options, 0, sizeof(options));
+    options.output_file = file;
+    options.snap_length = 256;
+
+    int status = CaptureBroker_Run(section, &options);
+    int ok = Require(status == CAPTURE_BROKER_INVALID,
+                     "malformed section status") &&
+        Require(section->broker_status == CAPTURE_BROKER_STATE_FAILED,
+                "malformed section failed state") &&
+        Require(section->error_status == ERROR_INVALID_DATA,
+                "malformed section error status");
+
+    DeleteFileW(path);
+    free(section);
+    return ok;
+}
+
+
 int main(int argc, char **argv)
 {
     g_keep_outputs = argc == 2 && strcmp(argv[1], "--keep") == 0;
     if (! TestBrokerDrainsRingAndWritesPcapng() ||
-            ! TestBrokerRotatesAtFileLimit())
+            ! TestBrokerRotatesAtFileLimit() ||
+            ! TestBrokerRejectsMalformedSection())
         return 1;
 
     printf("capture broker tests passed\n");
