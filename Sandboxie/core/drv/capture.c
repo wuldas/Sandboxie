@@ -25,6 +25,7 @@
 #include "api.h"
 #include "box.h"
 #include "wfp.h"
+#include "../svc/capturebrokerwire.h"
 
 
 #define CAPTURE_MAX_FLOW_CONTEXTS 4096
@@ -44,6 +45,10 @@ typedef struct _CAPTURE_SESSION {
     CAPTURE_PACKET_QUEUE *packet_queue;
     CAPTURE_STREAM_QUEUE *stream_queue;
     BOOLEAN payload_enabled;
+    HANDLE section_kernel_handle;
+    PVOID section_object;
+    CAPTURE_BROKER_SECTION *section_system_address;
+    SIZE_T section_view_size;
     CAPTURE_FILTER_PROCESS_KEY initial_processes[1];
 
 } CAPTURE_SESSION;
@@ -158,8 +163,107 @@ static CAPTURE_SESSION *Capture_FindSessionLocked(
 }
 
 
+static NTSTATUS Capture_CreateSharedSection(
+    CAPTURE_SESSION *session)
+{
+    if (! session || ! session->payload_enabled)
+        return STATUS_NOT_SUPPORTED;
+    if (session->section_system_address)
+        return STATUS_SUCCESS;
+
+    const ULONG sectionSize = CAPTURE_BROKER_SECTION_SIZE(
+        CAPTURE_BROKER_MAX_RECORD_CAPACITY);
+    LARGE_INTEGER maximumSize;
+    maximumSize.QuadPart = sectionSize;
+
+    OBJECT_ATTRIBUTES attributes;
+    InitializeObjectAttributes(
+        &attributes, NULL, OBJ_KERNEL_HANDLE, NULL, NULL);
+
+    HANDLE sectionHandle = NULL;
+    NTSTATUS status = ZwCreateSection(
+        &sectionHandle,
+        SECTION_ALL_ACCESS,
+        &attributes,
+        &maximumSize,
+        PAGE_READWRITE,
+        SEC_COMMIT,
+        NULL);
+    if (! NT_SUCCESS(status))
+        return status;
+
+    PVOID sectionObject = NULL;
+    status = ObReferenceObjectByHandle(
+        sectionHandle,
+        SECTION_ALL_ACCESS,
+        NULL,
+        KernelMode,
+        &sectionObject,
+        NULL);
+    if (! NT_SUCCESS(status)) {
+        ZwClose(sectionHandle);
+        return status;
+    }
+
+    PVOID baseAddress = NULL;
+    SIZE_T viewSize = 0;
+    status = MmMapViewInSystemSpace(
+        sectionObject, &baseAddress, &viewSize);
+    if (! NT_SUCCESS(status) || viewSize < sectionSize) {
+        if (NT_SUCCESS(status))
+            MmUnmapViewInSystemSpace(baseAddress);
+        ObDereferenceObject(sectionObject);
+        ZwClose(sectionHandle);
+        return NT_SUCCESS(status) ? STATUS_INVALID_BUFFER_SIZE : status;
+    }
+
+    CAPTURE_BROKER_SECTION *shared =
+        (CAPTURE_BROKER_SECTION *)baseAddress;
+    RtlZeroMemory(shared, viewSize);
+    shared->magic = CAPTURE_BROKER_SECTION_MAGIC;
+    shared->version = CAPTURE_BROKER_SECTION_VERSION;
+    shared->size = sectionSize;
+    shared->record_capacity = CAPTURE_BROKER_MAX_RECORD_CAPACITY;
+    RtlCopyMemory(
+        shared->box_name,
+        session->target.box_name,
+        sizeof(shared->box_name));
+    RtlCopyMemory(
+        shared->sid_string,
+        session->target.sid_string,
+        sizeof(shared->sid_string));
+
+    session->section_kernel_handle = sectionHandle;
+    session->section_object = sectionObject;
+    session->section_system_address = shared;
+    session->section_view_size = viewSize;
+    return STATUS_SUCCESS;
+}
+
+
+static void Capture_DestroySharedSection(CAPTURE_SESSION *session)
+{
+    if (! session)
+        return;
+    if (session->section_system_address) {
+        MmUnmapViewInSystemSpace(session->section_system_address);
+        session->section_system_address = NULL;
+    }
+    if (session->section_object) {
+        ObDereferenceObject(session->section_object);
+        session->section_object = NULL;
+    }
+    if (session->section_kernel_handle) {
+        ZwClose(session->section_kernel_handle);
+        session->section_kernel_handle = NULL;
+    }
+    session->section_view_size = 0;
+}
+
+
 static void Capture_FreeSession(CAPTURE_SESSION *session)
 {
+    Capture_DestroySharedSection(session);
     if (session->queue)
         CaptureQueue_Destroy(session->queue, Capture_Free);
     if (session->packet_queue)
@@ -507,6 +611,144 @@ static NTSTATUS Capture_Api_Control(PROCESS *proc, ULONG64 *parms)
 }
 
 
+static NTSTATUS Capture_OpenSharedSectionObjectHandle(
+    PVOID sectionObject, HANDLE *userHandle)
+{
+    if (! sectionObject || ! userHandle)
+        return STATUS_INVALID_PARAMETER;
+
+    *userHandle = NULL;
+    return ObOpenObjectByPointer(
+        sectionObject,
+        0,
+        NULL,
+        SECTION_MAP_READ | SECTION_MAP_WRITE | SECTION_QUERY,
+        NULL,
+        UserMode,
+        userHandle);
+}
+
+
+static NTSTATUS Capture_Api_Map(PROCESS *proc, ULONG64 *parms)
+{
+    API_CAPTURE_MAP_ARGS *args = (API_CAPTURE_MAP_ARGS *)parms;
+    if (proc || PsGetCurrentProcessId() != Api_ServiceProcessId)
+        return STATUS_ACCESS_DENIED;
+
+    CAPTURE_DRIVER_MAP *userMap = args->map.val;
+    if (! userMap)
+        return STATUS_INVALID_PARAMETER;
+
+    CAPTURE_DRIVER_MAP request;
+    RtlZeroMemory(&request, sizeof(request));
+    __try {
+        ProbeForRead(userMap, sizeof(request), sizeof(ULONG));
+        RtlCopyMemory(&request, userMap, sizeof(request));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+
+    if (request.version != CAPTURE_DRIVER_VERSION ||
+            request.size != sizeof(request) ||
+            Capture_IdIsZero(&request.capture_id) ||
+            request.record_capacity || request.section_size ||
+            request.section_handle || request.reserved) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    CAPTURE_SESSION temporary;
+    RtlZeroMemory(&temporary, sizeof(temporary));
+    CAPTURE_SESSION *session = NULL;
+    PVOID referencedObject = NULL;
+    BOOLEAN temporaryCreated = FALSE;
+
+    KIRQL irql;
+    KeAcquireSpinLock(&Capture_Lock, &irql);
+    session = Capture_FindSessionLocked(&request.capture_id);
+    if (! session) {
+        KeReleaseSpinLock(&Capture_Lock, irql);
+        return STATUS_NOT_FOUND;
+    }
+    if (! session->payload_enabled) {
+        KeReleaseSpinLock(&Capture_Lock, irql);
+        return STATUS_NOT_SUPPORTED;
+    }
+    if (session->section_object) {
+        referencedObject = session->section_object;
+        ObReferenceObject(referencedObject);
+    }
+    else {
+        RtlCopyMemory(
+            temporary.target.box_name,
+            session->target.box_name,
+            sizeof(temporary.target.box_name));
+        RtlCopyMemory(
+            temporary.target.sid_string,
+            session->target.sid_string,
+            sizeof(temporary.target.sid_string));
+        temporary.payload_enabled = TRUE;
+    }
+    KeReleaseSpinLock(&Capture_Lock, irql);
+
+    if (! referencedObject) {
+        NTSTATUS createStatus = Capture_CreateSharedSection(&temporary);
+        if (! NT_SUCCESS(createStatus))
+            return createStatus;
+        temporaryCreated = TRUE;
+
+        KeAcquireSpinLock(&Capture_Lock, &irql);
+        session = Capture_FindSessionLocked(&request.capture_id);
+        if (! session || ! session->payload_enabled) {
+            KeReleaseSpinLock(&Capture_Lock, irql);
+            Capture_DestroySharedSection(&temporary);
+            return ! session ? STATUS_NOT_FOUND : STATUS_NOT_SUPPORTED;
+        }
+        if (! session->section_object) {
+            session->section_kernel_handle = temporary.section_kernel_handle;
+            session->section_object = temporary.section_object;
+            session->section_system_address =
+                temporary.section_system_address;
+            session->section_view_size = temporary.section_view_size;
+            temporary.section_kernel_handle = NULL;
+            temporary.section_object = NULL;
+            temporary.section_system_address = NULL;
+            temporary.section_view_size = 0;
+        }
+        referencedObject = session->section_object;
+        ObReferenceObject(referencedObject);
+        KeReleaseSpinLock(&Capture_Lock, irql);
+    }
+
+    if (temporaryCreated)
+        Capture_DestroySharedSection(&temporary);
+
+    HANDLE userHandle = NULL;
+    NTSTATUS status = Capture_OpenSharedSectionObjectHandle(
+        referencedObject, &userHandle);
+    ObDereferenceObject(referencedObject);
+    if (! NT_SUCCESS(status))
+        return status;
+
+    CAPTURE_DRIVER_MAP output = request;
+    output.record_capacity = CAPTURE_BROKER_MAX_RECORD_CAPACITY;
+    output.section_size = CAPTURE_BROKER_SECTION_SIZE(
+        CAPTURE_BROKER_MAX_RECORD_CAPACITY);
+    output.section_handle = (ULONG64)(ULONG_PTR)userHandle;
+
+    __try {
+        ProbeForWrite(userMap, sizeof(output), sizeof(ULONG));
+        RtlCopyMemory(userMap, &output, sizeof(output));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        ZwClose(userHandle);
+        return GetExceptionCode();
+    }
+
+    return STATUS_SUCCESS;
+}
+
+
 static NTSTATUS Capture_Api_Read(PROCESS *proc, ULONG64 *parms)
 {
     API_CAPTURE_READ_ARGS *args = (API_CAPTURE_READ_ARGS *)parms;
@@ -634,6 +876,7 @@ BOOLEAN Capture_Init(void)
 
     Api_SetFunction(API_CAPTURE_CONTROL, Capture_Api_Control);
     Api_SetFunction(API_CAPTURE_READ, Capture_Api_Read);
+    Api_SetFunction(API_CAPTURE_MAP, Capture_Api_Map);
     return TRUE;
 }
 
@@ -772,6 +1015,28 @@ void Capture_DeleteFlowContext(UINT64 flowContext)
 }
 
 
+static void Capture_SharedPushLocked(
+    CAPTURE_SESSION *session,
+    const CAPTURE_PACKET_RECORD *record)
+{
+    CAPTURE_BROKER_SECTION *shared = session->section_system_address;
+    if (! shared || ! record || ! shared->record_capacity)
+        return;
+
+    ULONG writeIndex = shared->write_index;
+    ULONG capacity = shared->record_capacity;
+
+    CAPTURE_PACKET_RECORD copy = *record;
+    copy.sequence = (ULONG64)writeIndex + 1;
+    RtlCopyMemory(
+        &shared->records[writeIndex % capacity],
+        &copy,
+        sizeof(copy));
+    KeMemoryBarrier();
+    shared->write_index = writeIndex + 1;
+}
+
+
 static void Capture_RecordPayloadByFlowInternal(
     UINT64 flowContext,
     const UCHAR *data,
@@ -817,10 +1082,15 @@ static void Capture_RecordPayloadByFlowInternal(
                             session->stream_queue,
                             (const CAPTURE_STREAM_RECORD *)&record);
                     }
-                    else if (layer != CAPTURE_PACKET_LAYER_STREAM &&
-                            session->packet_queue) {
-                        CapturePacketQueue_Push(
-                            session->packet_queue, &record);
+                    else if (layer != CAPTURE_PACKET_LAYER_STREAM) {
+                        if (layer == CAPTURE_PACKET_LAYER_TRANSPORT &&
+                                session->section_system_address) {
+                            Capture_SharedPushLocked(session, &record);
+                        }
+                        else if (session->packet_queue) {
+                            CapturePacketQueue_Push(
+                                session->packet_queue, &record);
+                        }
                     }
                 }
                 entry = entry->Flink;

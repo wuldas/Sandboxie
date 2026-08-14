@@ -446,6 +446,34 @@ static ULONG CaptureServer_StartDriver(
 }
 
 
+static ULONG CaptureServer_MapDriver(CAPTURE_SESSION_OBJ *session)
+{
+    CAPTURE_DRIVER_MAP map;
+    memzero(&map, sizeof(map));
+    map.version = CAPTURE_DRIVER_VERSION;
+    map.size = sizeof(map);
+    map.capture_id.high = session->info.capture_id.high;
+    map.capture_id.low = session->info.capture_id.low;
+
+    ULONG status = SbieApi_Call(API_CAPTURE_MAP, 1, (ULONG_PTR)&map);
+    if (! NT_SUCCESS(status))
+        return status;
+    if (map.version != CAPTURE_DRIVER_VERSION ||
+            map.size != sizeof(map) ||
+            map.record_capacity == 0 ||
+            map.section_size == 0 ||
+            map.section_handle == 0 ||
+            map.reserved) {
+        if (map.section_handle)
+            CloseHandle((HANDLE)(ULONG_PTR)map.section_handle);
+        return STATUS_INVALID_NETWORK_RESPONSE;
+    }
+
+    session->section_handle = (HANDLE)(ULONG_PTR)map.section_handle;
+    return STATUS_SUCCESS;
+}
+
+
 static ULONG CaptureServer_StopDriver(const CAPTURE_SESSION_ID *captureId)
 {
     UCHAR buffer[CAPTURE_DRIVER_CONTROL_BASE_SIZE];
@@ -920,9 +948,26 @@ MSG_HEADER *CaptureServer::StartHandler(MSG_HEADER *msg)
         return SHORT_REPLY(status);
     }
 
+    if (session->info.mode == CAPTURE_MODE_PACKETS) {
+        status = CaptureServer_MapDriver(session);
+        if (! NT_SUCCESS(status)) {
+            CaptureServer_StopDriver(&session->info.capture_id);
+            PipeServer::GetPipeServer()->FreeMsg(&rpl->h);
+            if (session->section_handle)
+                CloseHandle(session->section_handle);
+            HeapFree(m_heap, 0, session->stopped_events);
+            HeapFree(m_heap, 0, session);
+            LeaveCriticalSection(&m_lock);
+            return SHORT_REPLY(status);
+        }
+        session->info.state = CAPTURE_STATE_WAITING_FOR_BACKEND;
+    }
+
     session->backend_active = TRUE;
-    session->info.state = CAPTURE_STATE_RUNNING;
-    session->info.backend_status = STATUS_SUCCESS;
+    if (session->info.mode != CAPTURE_MODE_PACKETS) {
+        session->info.state = CAPTURE_STATE_RUNNING;
+        session->info.backend_status = STATUS_SUCCESS;
+    }
     List_Insert_After(&m_sessions, NULL, session);
 
     memzero(rpl, sizeof(*rpl));
