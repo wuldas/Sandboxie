@@ -57,6 +57,11 @@ typedef struct _CAPTURE_SESSION_OBJ {
     WCHAR owner_sid[96];
     BOOLEAN backend_active;
     HANDLE export_file;
+    HANDLE section_handle;
+    HANDLE broker_job;
+    HANDLE broker_process;
+    HANDLE broker_thread;
+    HANDLE broker_stop_event;
     ULONG snap_length;
     ULONG max_file_bytes;
     ULONG max_seconds;
@@ -368,6 +373,25 @@ static BOOLEAN CaptureServer_IsWaitingForBackend(
 {
     return session && session->info.state == CAPTURE_STATE_WAITING_FOR_BACKEND;
 }
+
+
+static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session);
+static ULONG CaptureServer_StopBroker(CAPTURE_SESSION_OBJ *session);
+static void CaptureServer_PollBroker(CAPTURE_SESSION_OBJ *session);
+
+
+#define SBIE_PROC_THREAD_ATTRIBUTE_HANDLE_LIST 0x00020002
+
+typedef struct _SBIE_STARTUPINFOEXW {
+    STARTUPINFOW StartupInfo;
+    PVOID attribute_list;
+} SBIE_STARTUPINFOEXW;
+
+typedef BOOL (WINAPI *SBIE_INITIALIZE_ATTRIBUTE_LIST)(
+    PVOID, DWORD, DWORD, PSIZE_T);
+typedef BOOL (WINAPI *SBIE_UPDATE_ATTRIBUTE)(
+    PVOID, DWORD, DWORD_PTR, PVOID, SIZE_T, PVOID, PSIZE_T);
+typedef void (WINAPI *SBIE_DELETE_ATTRIBUTE_LIST)(PVOID);
 
 
 static ULONG CaptureServer_QueryDriver(void)
@@ -1019,6 +1043,8 @@ MSG_HEADER *CaptureServer::GetStatusHandler(MSG_HEADER *msg)
         return SHORT_REPLY(STATUS_ACCESS_DENIED);
     }
 
+    CaptureServer_PollBroker(session);
+
     CAPTURE_STATUS_RPL *rpl = (CAPTURE_STATUS_RPL *)
         LONG_REPLY(sizeof(CAPTURE_STATUS_RPL));
     if (! rpl) {
@@ -1186,6 +1212,8 @@ MSG_HEADER *CaptureServer::ReadEventsHandler(MSG_HEADER *msg)
         return SHORT_REPLY(STATUS_ACCESS_DENIED);
     }
 
+    CaptureServer_PollBroker(session);
+
     ULONG returnedEvents = 0;
     ULONG remainingEvents = 0;
     ULONG64 nextSequence = 0;
@@ -1335,6 +1363,19 @@ MSG_HEADER *CaptureServer::SetExportHandler(MSG_HEADER *msg)
     duplicateFile = NULL;
     session->info.backend_status = STATUS_PENDING;
 
+    if (session->section_handle) {
+        status = CaptureServer_StartBroker(session);
+        if (! NT_SUCCESS(status)) {
+            CloseHandle(session->export_file);
+            session->export_file = NULL;
+            session->info.state = CAPTURE_STATE_FAILED;
+            session->info.backend_status = status;
+            PipeServer::GetPipeServer()->FreeMsg(&rpl->h);
+            LeaveCriticalSection(&m_lock);
+            return SHORT_REPLY(status);
+        }
+    }
+
     memzero(rpl, sizeof(*rpl));
     rpl->h.length = sizeof(*rpl);
     rpl->h.status = STATUS_SUCCESS;
@@ -1344,6 +1385,314 @@ MSG_HEADER *CaptureServer::SetExportHandler(MSG_HEADER *msg)
 
     LeaveCriticalSection(&m_lock);
     return &rpl->h;
+}
+
+
+static BOOLEAN CaptureServer_DuplicateInheritable(
+    HANDLE source, HANDLE *duplicate)
+{
+    return DuplicateHandle(
+        GetCurrentProcess(),
+        source,
+        GetCurrentProcess(),
+        duplicate,
+        0,
+        TRUE,
+        DUPLICATE_SAME_ACCESS) != FALSE;
+}
+
+
+static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session)
+{
+    if (! session || ! session->section_handle || ! session->export_file)
+        return STATUS_DEVICE_NOT_READY;
+    if (session->broker_process || session->broker_job)
+        return STATUS_OBJECT_NAME_COLLISION;
+
+    HANDLE ownerProcess = NULL;
+    HANDLE ownerToken = NULL;
+    HANDLE primaryToken = NULL;
+    HANDLE stopEvent = NULL;
+    HANDLE job = NULL;
+    HANDLE childSection = NULL;
+    HANDLE childFile = NULL;
+    HANDLE childStopEvent = NULL;
+    HANDLE inheritedHandles[3] = { 0 };
+    SBIE_STARTUPINFOEXW startup = { 0 };
+    PROCESS_INFORMATION processInfo = { 0 };
+    PVOID attributes = NULL;
+    SIZE_T attributesSize = 0;
+    BOOL attributesInitialized = FALSE;
+    SBIE_INITIALIZE_ATTRIBUTE_LIST initializeAttributes = NULL;
+    SBIE_UPDATE_ATTRIBUTE updateAttribute = NULL;
+    SBIE_DELETE_ATTRIBUTE_LIST deleteAttributes = NULL;
+    HMODULE kernel32 = NULL;
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = { 0 };
+    DWORD exitCode = STILL_ACTIVE;
+    WCHAR homePath[512];
+    WCHAR executablePath[512];
+    WCHAR commandLine[1024];
+    ULONG status = STATUS_UNSUCCESSFUL;
+    BOOL processCreated = FALSE;
+
+    ownerProcess = OpenProcess(
+        PROCESS_QUERY_INFORMATION, FALSE, session->owner_pid);
+    if (! ownerProcess)
+        goto cleanup;
+    if (! OpenProcessToken(
+            ownerProcess,
+            TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY,
+            &ownerToken)) {
+        goto cleanup;
+    }
+    if (! DuplicateTokenEx(
+            ownerToken,
+            TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY,
+            NULL,
+            SecurityImpersonation,
+            TokenPrimary,
+            &primaryToken)) {
+        goto cleanup;
+    }
+
+    stopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    job = CreateJobObjectW(NULL, NULL);
+    if (! stopEvent || ! job)
+        goto cleanup;
+
+    limits.BasicLimitInformation.LimitFlags =
+        JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    if (! SetInformationJobObject(
+            job,
+            JobObjectExtendedLimitInformation,
+            &limits,
+            sizeof(limits))) {
+        goto cleanup;
+    }
+
+    if (! CaptureServer_DuplicateInheritable(
+            session->section_handle, &childSection) ||
+            ! CaptureServer_DuplicateInheritable(
+                session->export_file, &childFile) ||
+            ! CaptureServer_DuplicateInheritable(
+                stopEvent, &childStopEvent)) {
+        goto cleanup;
+    }
+
+    inheritedHandles[0] = childSection;
+    inheritedHandles[1] = childFile;
+    inheritedHandles[2] = childStopEvent;
+
+    if (SbieApi_GetHomePath(NULL, 0, homePath, ARRAYSIZE(homePath)) != 0)
+        goto cleanup;
+    if (wcscpy_s(executablePath, ARRAYSIZE(executablePath), homePath) != 0 ||
+            wcscat_s(executablePath, ARRAYSIZE(executablePath),
+                     L"\\SbieCapture.exe") != 0) {
+        goto cleanup;
+    }
+
+    if (swprintf_s(
+            commandLine,
+            ARRAYSIZE(commandLine),
+            L"\"%s\" --section %p --file %p --stop-event %p "
+            L"--snaplen %lu --max-file-bytes %lu --max-seconds %lu "
+            L"--rotate-count %lu",
+            executablePath,
+            childSection,
+            childFile,
+            childStopEvent,
+            session->snap_length,
+            session->max_file_bytes,
+            session->max_seconds,
+            session->rotate_count) < 0) {
+        goto cleanup;
+    }
+
+    kernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (! kernel32)
+        goto cleanup;
+    initializeAttributes = (SBIE_INITIALIZE_ATTRIBUTE_LIST)
+        GetProcAddress(kernel32, "InitializeProcThreadAttributeList");
+    updateAttribute = (SBIE_UPDATE_ATTRIBUTE)
+        GetProcAddress(kernel32, "UpdateProcThreadAttribute");
+    deleteAttributes = (SBIE_DELETE_ATTRIBUTE_LIST)
+        GetProcAddress(kernel32, "DeleteProcThreadAttributeList");
+    if (! initializeAttributes || ! updateAttribute || ! deleteAttributes)
+        goto cleanup;
+
+    initializeAttributes(NULL, 1, 0, &attributesSize);
+    attributes = HeapAlloc(
+        GetProcessHeap(), HEAP_ZERO_MEMORY, attributesSize);
+    if (! attributes || ! initializeAttributes(attributes, 1, 0, &attributesSize)) {
+        goto cleanup;
+    }
+    attributesInitialized = TRUE;
+    if (! updateAttribute(
+            attributes,
+            0,
+            SBIE_PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            inheritedHandles,
+            sizeof(inheritedHandles),
+            NULL,
+            NULL)) {
+        goto cleanup;
+    }
+
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.attribute_list = attributes;
+    if (! CreateProcessAsUserW(
+            primaryToken,
+            NULL,
+            commandLine,
+            NULL,
+            NULL,
+            TRUE,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
+            NULL,
+            NULL,
+            &startup.StartupInfo,
+            &processInfo)) {
+        goto cleanup;
+    }
+    processCreated = TRUE;
+
+    if (! AssignProcessToJobObject(job, processInfo.hProcess))
+        goto cleanup;
+    if (ResumeThread(processInfo.hThread) == (DWORD)-1)
+        goto cleanup;
+
+    exitCode = STILL_ACTIVE;
+    if (! GetExitCodeProcess(processInfo.hProcess, &exitCode) ||
+            exitCode != STILL_ACTIVE) {
+        goto cleanup;
+    }
+
+    session->broker_job = job;
+    job = NULL;
+    session->broker_process = processInfo.hProcess;
+    processInfo.hProcess = NULL;
+    session->broker_thread = processInfo.hThread;
+    processInfo.hThread = NULL;
+    session->broker_stop_event = stopEvent;
+    stopEvent = NULL;
+    session->info.state = CAPTURE_STATE_RUNNING;
+    session->info.backend_status = STATUS_SUCCESS;
+    status = STATUS_SUCCESS;
+
+cleanup:
+    if (attributesInitialized)
+        deleteAttributes(attributes);
+    if (attributes)
+        HeapFree(GetProcessHeap(), 0, attributes);
+    if (processCreated && status != STATUS_SUCCESS) {
+        TerminateProcess(processInfo.hProcess, ERROR_PROCESS_ABORTED);
+        WaitForSingleObject(processInfo.hProcess, 5000);
+    }
+    if (processInfo.hThread)
+        CloseHandle(processInfo.hThread);
+    if (processInfo.hProcess)
+        CloseHandle(processInfo.hProcess);
+    if (childSection)
+        CloseHandle(childSection);
+    if (childFile)
+        CloseHandle(childFile);
+    if (childStopEvent)
+        CloseHandle(childStopEvent);
+    if (job)
+        CloseHandle(job);
+    if (stopEvent)
+        CloseHandle(stopEvent);
+    if (primaryToken)
+        CloseHandle(primaryToken);
+    if (ownerToken)
+        CloseHandle(ownerToken);
+    if (ownerProcess)
+        CloseHandle(ownerProcess);
+    return status;
+}
+
+
+static ULONG CaptureServer_StopBroker(CAPTURE_SESSION_OBJ *session)
+{
+    if (! session)
+        return STATUS_INVALID_PARAMETER;
+    if (! session->broker_process && ! session->broker_job) {
+        if (session->broker_stop_event)
+            CloseHandle(session->broker_stop_event);
+        session->broker_stop_event = NULL;
+        return STATUS_SUCCESS;
+    }
+
+    ULONG status = STATUS_SUCCESS;
+    if (session->broker_stop_event)
+        SetEvent(session->broker_stop_event);
+
+    if (session->broker_process &&
+            WaitForSingleObject(session->broker_process, 5000) !=
+                WAIT_OBJECT_0) {
+        status = STATUS_TIMEOUT;
+        if (session->broker_job)
+            TerminateJobObject(session->broker_job, ERROR_PROCESS_ABORTED);
+        else
+            TerminateProcess(
+                session->broker_process, ERROR_PROCESS_ABORTED);
+        WaitForSingleObject(session->broker_process, 5000);
+    }
+
+    if (session->broker_thread)
+        CloseHandle(session->broker_thread);
+    if (session->broker_process)
+        CloseHandle(session->broker_process);
+    if (session->broker_stop_event)
+        CloseHandle(session->broker_stop_event);
+    if (session->broker_job)
+        CloseHandle(session->broker_job);
+
+    session->broker_thread = NULL;
+    session->broker_process = NULL;
+    session->broker_stop_event = NULL;
+    session->broker_job = NULL;
+    return status;
+}
+
+
+static void CaptureServer_PollBroker(CAPTURE_SESSION_OBJ *session)
+{
+    if (! session || ! session->broker_process)
+        return;
+
+    DWORD exitCode = STILL_ACTIVE;
+    if (! GetExitCodeProcess(session->broker_process, &exitCode) ||
+            exitCode == STILL_ACTIVE) {
+        return;
+    }
+
+    ULONG brokerStatus = CaptureServer_StopBroker(session);
+    ULONG driverStatus = STATUS_SUCCESS;
+    if (session->backend_active) {
+        driverStatus = CaptureServer_StopDriver(&session->info.capture_id);
+        if (NT_SUCCESS(driverStatus) || driverStatus == STATUS_NOT_FOUND)
+            session->backend_active = FALSE;
+    }
+    if (session->export_file) {
+        CloseHandle(session->export_file);
+        session->export_file = NULL;
+    }
+    if (session->section_handle) {
+        CloseHandle(session->section_handle);
+        session->section_handle = NULL;
+    }
+
+    ULONG stopStatus = NT_SUCCESS(driverStatus) ? brokerStatus : driverStatus;
+    if (exitCode == ERROR_SUCCESS && NT_SUCCESS(stopStatus)) {
+        session->info.state = CAPTURE_STATE_STOPPED;
+        session->info.backend_status = STATUS_SUCCESS;
+    }
+    else {
+        session->info.state = CAPTURE_STATE_FAILED;
+        session->info.backend_status = NT_SUCCESS(stopStatus) ?
+            STATUS_UNSUCCESSFUL : stopStatus;
+    }
 }
 
 
@@ -1397,8 +1746,21 @@ CAPTURE_SESSION_OBJ *CaptureServer::FindSession(
 ULONG CaptureServer::StopBackend(
     CAPTURE_SESSION_OBJ *session, BOOLEAN preserveEvents)
 {
-    if (! session->backend_active)
-        return STATUS_SUCCESS;
+    if (! session)
+        return STATUS_INVALID_PARAMETER;
+
+    ULONG brokerStatus = CaptureServer_StopBroker(session);
+    if (! session->backend_active) {
+        if (session->export_file) {
+            CloseHandle(session->export_file);
+            session->export_file = NULL;
+        }
+        if (session->section_handle) {
+            CloseHandle(session->section_handle);
+            session->section_handle = NULL;
+        }
+        return brokerStatus;
+    }
 
     ULONG readStatus = STATUS_SUCCESS;
 
@@ -1448,10 +1810,16 @@ ULONG CaptureServer::StopBackend(
         CloseHandle(session->export_file);
         session->export_file = NULL;
     }
+    if (! session->backend_active && session->section_handle) {
+        CloseHandle(session->section_handle);
+        session->section_handle = NULL;
+    }
 
     if (! NT_SUCCESS(stopStatus))
         return stopStatus;
-    return readStatus;
+    if (! NT_SUCCESS(readStatus))
+        return readStatus;
+    return brokerStatus;
 }
 
 
@@ -1482,11 +1850,15 @@ void CaptureServer::TrimStoppedSessions(
 
 void CaptureServer::DeleteSession(CAPTURE_SESSION_OBJ *session)
 {
-    if (session->backend_active)
+    if (session->backend_active || session->broker_process ||
+            session->broker_job || session->export_file ||
+            session->section_handle)
         StopBackend(session, FALSE);
     List_Remove(&m_sessions, session);
     if (session->export_file)
         CloseHandle(session->export_file);
+    if (session->section_handle)
+        CloseHandle(session->section_handle);
     if (session->stopped_events)
         HeapFree(m_heap, 0, session->stopped_events);
     HeapFree(m_heap, 0, session);
