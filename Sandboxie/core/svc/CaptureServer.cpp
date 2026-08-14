@@ -43,6 +43,9 @@
 #define CAPTURE_MAX_LIST_ENTRIES        64
 #define CAPTURE_MAX_ACTIVE_PER_PRINCIPAL 16
 #define CAPTURE_MAX_ACTIVE_GLOBAL       CAPTURE_DRIVER_MAX_SESSIONS
+#define CAPTURE_DEFAULT_SNAP_LENGTH     256
+#define CAPTURE_DEFAULT_MAX_FILE_BYTES  (64u * 1024u * 1024u)
+#define CAPTURE_DEFAULT_MAX_SECONDS     300
 
 
 typedef struct _CAPTURE_SESSION_OBJ {
@@ -53,6 +56,11 @@ typedef struct _CAPTURE_SESSION_OBJ {
     ULONG64 owner_create_time;
     WCHAR owner_sid[96];
     BOOLEAN backend_active;
+    HANDLE export_file;
+    ULONG snap_length;
+    ULONG max_file_bytes;
+    ULONG max_seconds;
+    ULONG rotate_count;
     ULONG stopped_event_head;
     ULONG stopped_event_count;
     CAPTURE_CONNECTION_EVENT *stopped_events;
@@ -306,6 +314,62 @@ static BOOLEAN CaptureServer_IdEquals(
 }
 
 
+static ULONG CaptureServer_DuplicateWritableFile(
+    ULONG callerPid, ULONG64 rawHandle, HANDLE *fileHandle)
+{
+    if (! callerPid || ! rawHandle || ! fileHandle)
+        return STATUS_INVALID_PARAMETER;
+
+    *fileHandle = NULL;
+    HANDLE callerProcess = OpenProcess(
+        PROCESS_DUP_HANDLE, FALSE, callerPid);
+    if (! callerProcess)
+        return STATUS_INVALID_CID;
+
+    HANDLE duplicate = NULL;
+    BOOL ok = DuplicateHandle(
+        callerProcess,
+        (HANDLE)(ULONG_PTR)rawHandle,
+        GetCurrentProcess(),
+        &duplicate,
+        GENERIC_READ | GENERIC_WRITE,
+        FALSE,
+        0);
+    CloseHandle(callerProcess);
+    if (! ok || ! duplicate)
+        return STATUS_INVALID_HANDLE;
+
+    if (GetFileType(duplicate) != FILE_TYPE_DISK) {
+        CloseHandle(duplicate);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    BY_HANDLE_FILE_INFORMATION information;
+    if (! GetFileInformationByHandle(duplicate, &information) ||
+            (information.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) != 0) {
+        CloseHandle(duplicate);
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    *fileHandle = duplicate;
+    return STATUS_SUCCESS;
+}
+
+
+static BOOLEAN CaptureServer_IsPacketMode(
+    const CAPTURE_SESSION_OBJ *session)
+{
+    return session && session->info.mode == CAPTURE_MODE_PACKETS;
+}
+
+
+static BOOLEAN CaptureServer_IsWaitingForBackend(
+    const CAPTURE_SESSION_OBJ *session)
+{
+    return session && session->info.state == CAPTURE_STATE_WAITING_FOR_BACKEND;
+}
+
+
 static ULONG CaptureServer_QueryDriver(void)
 {
     UCHAR buffer[CAPTURE_DRIVER_CONTROL_BASE_SIZE];
@@ -341,6 +405,8 @@ static ULONG CaptureServer_StartDriver(
     control->operation = CAPTURE_DRIVER_CONTROL_START;
     control->scope = session->info.scope;
     control->flags = session->info.flags;
+    if (session->info.mode == CAPTURE_MODE_PACKETS)
+        control->flags |= CAPTURE_DRIVER_FLAG_INCLUDE_PAYLOAD;
     control->target_pid = session->info.target_pid;
     control->target_session_id = session->info.target_session_id;
     control->queue_capacity = CAPTURE_DRIVER_QUEUE_CAPACITY;
@@ -802,6 +868,13 @@ MSG_HEADER *CaptureServer::StartHandler(MSG_HEADER *msg)
     session->info.target_process_create_time = targetCreateTime;
     session->info.started_time = CaptureServer_GetSystemTime();
     session->info.backend_status = STATUS_PENDING;
+    session->snap_length = req->snap_length ?
+        req->snap_length : CAPTURE_DEFAULT_SNAP_LENGTH;
+    session->max_file_bytes = req->max_file_bytes ?
+        req->max_file_bytes : CAPTURE_DEFAULT_MAX_FILE_BYTES;
+    session->max_seconds = req->max_seconds ?
+        req->max_seconds : CAPTURE_DEFAULT_MAX_SECONDS;
+    session->rotate_count = req->rotate_count;
     wcscpy_s(session->info.box_name, ARRAYSIZE(session->info.box_name),
              req->box_name);
 
@@ -1206,7 +1279,71 @@ MSG_HEADER *CaptureServer::SetExportHandler(MSG_HEADER *msg)
             req->file_handle == 0 || req->reserved || req->reserved2)
         return SHORT_REPLY(STATUS_INVALID_PARAMETER);
 
-    return SHORT_REPLY(STATUS_NOT_SUPPORTED);
+    ULONG ownerPid;
+    ULONG ownerSessionId;
+    ULONG64 ownerCreateTime;
+    WCHAR ownerSid[96];
+    status = CaptureServer_GetCallerIdentity(
+        &ownerPid, &ownerSessionId, &ownerCreateTime, ownerSid);
+    if (! NT_SUCCESS(status))
+        return SHORT_REPLY(status);
+
+    HANDLE duplicateFile = NULL;
+    status = CaptureServer_DuplicateWritableFile(
+        ownerPid, req->file_handle, &duplicateFile);
+    if (! NT_SUCCESS(status))
+        return SHORT_REPLY(status);
+
+    EnterCriticalSection(&m_lock);
+
+    CAPTURE_SESSION_OBJ *session = FindSession(
+        &req->capture_id, ownerPid, ownerCreateTime, ownerSid);
+    if (! session) {
+        LeaveCriticalSection(&m_lock);
+        CloseHandle(duplicateFile);
+        return SHORT_REPLY(STATUS_OBJECT_NAME_NOT_FOUND);
+    }
+
+    if (session->owner_session_id != ownerSessionId) {
+        LeaveCriticalSection(&m_lock);
+        CloseHandle(duplicateFile);
+        return SHORT_REPLY(STATUS_ACCESS_DENIED);
+    }
+
+    if (! CaptureServer_IsPacketMode(session)) {
+        LeaveCriticalSection(&m_lock);
+        CloseHandle(duplicateFile);
+        return SHORT_REPLY(STATUS_NOT_SUPPORTED);
+    }
+
+    if (! CaptureServer_IsWaitingForBackend(session) ||
+            session->export_file) {
+        LeaveCriticalSection(&m_lock);
+        CloseHandle(duplicateFile);
+        return SHORT_REPLY(STATUS_INVALID_DEVICE_STATE);
+    }
+
+    CAPTURE_SET_EXPORT_RPL *rpl = (CAPTURE_SET_EXPORT_RPL *)
+        LONG_REPLY(sizeof(CAPTURE_SET_EXPORT_RPL));
+    if (! rpl) {
+        LeaveCriticalSection(&m_lock);
+        CloseHandle(duplicateFile);
+        return SHORT_REPLY(STATUS_INSUFFICIENT_RESOURCES);
+    }
+
+    session->export_file = duplicateFile;
+    duplicateFile = NULL;
+    session->info.backend_status = STATUS_PENDING;
+
+    memzero(rpl, sizeof(*rpl));
+    rpl->h.length = sizeof(*rpl);
+    rpl->h.status = STATUS_SUCCESS;
+    rpl->wire_version = CAPTURE_WIRE_VERSION;
+    rpl->struct_size = sizeof(*rpl);
+    memcpy(&rpl->session, &session->info, sizeof(rpl->session));
+
+    LeaveCriticalSection(&m_lock);
+    return &rpl->h;
 }
 
 
@@ -1307,6 +1444,11 @@ ULONG CaptureServer::StopBackend(
     if (NT_SUCCESS(stopStatus) || stopStatus == STATUS_NOT_FOUND)
         session->backend_active = FALSE;
 
+    if (! session->backend_active && session->export_file) {
+        CloseHandle(session->export_file);
+        session->export_file = NULL;
+    }
+
     if (! NT_SUCCESS(stopStatus))
         return stopStatus;
     return readStatus;
@@ -1343,6 +1485,8 @@ void CaptureServer::DeleteSession(CAPTURE_SESSION_OBJ *session)
     if (session->backend_active)
         StopBackend(session, FALSE);
     List_Remove(&m_sessions, session);
+    if (session->export_file)
+        CloseHandle(session->export_file);
     if (session->stopped_events)
         HeapFree(m_heap, 0, session->stopped_events);
     HeapFree(m_heap, 0, session);
