@@ -27,6 +27,9 @@
 #include "wfp.h"
 
 
+#define CAPTURE_MAX_FLOW_CONTEXTS 4096
+
+
 //---------------------------------------------------------------------------
 // Structures and Types
 //---------------------------------------------------------------------------
@@ -38,9 +41,24 @@ typedef struct _CAPTURE_SESSION {
     CAPTURE_DRIVER_SESSION_ID capture_id;
     CAPTURE_FILTER_TARGET target;
     CAPTURE_QUEUE *queue;
+    CAPTURE_PACKET_QUEUE *packet_queue;
+    CAPTURE_STREAM_QUEUE *stream_queue;
+    BOOLEAN payload_enabled;
     CAPTURE_FILTER_PROCESS_KEY initial_processes[1];
 
 } CAPTURE_SESSION;
+
+
+typedef struct _CAPTURE_FLOW_CONTEXT {
+
+    LIST_ENTRY link;
+    UINT64 flow_id;
+    UINT16 layer_id;
+    UINT32 callout_id;
+    CAPTURE_FILTER_IDENTITY identity;
+    CAPTURE_PACKET_RECORD template_record;
+
+} CAPTURE_FLOW_CONTEXT;
 
 
 //---------------------------------------------------------------------------
@@ -53,6 +71,8 @@ static BOOLEAN Capture_Unloading = FALSE;
 static KSPIN_LOCK Capture_Lock;
 static LIST_ENTRY Capture_Sessions;
 static ULONG Capture_SessionCount = 0;
+static LIST_ENTRY Capture_Flows;
+static ULONG Capture_FlowCount = 0;
 
 
 //---------------------------------------------------------------------------
@@ -142,14 +162,26 @@ static void Capture_FreeSession(CAPTURE_SESSION *session)
 {
     if (session->queue)
         CaptureQueue_Destroy(session->queue, Capture_Free);
+    if (session->packet_queue)
+        CapturePacketQueue_Destroy(session->packet_queue, Capture_Free);
+    if (session->stream_queue)
+        CaptureStreamQueue_Destroy(session->stream_queue, Capture_Free);
     Capture_Free(session);
+}
+
+
+static void Capture_FreeFlow(CAPTURE_FLOW_CONTEXT *flow)
+{
+    Capture_Free(flow);
 }
 
 
 static void Capture_ReleaseAll(BOOLEAN unloading)
 {
     LIST_ENTRY staleSessions;
+    LIST_ENTRY staleFlows;
     InitializeListHead(&staleSessions);
+    InitializeListHead(&staleFlows);
 
     if (! Capture_Initialized)
         return;
@@ -166,6 +198,12 @@ static void Capture_ReleaseAll(BOOLEAN unloading)
     }
     Capture_SessionCount = 0;
 
+    while (! IsListEmpty(&Capture_Flows)) {
+        PLIST_ENTRY entry = RemoveHeadList(&Capture_Flows);
+        InsertTailList(&staleFlows, entry);
+    }
+    Capture_FlowCount = 0;
+
     if (unloading)
         Capture_Initialized = FALSE;
 
@@ -175,6 +213,12 @@ static void Capture_ReleaseAll(BOOLEAN unloading)
         PLIST_ENTRY entry = RemoveHeadList(&staleSessions);
         Capture_FreeSession(CONTAINING_RECORD(entry, CAPTURE_SESSION, link));
     }
+
+    while (! IsListEmpty(&staleFlows)) {
+        PLIST_ENTRY entry = RemoveHeadList(&staleFlows);
+        Capture_FreeFlow(CONTAINING_RECORD(
+            entry, CAPTURE_FLOW_CONTEXT, link));
+    }
 }
 
 
@@ -183,7 +227,8 @@ static NTSTATUS Capture_ValidateStartControl(
 {
     const ULONG knownFlags =
         CAPTURE_DRIVER_FLAG_INCLUDE_FUTURE |
-        CAPTURE_DRIVER_FLAG_INCLUDE_LOOPBACK;
+        CAPTURE_DRIVER_FLAG_INCLUDE_LOOPBACK |
+        CAPTURE_DRIVER_FLAG_INCLUDE_PAYLOAD;
 
     if (Capture_IdIsZero(&control->capture_id) ||
             control->reserved ||
@@ -270,6 +315,8 @@ static NTSTATUS Capture_Start(const CAPTURE_DRIVER_CONTROL *control)
         sizeof(session->target.sid_string));
     session->target.initial_process_count = control->initial_process_count;
     session->target.initial_processes = session->initial_processes;
+    session->payload_enabled =
+        (control->flags & CAPTURE_DRIVER_FLAG_INCLUDE_PAYLOAD) != 0;
 
     for (ULONG index = 0;
             index < control->initial_process_count;
@@ -286,6 +333,17 @@ static NTSTATUS Capture_Start(const CAPTURE_DRIVER_CONTROL *control)
     if (! session->queue) {
         Capture_Free(session);
         return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    if (session->payload_enabled) {
+        session->packet_queue = CapturePacketQueue_Create(
+            CAPTURE_DRIVER_QUEUE_CAPACITY, Capture_Alloc);
+        session->stream_queue = CaptureStreamQueue_Create(
+            CAPTURE_DRIVER_QUEUE_CAPACITY, Capture_Alloc);
+        if (! session->packet_queue || ! session->stream_queue) {
+            Capture_FreeSession(session);
+            return STATUS_INSUFFICIENT_RESOURCES;
+        }
     }
 
     KIRQL irql;
@@ -569,6 +627,8 @@ BOOLEAN Capture_Init(void)
     KeInitializeSpinLock(&Capture_Lock);
     InitializeListHead(&Capture_Sessions);
     Capture_SessionCount = 0;
+    InitializeListHead(&Capture_Flows);
+    Capture_FlowCount = 0;
     Capture_Unloading = FALSE;
     Capture_Initialized = TRUE;
 
@@ -612,4 +672,173 @@ void Capture_RecordEvent(
     }
 
     KeReleaseSpinLock(&Capture_Lock, irql);
+}
+
+
+static CAPTURE_FLOW_CONTEXT *Capture_FindFlowLocked(UINT64 flowContext)
+{
+    PLIST_ENTRY entry = Capture_Flows.Flink;
+    while (entry != &Capture_Flows) {
+        CAPTURE_FLOW_CONTEXT *flow = CONTAINING_RECORD(
+            entry, CAPTURE_FLOW_CONTEXT, link);
+        if ((UINT64)(ULONG_PTR)flow == flowContext)
+            return flow;
+        entry = entry->Flink;
+    }
+    return NULL;
+}
+
+
+static BOOLEAN Capture_HasPayloadSessionLocked(
+    const CAPTURE_FILTER_IDENTITY *identity)
+{
+    PLIST_ENTRY entry = Capture_Sessions.Flink;
+    while (entry != &Capture_Sessions) {
+        CAPTURE_SESSION *session = CONTAINING_RECORD(
+            entry, CAPTURE_SESSION, link);
+        if (session->payload_enabled &&
+                CaptureFilter_Matches(&session->target, identity)) {
+            return TRUE;
+        }
+        entry = entry->Flink;
+    }
+    return FALSE;
+}
+
+
+UINT64 Capture_CreateFlowContext(
+    const CAPTURE_FILTER_IDENTITY *identity,
+    const CAPTURE_PACKET_RECORD *templateRecord,
+    UINT64 flowId,
+    UINT16 layerId,
+    UINT32 calloutId)
+{
+    if (! identity || ! templateRecord || ! flowId ||
+            ! Capture_Initialized)
+        return 0;
+
+    CAPTURE_FLOW_CONTEXT *flow =
+        (CAPTURE_FLOW_CONTEXT *)Capture_Alloc(sizeof(*flow));
+    if (! flow)
+        return 0;
+
+    RtlZeroMemory(flow, sizeof(*flow));
+    flow->flow_id = flowId;
+    flow->layer_id = layerId;
+    flow->callout_id = calloutId;
+    flow->identity = *identity;
+    flow->template_record = *templateRecord;
+
+    BOOLEAN keep = FALSE;
+    KIRQL irql;
+    KeAcquireSpinLock(&Capture_Lock, &irql);
+    if (! Capture_Unloading &&
+            Capture_FlowCount < CAPTURE_MAX_FLOW_CONTEXTS &&
+            Capture_HasPayloadSessionLocked(identity)) {
+        InsertTailList(&Capture_Flows, &flow->link);
+        ++Capture_FlowCount;
+        keep = TRUE;
+    }
+    KeReleaseSpinLock(&Capture_Lock, irql);
+
+    if (! keep) {
+        Capture_FreeFlow(flow);
+        return 0;
+    }
+
+    return (UINT64)(ULONG_PTR)flow;
+}
+
+
+void Capture_DeleteFlowContext(UINT64 flowContext)
+{
+    if (! flowContext || ! Capture_Initialized)
+        return;
+
+    CAPTURE_FLOW_CONTEXT *flow = NULL;
+    KIRQL irql;
+    KeAcquireSpinLock(&Capture_Lock, &irql);
+
+    flow = Capture_FindFlowLocked(flowContext);
+    if (flow) {
+        RemoveEntryList(&flow->link);
+        --Capture_FlowCount;
+    }
+
+    KeReleaseSpinLock(&Capture_Lock, irql);
+
+    if (flow)
+        Capture_FreeFlow(flow);
+}
+
+
+static void Capture_RecordPayloadByFlowInternal(
+    UINT64 flowContext,
+    const UCHAR *data,
+    ULONG dataLength,
+    ULONG originalLength,
+    UCHAR layer)
+{
+    if (! flowContext || ! Capture_Initialized)
+        return;
+
+    KIRQL irql;
+    KeAcquireSpinLock(&Capture_Lock, &irql);
+
+    if (! Capture_Unloading) {
+        CAPTURE_FLOW_CONTEXT *flow =
+            Capture_FindFlowLocked(flowContext);
+        if (flow) {
+            CAPTURE_PACKET_RECORD record = flow->template_record;
+            record.timestamp = 0;
+            record.layer = layer;
+            record.original_length = originalLength;
+            record.captured_length = dataLength >
+                CAPTURE_PACKET_SNAPLEN_MAX ?
+                CAPTURE_PACKET_SNAPLEN_MAX : dataLength;
+            if (record.captured_length && data)
+                RtlCopyMemory(
+                    record.data, data, record.captured_length);
+
+            LARGE_INTEGER timestamp;
+            KeQuerySystemTime(&timestamp);
+            record.timestamp = timestamp.QuadPart;
+
+            PLIST_ENTRY entry = Capture_Sessions.Flink;
+            while (entry != &Capture_Sessions) {
+                CAPTURE_SESSION *session = CONTAINING_RECORD(
+                    entry, CAPTURE_SESSION, link);
+                if (session->payload_enabled &&
+                        CaptureFilter_Matches(
+                            &session->target, &flow->identity)) {
+                    if (layer == CAPTURE_PACKET_LAYER_STREAM &&
+                            session->stream_queue) {
+                        CaptureStreamQueue_Push(
+                            session->stream_queue,
+                            (const CAPTURE_STREAM_RECORD *)&record);
+                    }
+                    else if (layer != CAPTURE_PACKET_LAYER_STREAM &&
+                            session->packet_queue) {
+                        CapturePacketQueue_Push(
+                            session->packet_queue, &record);
+                    }
+                }
+                entry = entry->Flink;
+            }
+        }
+    }
+
+    KeReleaseSpinLock(&Capture_Lock, irql);
+}
+
+
+void Capture_RecordPayloadByFlow(
+    UINT64 flowContext,
+    const UCHAR *data,
+    ULONG dataLength,
+    ULONG originalLength,
+    UCHAR layer)
+{
+    Capture_RecordPayloadByFlowInternal(
+        flowContext, data, dataLength, originalLength, layer);
 }

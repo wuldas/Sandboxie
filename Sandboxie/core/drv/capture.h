@@ -25,6 +25,8 @@
 
 #include "capture_filter.h"
 #include "capture_queue.h"
+#include "capture_packet.h"
+#include "capture_stream.h"
 
 
 BOOLEAN Capture_Init(void);
@@ -36,6 +38,22 @@ void Capture_Reset(void);
 void Capture_RecordEvent(
     const CAPTURE_FILTER_IDENTITY *identity,
     const CAPTURE_QUEUE_RECORD *record);
+
+UINT64 Capture_CreateFlowContext(
+    const CAPTURE_FILTER_IDENTITY *identity,
+    const CAPTURE_PACKET_RECORD *templateRecord,
+    UINT64 flowId,
+    UINT16 layerId,
+    UINT32 calloutId);
+
+void Capture_DeleteFlowContext(UINT64 flowContext);
+
+void Capture_RecordPayloadByFlow(
+    UINT64 flowContext,
+    const UCHAR *data,
+    ULONG dataLength,
+    ULONG originalLength,
+    UCHAR layer);
 
 
 #endif /* _MY_CAPTURE_H */

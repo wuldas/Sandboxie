@@ -84,6 +84,26 @@ DEFINE_GUID(WPF_RECV_CALLOUT_GUID_V4,	// 0bf56435-71e4-4de7-bd0b-1af0b4cbb8f8
 	0x0bf56435, 0x71e4, 0x4de7, 0xbd, 0x0b, 0x1a, 0xf0, 0xb4, 0xcb, 0xb8, 0xf8);
 DEFINE_GUID(WPF_RECV_CALLOUT_GUID_V6,	// 0bf56435-71e4-4de7-bd0b-1af0b4cbb9f9
 	0x0bf56435, 0x71e4, 0x4de7, 0xbd, 0x0b, 0x1a, 0xf0, 0xb4, 0xcb, 0xb9, 0xf9);
+DEFINE_GUID(WFP_FLOW_CALLOUT_GUID_V4,
+    0x4e0d6435, 0x91a2, 0x4d7e, 0x8b, 0x01, 0x1a, 0xf0, 0xb4, 0xcb, 0x10, 0x01);
+DEFINE_GUID(WFP_FLOW_CALLOUT_GUID_V6,
+    0x4e0d6435, 0x91a2, 0x4d7e, 0x8b, 0x01, 0x1a, 0xf0, 0xb4, 0xcb, 0x10, 0x02);
+DEFINE_GUID(WFP_TRANSPORT_OUT_CALLOUT_GUID_V4,
+    0x4e0d6435, 0x91a2, 0x4d7e, 0x8b, 0x01, 0x1a, 0xf0, 0xb4, 0xcb, 0x10, 0x03);
+DEFINE_GUID(WFP_TRANSPORT_OUT_CALLOUT_GUID_V6,
+    0x4e0d6435, 0x91a2, 0x4d7e, 0x8b, 0x01, 0x1a, 0xf0, 0xb4, 0xcb, 0x10, 0x04);
+DEFINE_GUID(WFP_TRANSPORT_IN_CALLOUT_GUID_V4,
+    0x4e0d6435, 0x91a2, 0x4d7e, 0x8b, 0x01, 0x1a, 0xf0, 0xb4, 0xcb, 0x10, 0x05);
+DEFINE_GUID(WFP_TRANSPORT_IN_CALLOUT_GUID_V6,
+    0x4e0d6435, 0x91a2, 0x4d7e, 0x8b, 0x01, 0x1a, 0xf0, 0xb4, 0xcb, 0x10, 0x06);
+DEFINE_GUID(WFP_STREAM_CALLOUT_GUID_V4,
+    0x4e0d6435, 0x91a2, 0x4d7e, 0x8b, 0x01, 0x1a, 0xf0, 0xb4, 0xcb, 0x10, 0x07);
+DEFINE_GUID(WFP_STREAM_CALLOUT_GUID_V6,
+    0x4e0d6435, 0x91a2, 0x4d7e, 0x8b, 0x01, 0x1a, 0xf0, 0xb4, 0xcb, 0x10, 0x08);
+DEFINE_GUID(WFP_DATAGRAM_CALLOUT_GUID_V4,
+    0x4e0d6435, 0x91a2, 0x4d7e, 0x8b, 0x01, 0x1a, 0xf0, 0xb4, 0xcb, 0x10, 0x09);
+DEFINE_GUID(WFP_DATAGRAM_CALLOUT_GUID_V6,
+    0x4e0d6435, 0x91a2, 0x4d7e, 0x8b, 0x01, 0x1a, 0xf0, 0xb4, 0xcb, 0x10, 0x0a);
 
 #define WFP_FILTER_NAME L"SbieFilter"
 #define WFP_FILTER_DESCRIPTION L"A filter that uses by sandboxie to implement internet restrictions"
@@ -121,6 +141,50 @@ void WFP_Uninstall_Callbacks(void);
 NTSTATUS WFP_RegisterSubLayer();
 
 NTSTATUS WFP_RegisterCallout(const GUID* calloutKey, const GUID* applicableLayer, UINT32* callout_id, UINT64* filter_id);
+
+static NTSTATUS WFP_RegisterCalloutEx(
+    const GUID *calloutKey,
+    const GUID *applicableLayer,
+    UINT32 *calloutId,
+    UINT64 *filterId,
+    FWPS_CALLOUT_CLASSIFY_FN1 classifyFn,
+    FWP_ACTION_TYPE actionType);
+
+static void NTAPI WFP_flow_classify(
+    const FWPS_INCOMING_VALUES *inFixedValues,
+    const FWPS_INCOMING_METADATA_VALUES *inMetaValues,
+    void *layerData,
+    const void *classifyContext,
+    const FWPS_FILTER1 *filter,
+    UINT64 flowContext,
+    FWPS_CLASSIFY_OUT *classifyOut);
+
+static void NTAPI WFP_transport_classify(
+    const FWPS_INCOMING_VALUES *inFixedValues,
+    const FWPS_INCOMING_METADATA_VALUES *inMetaValues,
+    void *layerData,
+    const void *classifyContext,
+    const FWPS_FILTER1 *filter,
+    UINT64 flowContext,
+    FWPS_CLASSIFY_OUT *classifyOut);
+
+static void NTAPI WFP_stream_classify(
+    const FWPS_INCOMING_VALUES *inFixedValues,
+    const FWPS_INCOMING_METADATA_VALUES *inMetaValues,
+    void *layerData,
+    const void *classifyContext,
+    const FWPS_FILTER1 *filter,
+    UINT64 flowContext,
+    FWPS_CLASSIFY_OUT *classifyOut);
+
+static void NTAPI WFP_datagram_classify(
+    const FWPS_INCOMING_VALUES *inFixedValues,
+    const FWPS_INCOMING_METADATA_VALUES *inMetaValues,
+    void *layerData,
+    const void *classifyContext,
+    const FWPS_FILTER1 *filter,
+    UINT64 flowContext,
+    FWPS_CLASSIFY_OUT *classifyOut);
 
 const WCHAR* Process_MatchImageAndGetValue(BOX* box, const WCHAR* value, const WCHAR* ImageName, ULONG* pLevel);
 
@@ -197,6 +261,16 @@ static UINT32 WFP_send_callout_id_v4 = 0;
 static UINT32 WFP_send_callout_id_v6 = 0;
 static UINT32 WFP_recv_callout_id_v4 = 0;
 static UINT32 WFP_recv_callout_id_v6 = 0;
+static UINT32 WFP_flow_callout_id_v4 = 0;
+static UINT32 WFP_flow_callout_id_v6 = 0;
+static UINT32 WFP_transport_out_callout_id_v4 = 0;
+static UINT32 WFP_transport_out_callout_id_v6 = 0;
+static UINT32 WFP_transport_in_callout_id_v4 = 0;
+static UINT32 WFP_transport_in_callout_id_v6 = 0;
+static UINT32 WFP_stream_callout_id_v4 = 0;
+static UINT32 WFP_stream_callout_id_v6 = 0;
+static UINT32 WFP_datagram_callout_id_v4 = 0;
+static UINT32 WFP_datagram_callout_id_v6 = 0;
 
 //static UINT64 WFP_filter_id_v4 = 0;
 //static UINT64 WFP_filter_id_v6 = 0;
@@ -204,10 +278,35 @@ static UINT64 WFP_send_filter_id_v4 = 0;
 static UINT64 WFP_send_filter_id_v6 = 0;
 static UINT64 WFP_recv_filter_id_v4 = 0;
 static UINT64 WFP_recv_filter_id_v6 = 0;
+static UINT64 WFP_flow_filter_id_v4 = 0;
+static UINT64 WFP_flow_filter_id_v6 = 0;
+static UINT64 WFP_transport_out_filter_id_v4 = 0;
+static UINT64 WFP_transport_out_filter_id_v6 = 0;
+static UINT64 WFP_transport_in_filter_id_v4 = 0;
+static UINT64 WFP_transport_in_filter_id_v6 = 0;
+static UINT64 WFP_stream_filter_id_v4 = 0;
+static UINT64 WFP_stream_filter_id_v6 = 0;
+static UINT64 WFP_datagram_filter_id_v4 = 0;
+static UINT64 WFP_datagram_filter_id_v6 = 0;
 
 static BOOLEAN WPF_MapInitialized = FALSE;
 static map_base_t WFP_Processes;
 static KSPIN_LOCK WFP_MapLock;
+
+
+static void WFP_UnregisterCalloutId(UINT32 *calloutId)
+{
+    if (calloutId && *calloutId) {
+        FwpsCalloutUnregisterById(*calloutId);
+        *calloutId = 0;
+    }
+}
+
+
+static BOOLEAN WFP_PayloadInspectionEnabled(void)
+{
+    return FALSE;
+}
 
 
 //---------------------------------------------------------------------------
@@ -433,6 +532,88 @@ _FX BOOLEAN WFP_Install_Callbacks(void)
 	stage = 0x43; if (!NT_SUCCESS(status)) goto Exit;
 	status = WFP_RegisterCallout(&WPF_RECV_CALLOUT_GUID_V6, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6, &WFP_recv_callout_id_v6, &WFP_recv_filter_id_v6);
 	stage = 0x44; if (!NT_SUCCESS(status)) goto Exit;
+	if (WFP_PayloadInspectionEnabled()) {
+	status = WFP_RegisterCalloutEx(
+		&WFP_FLOW_CALLOUT_GUID_V4,
+		&FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4,
+		&WFP_flow_callout_id_v4,
+		&WFP_flow_filter_id_v4,
+		WFP_flow_classify,
+		FWP_ACTION_CALLOUT_INSPECTION);
+	stage = 0x51; if (!NT_SUCCESS(status)) goto Exit;
+	status = WFP_RegisterCalloutEx(
+		&WFP_FLOW_CALLOUT_GUID_V6,
+		&FWPM_LAYER_ALE_FLOW_ESTABLISHED_V6,
+		&WFP_flow_callout_id_v6,
+		&WFP_flow_filter_id_v6,
+		WFP_flow_classify,
+		FWP_ACTION_CALLOUT_INSPECTION);
+	stage = 0x52; if (!NT_SUCCESS(status)) goto Exit;
+	status = WFP_RegisterCalloutEx(
+		&WFP_TRANSPORT_OUT_CALLOUT_GUID_V4,
+		&FWPM_LAYER_OUTBOUND_TRANSPORT_V4,
+		&WFP_transport_out_callout_id_v4,
+		&WFP_transport_out_filter_id_v4,
+		WFP_transport_classify,
+		FWP_ACTION_CALLOUT_INSPECTION);
+	stage = 0x53; if (!NT_SUCCESS(status)) goto Exit;
+	status = WFP_RegisterCalloutEx(
+		&WFP_TRANSPORT_OUT_CALLOUT_GUID_V6,
+		&FWPM_LAYER_OUTBOUND_TRANSPORT_V6,
+		&WFP_transport_out_callout_id_v6,
+		&WFP_transport_out_filter_id_v6,
+		WFP_transport_classify,
+		FWP_ACTION_CALLOUT_INSPECTION);
+	stage = 0x54; if (!NT_SUCCESS(status)) goto Exit;
+	status = WFP_RegisterCalloutEx(
+		&WFP_TRANSPORT_IN_CALLOUT_GUID_V4,
+		&FWPM_LAYER_INBOUND_TRANSPORT_V4,
+		&WFP_transport_in_callout_id_v4,
+		&WFP_transport_in_filter_id_v4,
+		WFP_transport_classify,
+		FWP_ACTION_CALLOUT_INSPECTION);
+	stage = 0x55; if (!NT_SUCCESS(status)) goto Exit;
+	status = WFP_RegisterCalloutEx(
+		&WFP_TRANSPORT_IN_CALLOUT_GUID_V6,
+		&FWPM_LAYER_INBOUND_TRANSPORT_V6,
+		&WFP_transport_in_callout_id_v6,
+		&WFP_transport_in_filter_id_v6,
+		WFP_transport_classify,
+		FWP_ACTION_CALLOUT_INSPECTION);
+	stage = 0x56; if (!NT_SUCCESS(status)) goto Exit;
+	status = WFP_RegisterCalloutEx(
+		&WFP_STREAM_CALLOUT_GUID_V4,
+		&FWPM_LAYER_STREAM_V4,
+		&WFP_stream_callout_id_v4,
+		&WFP_stream_filter_id_v4,
+		WFP_stream_classify,
+		FWP_ACTION_CALLOUT_INSPECTION);
+	stage = 0x57; if (!NT_SUCCESS(status)) goto Exit;
+	status = WFP_RegisterCalloutEx(
+		&WFP_STREAM_CALLOUT_GUID_V6,
+		&FWPM_LAYER_STREAM_V6,
+		&WFP_stream_callout_id_v6,
+		&WFP_stream_filter_id_v6,
+		WFP_stream_classify,
+		FWP_ACTION_CALLOUT_INSPECTION);
+	stage = 0x58; if (!NT_SUCCESS(status)) goto Exit;
+	status = WFP_RegisterCalloutEx(
+		&WFP_DATAGRAM_CALLOUT_GUID_V4,
+		&FWPM_LAYER_DATAGRAM_DATA_V4,
+		&WFP_datagram_callout_id_v4,
+		&WFP_datagram_filter_id_v4,
+		WFP_datagram_classify,
+		FWP_ACTION_CALLOUT_INSPECTION);
+	stage = 0x59; if (!NT_SUCCESS(status)) goto Exit;
+	status = WFP_RegisterCalloutEx(
+		&WFP_DATAGRAM_CALLOUT_GUID_V6,
+		&FWPM_LAYER_DATAGRAM_DATA_V6,
+		&WFP_datagram_callout_id_v6,
+		&WFP_datagram_filter_id_v6,
+		WFP_datagram_classify,
+		FWP_ACTION_CALLOUT_INSPECTION);
+	stage = 0x5a; if (!NT_SUCCESS(status)) goto Exit;
+	}
 
 	// note: we could also setup FWPM_LAYER_ALE_AUTH_LISTEN_V4 but since we block all accepts we don't have to
 
@@ -452,10 +633,20 @@ Exit:
 			_Analysis_assume_lock_not_held_(WFP_engine_handle); // Potential leak if "FwpmTransactionAbort" fails
 		}
 		if (callout_registered) {
-			FwpsCalloutUnregisterById(WFP_send_callout_id_v4);
-			FwpsCalloutUnregisterById(WFP_send_callout_id_v6);
-			FwpsCalloutUnregisterById(WFP_recv_callout_id_v4);
-			FwpsCalloutUnregisterById(WFP_recv_callout_id_v6);
+			WFP_UnregisterCalloutId(&WFP_send_callout_id_v4);
+			WFP_UnregisterCalloutId(&WFP_send_callout_id_v6);
+			WFP_UnregisterCalloutId(&WFP_recv_callout_id_v4);
+			WFP_UnregisterCalloutId(&WFP_recv_callout_id_v6);
+			WFP_UnregisterCalloutId(&WFP_flow_callout_id_v4);
+			WFP_UnregisterCalloutId(&WFP_flow_callout_id_v6);
+			WFP_UnregisterCalloutId(&WFP_transport_out_callout_id_v4);
+			WFP_UnregisterCalloutId(&WFP_transport_out_callout_id_v6);
+			WFP_UnregisterCalloutId(&WFP_transport_in_callout_id_v4);
+			WFP_UnregisterCalloutId(&WFP_transport_in_callout_id_v6);
+			WFP_UnregisterCalloutId(&WFP_stream_callout_id_v4);
+			WFP_UnregisterCalloutId(&WFP_stream_callout_id_v6);
+			WFP_UnregisterCalloutId(&WFP_datagram_callout_id_v4);
+			WFP_UnregisterCalloutId(&WFP_datagram_callout_id_v6);
 		}
 		if (WFP_engine_handle) {
 			FwpmEngineClose(WFP_engine_handle);
@@ -480,21 +671,23 @@ _FX void WFP_Uninstall_Callbacks(void)
 	if (WFP_engine_handle == NULL)
 		return; // not initialized
 
-	NTSTATUS status = STATUS_SUCCESS;
-	UNICODE_STRING symlink = { 0 };
-
-	//status = FwpsCalloutUnregisterById(WFP_callout_id_v4);
+	WFP_UnregisterCalloutId(&WFP_send_callout_id_v4);
 	//if (!NT_SUCCESS(status)) DbgPrint("Failed to unregister callout, status: 0x%08x\r\n", status);
-	//status = FwpsCalloutUnregisterById(WFP_callout_id_v6);
+	WFP_UnregisterCalloutId(&WFP_send_callout_id_v6);
 	//if (!NT_SUCCESS(status)) DbgPrint("Failed to unregister callout, status: 0x%08x\r\n", status);
-	status = FwpsCalloutUnregisterById(WFP_send_callout_id_v4);
+	WFP_UnregisterCalloutId(&WFP_recv_callout_id_v4);
 	//if (!NT_SUCCESS(status)) DbgPrint("Failed to unregister callout, status: 0x%08x\r\n", status);
-	status = FwpsCalloutUnregisterById(WFP_send_callout_id_v6);
-	//if (!NT_SUCCESS(status)) DbgPrint("Failed to unregister callout, status: 0x%08x\r\n", status);
-	status = FwpsCalloutUnregisterById(WFP_recv_callout_id_v4);
-	//if (!NT_SUCCESS(status)) DbgPrint("Failed to unregister callout, status: 0x%08x\r\n", status);
-	status = FwpsCalloutUnregisterById(WFP_recv_callout_id_v6);
-	//if (!NT_SUCCESS(status)) DbgPrint("Failed to unregister callout, status: 0x%08x\r\n", status);
+	WFP_UnregisterCalloutId(&WFP_recv_callout_id_v6);
+	WFP_UnregisterCalloutId(&WFP_flow_callout_id_v4);
+	WFP_UnregisterCalloutId(&WFP_flow_callout_id_v6);
+	WFP_UnregisterCalloutId(&WFP_transport_out_callout_id_v4);
+	WFP_UnregisterCalloutId(&WFP_transport_out_callout_id_v6);
+	WFP_UnregisterCalloutId(&WFP_transport_in_callout_id_v4);
+	WFP_UnregisterCalloutId(&WFP_transport_in_callout_id_v6);
+	WFP_UnregisterCalloutId(&WFP_stream_callout_id_v4);
+	WFP_UnregisterCalloutId(&WFP_stream_callout_id_v6);
+	WFP_UnregisterCalloutId(&WFP_datagram_callout_id_v4);
+	WFP_UnregisterCalloutId(&WFP_datagram_callout_id_v6);
 
 	// Close handle to the WFP Filter Engine
 	if (WFP_engine_handle) {
@@ -537,24 +730,31 @@ Exit:
 //---------------------------------------------------------------------------
 
 
-NTSTATUS WFP_RegisterCallout(const GUID* calloutKey, const GUID* applicableLayer, UINT32* callout_id, UINT64* filter_id)
+static NTSTATUS WFP_RegisterCalloutEx(
+    const GUID* calloutKey,
+    const GUID* applicableLayer,
+    UINT32* callout_id,
+    UINT64* filter_id,
+    FWPS_CALLOUT_CLASSIFY_FN1 classifyFn,
+    FWP_ACTION_TYPE actionType)
 {
 	NTSTATUS status = STATUS_SUCCESS;
+	BOOLEAN fwpsRegistered = FALSE;
 	
-	if (WFP_engine_handle == NULL)
-		return STATUS_INVALID_HANDLE;
+	if (WFP_engine_handle == NULL || ! classifyFn ||
+			! callout_id || ! filter_id)
+		return STATUS_INVALID_PARAMETER;
 
 	// Register a new Callout with the Filter Engine using the provided callout functions
 	FWPS_CALLOUT1 s_callout = { 0 }; // FWPS_CALLOUT1 is the latest supported by windows 7
 	s_callout.calloutKey = *calloutKey;
-	s_callout.classifyFn = WFP_classify;
+	s_callout.classifyFn = classifyFn;
 	s_callout.notifyFn = WFP_notify;
 	s_callout.flowDeleteFn = WFP_flow_delete;
 	status = FwpsCalloutRegister1((void *)Api_DeviceObject, &s_callout, callout_id); // FwpsCalloutRegister1 is the latest supported by windows 7
-	if (!NT_SUCCESS(status)){
-		//DbgPrint("Failed to register callout functions for sbie callout, status 0x%08x\r\n", status);
+	if (!NT_SUCCESS(status))
 		goto Exit;
-	}
+	fwpsRegistered = TRUE;
 
 	// Setup a FWPM_CALLOUT structure to store/track the state associated with the FWPS_CALLOUT
 	FWPM_CALLOUT m_callout = { 0 };
@@ -573,7 +773,7 @@ NTSTATUS WFP_RegisterCallout(const GUID* calloutKey, const GUID* applicableLayer
 	FWPM_FILTER filter = { 0 };
 	filter.displayData.name = WFP_FILTER_NAME;
 	filter.displayData.description = WFP_FILTER_DESCRIPTION;
-	filter.action.type = FWP_ACTION_CALLOUT_TERMINATING;	// Says this filter's callout MUST make a block/permit decision
+	filter.action.type = actionType;
 	filter.subLayerKey = WFP_SUBLAYER_GUID;
 	filter.weight.type = FWP_UINT8;
 	filter.weight.uint8 = 0xf;		// The weight of this filter within its sublayer
@@ -587,7 +787,27 @@ NTSTATUS WFP_RegisterCallout(const GUID* calloutKey, const GUID* applicableLayer
 	}
 
 Exit:
+	if (! NT_SUCCESS(status) && fwpsRegistered) {
+		FwpsCalloutUnregisterById(*callout_id);
+		*callout_id = 0;
+	}
 	return status;
+}
+
+
+NTSTATUS WFP_RegisterCallout(
+	const GUID* calloutKey,
+	const GUID* applicableLayer,
+	UINT32* callout_id,
+	UINT64* filter_id)
+{
+	return WFP_RegisterCalloutEx(
+		calloutKey,
+		applicableLayer,
+		callout_id,
+		filter_id,
+		WFP_classify,
+		FWP_ACTION_CALLOUT_TERMINATING);
 }
 
 
@@ -1080,6 +1300,343 @@ void WFP_classify(
 }
 
 
+static BOOLEAN WFP_IsV6Layer(UINT16 layerId)
+{
+    return layerId == FWPS_LAYER_ALE_FLOW_ESTABLISHED_V6 ||
+        layerId == FWPS_LAYER_OUTBOUND_TRANSPORT_V6 ||
+        layerId == FWPS_LAYER_INBOUND_TRANSPORT_V6 ||
+        layerId == FWPS_LAYER_STREAM_V6 ||
+        layerId == FWPS_LAYER_DATAGRAM_DATA_V6;
+}
+
+
+static BOOLEAN WFP_GetCaptureIdentity(
+    const FWPS_INCOMING_METADATA_VALUES *metadata,
+    CAPTURE_FILTER_IDENTITY *identity)
+{
+    if (! metadata || ! identity ||
+            ! FWPS_IS_METADATA_FIELD_PRESENT(
+                metadata, FWPS_METADATA_FIELD_PROCESS_ID)) {
+        return FALSE;
+    }
+
+    HANDLE processId = (HANDLE)(ULONG_PTR)metadata->processId;
+    BOOLEAN valid = FALSE;
+    KIRQL irql;
+#ifdef _WIN64
+    irql = KeAcquireSpinLockRaiseToDpc(&WFP_MapLock);
+#else
+    KeAcquireSpinLock(&WFP_MapLock, &irql);
+#endif
+
+    WFP_PROCESS *wfpProcess = map_get(&WFP_Processes, processId);
+    if (wfpProcess && wfpProcess->CaptureEligible) {
+        RtlZeroMemory(identity, sizeof(*identity));
+        identity->process_id = (ULONG)(ULONG_PTR)wfpProcess->ProcessId;
+        identity->session_id = wfpProcess->SessionId;
+        identity->process_create_time = wfpProcess->ProcessCreateTime;
+        RtlCopyMemory(
+            identity->box_name,
+            wfpProcess->BoxName,
+            sizeof(identity->box_name));
+        RtlCopyMemory(
+            identity->sid_string,
+            wfpProcess->SidString,
+            sizeof(identity->sid_string));
+        valid = TRUE;
+    }
+
+    KeReleaseSpinLock(&WFP_MapLock, irql);
+    return valid;
+}
+
+
+static UCHAR WFP_GetFlowDirection(
+    const FWPS_INCOMING_VALUES *fixedValues)
+{
+    UINT directionIndex = WFP_IsV6Layer(fixedValues->layerId) ?
+        FWPS_FIELD_ALE_FLOW_ESTABLISHED_V6_DIRECTION :
+        FWPS_FIELD_ALE_FLOW_ESTABLISHED_V4_DIRECTION;
+    return fixedValues->incomingValue[directionIndex].value.uint32 ==
+            FWP_DIRECTION_INBOUND ?
+        CAPTURE_PACKET_DIRECTION_INBOUND :
+        CAPTURE_PACKET_DIRECTION_OUTBOUND;
+}
+
+
+static BOOLEAN WFP_BuildPacketRecord(
+    const FWPS_INCOMING_VALUES *fixedValues,
+    UCHAR direction,
+    UCHAR layer,
+    CAPTURE_PACKET_RECORD *record)
+{
+    UINT localAddressIndex;
+    UINT remoteAddressIndex;
+    UINT localPortIndex;
+    UINT remotePortIndex;
+    UINT protocolIndex;
+    UINT flagsIndex;
+
+    if (! fixedValues || ! record)
+        return FALSE;
+
+    GetNetwork5TupleIndexesForLayer(
+        fixedValues->layerId,
+        &localAddressIndex,
+        &remoteAddressIndex,
+        &localPortIndex,
+        &remotePortIndex,
+        &protocolIndex,
+        &flagsIndex);
+    if (localAddressIndex == (UINT)-1 ||
+            remoteAddressIndex == (UINT)-1 ||
+            localPortIndex == (UINT)-1 ||
+            remotePortIndex == (UINT)-1 ||
+            protocolIndex == (UINT)-1) {
+        return FALSE;
+    }
+
+    BOOLEAN v6 = WFP_IsV6Layer(fixedValues->layerId);
+    RtlZeroMemory(record, sizeof(*record));
+    record->address_family = v6 ? AF_INET6 : AF_INET;
+    record->protocol =
+        fixedValues->incomingValue[protocolIndex].value.uint8;
+    record->direction = direction;
+    record->layer = layer;
+    record->local_port =
+        fixedValues->incomingValue[localPortIndex].value.uint16;
+    record->remote_port =
+        fixedValues->incomingValue[remotePortIndex].value.uint16;
+
+    if (v6) {
+        const FWP_BYTE_ARRAY16 *localArray =
+            fixedValues->incomingValue[localAddressIndex].value.byteArray16;
+        const FWP_BYTE_ARRAY16 *remoteArray =
+            fixedValues->incomingValue[remoteAddressIndex].value.byteArray16;
+        if (! localArray || ! remoteArray)
+            return FALSE;
+        RtlCopyMemory(record->local_address,
+            localArray->byteArray16, sizeof(record->local_address));
+        RtlCopyMemory(record->remote_address,
+            remoteArray->byteArray16, sizeof(record->remote_address));
+    }
+    else {
+        CaptureNetwork_EncodeIpv4(
+            record->local_address,
+            fixedValues->incomingValue[localAddressIndex].value.uint32);
+        CaptureNetwork_EncodeIpv4(
+            record->remote_address,
+            fixedValues->incomingValue[remoteAddressIndex].value.uint32);
+    }
+
+    if (flagsIndex != (UINT)-1) {
+        record->loopback =
+            (fixedValues->incomingValue[flagsIndex].value.uint32 &
+                FWP_CONDITION_FLAG_IS_LOOPBACK) != 0;
+    }
+    return TRUE;
+}
+
+
+static ULONG WFP_CopyNetBufferList(
+    void *layerData,
+    UCHAR *buffer,
+    ULONG capacity,
+    ULONG *originalLength)
+{
+    if (originalLength)
+        *originalLength = 0;
+    if (! layerData || ! buffer || ! capacity)
+        return 0;
+
+    NET_BUFFER_LIST *list = (NET_BUFFER_LIST *)layerData;
+    NET_BUFFER *netBuffer = NET_BUFFER_LIST_FIRST_NB(list);
+    if (! netBuffer)
+        return 0;
+
+    ULONG available = NET_BUFFER_DATA_LENGTH(netBuffer);
+    if (originalLength)
+        *originalLength = available;
+    ULONG copyLength = available < capacity ? available : capacity;
+    if (! copyLength)
+        return 0;
+
+    PVOID source = NdisGetDataBuffer(
+        netBuffer, copyLength, buffer, 1, 0);
+    if (! source)
+        return 0;
+    if (source != buffer)
+        RtlCopyMemory(buffer, source, copyLength);
+    return copyLength;
+}
+
+
+static void NTAPI WFP_flow_classify(
+    const FWPS_INCOMING_VALUES *inFixedValues,
+    const FWPS_INCOMING_METADATA_VALUES *inMetaValues,
+    void *layerData,
+    const void *classifyContext,
+    const FWPS_FILTER1 *filter,
+    UINT64 flowContext,
+    FWPS_CLASSIFY_OUT *classifyOut)
+{
+    UNREFERENCED_PARAMETER(layerData);
+    UNREFERENCED_PARAMETER(classifyContext);
+    UNREFERENCED_PARAMETER(flowContext);
+    UNREFERENCED_PARAMETER(classifyOut);
+
+    if (! inFixedValues || ! inMetaValues || ! filter ||
+            ! FWPS_IS_METADATA_FIELD_PRESENT(
+                inMetaValues, FWPS_METADATA_FIELD_FLOW_HANDLE)) {
+        return;
+    }
+
+    CAPTURE_FILTER_IDENTITY identity;
+    if (! WFP_GetCaptureIdentity(inMetaValues, &identity))
+        return;
+
+    CAPTURE_PACKET_RECORD record;
+    if (! WFP_BuildPacketRecord(
+            inFixedValues,
+            WFP_GetFlowDirection(inFixedValues),
+            CAPTURE_PACKET_LAYER_TRANSPORT,
+            &record)) {
+        return;
+    }
+
+    identity.loopback = record.loopback;
+
+    UINT32 calloutId = inFixedValues->layerId ==
+            FWPS_LAYER_ALE_FLOW_ESTABLISHED_V4 ?
+        WFP_flow_callout_id_v4 : WFP_flow_callout_id_v6;
+    UINT64 context = Capture_CreateFlowContext(
+        &identity,
+        &record,
+        inMetaValues->flowHandle,
+        inFixedValues->layerId,
+        calloutId);
+    if (! context)
+        return;
+
+    NTSTATUS status = FwpsFlowAssociateContext(
+        inMetaValues->flowHandle,
+        inFixedValues->layerId,
+        calloutId,
+        context);
+    if (! NT_SUCCESS(status))
+        Capture_DeleteFlowContext(context);
+}
+
+
+static void NTAPI WFP_transport_classify(
+    const FWPS_INCOMING_VALUES *inFixedValues,
+    const FWPS_INCOMING_METADATA_VALUES *inMetaValues,
+    void *layerData,
+    const void *classifyContext,
+    const FWPS_FILTER1 *filter,
+    UINT64 flowContext,
+    FWPS_CLASSIFY_OUT *classifyOut)
+{
+    UNREFERENCED_PARAMETER(inFixedValues);
+    UNREFERENCED_PARAMETER(inMetaValues);
+    UNREFERENCED_PARAMETER(classifyContext);
+    UNREFERENCED_PARAMETER(filter);
+    UNREFERENCED_PARAMETER(classifyOut);
+
+    if (! flowContext)
+        return;
+
+    UCHAR buffer[CAPTURE_PACKET_SNAPLEN_MAX];
+    ULONG originalLength;
+    ULONG capturedLength = WFP_CopyNetBufferList(
+        layerData, buffer, sizeof(buffer), &originalLength);
+    if (capturedLength) {
+        Capture_RecordPayloadByFlow(
+            flowContext,
+            buffer,
+            capturedLength,
+            originalLength,
+            CAPTURE_PACKET_LAYER_TRANSPORT);
+    }
+}
+
+
+static void NTAPI WFP_stream_classify(
+    const FWPS_INCOMING_VALUES *inFixedValues,
+    const FWPS_INCOMING_METADATA_VALUES *inMetaValues,
+    void *layerData,
+    const void *classifyContext,
+    const FWPS_FILTER1 *filter,
+    UINT64 flowContext,
+    FWPS_CLASSIFY_OUT *classifyOut)
+{
+    UNREFERENCED_PARAMETER(inFixedValues);
+    UNREFERENCED_PARAMETER(inMetaValues);
+    UNREFERENCED_PARAMETER(classifyContext);
+    UNREFERENCED_PARAMETER(filter);
+    UNREFERENCED_PARAMETER(classifyOut);
+
+    if (! flowContext || ! layerData)
+        return;
+
+    FWPS_STREAM_CALLOUT_IO_PACKET *ioPacket =
+        (FWPS_STREAM_CALLOUT_IO_PACKET *)layerData;
+    if (! ioPacket->streamData || ! ioPacket->streamData->dataLength)
+        return;
+
+    UCHAR buffer[CAPTURE_PACKET_SNAPLEN_MAX];
+    SIZE_T available = ioPacket->streamData->dataLength;
+    ULONG originalLength = available > 0xffffffffULL ?
+        (ULONG)-1 : (ULONG)available;
+    ULONG copyLength = available > sizeof(buffer) ?
+        sizeof(buffer) : (ULONG)available;
+    SIZE_T copied = 0;
+    FwpsCopyStreamDataToBuffer(
+        ioPacket->streamData, buffer, copyLength, &copied);
+    if (copied) {
+        Capture_RecordPayloadByFlow(
+            flowContext,
+            buffer,
+            (ULONG)copied,
+            originalLength,
+            CAPTURE_PACKET_LAYER_STREAM);
+    }
+}
+
+
+static void NTAPI WFP_datagram_classify(
+    const FWPS_INCOMING_VALUES *inFixedValues,
+    const FWPS_INCOMING_METADATA_VALUES *inMetaValues,
+    void *layerData,
+    const void *classifyContext,
+    const FWPS_FILTER1 *filter,
+    UINT64 flowContext,
+    FWPS_CLASSIFY_OUT *classifyOut)
+{
+    UNREFERENCED_PARAMETER(inFixedValues);
+    UNREFERENCED_PARAMETER(inMetaValues);
+    UNREFERENCED_PARAMETER(classifyContext);
+    UNREFERENCED_PARAMETER(filter);
+    UNREFERENCED_PARAMETER(classifyOut);
+
+    if (! flowContext)
+        return;
+
+    UCHAR buffer[CAPTURE_PACKET_SNAPLEN_MAX];
+    ULONG originalLength;
+    ULONG capturedLength = WFP_CopyNetBufferList(
+        layerData, buffer, sizeof(buffer), &originalLength);
+    if (capturedLength) {
+        Capture_RecordPayloadByFlow(
+            flowContext,
+            buffer,
+            capturedLength,
+            originalLength,
+            CAPTURE_PACKET_LAYER_DATAGRAM);
+    }
+}
+
+
 //---------------------------------------------------------------------------
 // WFP_notify
 //---------------------------------------------------------------------------
@@ -1104,10 +1661,10 @@ NTSTATUS WFP_notify(
 
 NTSTATUS WFP_flow_delete(UINT16 layerId, UINT32 calloutId, UINT64 flowContext)
 {
-	UNREFERENCED_PARAMETER(layerId);
-	UNREFERENCED_PARAMETER(calloutId);
-	UNREFERENCED_PARAMETER(flowContext);
-	return STATUS_SUCCESS;
+    UNREFERENCED_PARAMETER(layerId);
+    UNREFERENCED_PARAMETER(calloutId);
+    Capture_DeleteFlowContext(flowContext);
+    return STATUS_SUCCESS;
 }
 
 
@@ -1144,6 +1701,38 @@ GetNetwork5TupleIndexesForLayer(
       *remotePortIndex = FWPS_FIELD_ALE_AUTH_CONNECT_V6_IP_REMOTE_PORT;
       *protocolIndex = FWPS_FIELD_ALE_AUTH_CONNECT_V6_IP_PROTOCOL;
       *flagsIndex = FWPS_FIELD_ALE_AUTH_CONNECT_V6_FLAGS;
+      break;
+   case FWPS_LAYER_ALE_FLOW_ESTABLISHED_V4:
+      *localAddressIndex = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V4_IP_LOCAL_ADDRESS;
+      *remoteAddressIndex = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V4_IP_REMOTE_ADDRESS;
+      *localPortIndex = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V4_IP_LOCAL_PORT;
+      *remotePortIndex = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V4_IP_REMOTE_PORT;
+      *protocolIndex = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V4_IP_PROTOCOL;
+      *flagsIndex = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V4_FLAGS;
+      break;
+   case FWPS_LAYER_ALE_FLOW_ESTABLISHED_V6:
+      *localAddressIndex = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V6_IP_LOCAL_ADDRESS;
+      *remoteAddressIndex = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V6_IP_REMOTE_ADDRESS;
+      *localPortIndex = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V6_IP_LOCAL_PORT;
+      *remotePortIndex = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V6_IP_REMOTE_PORT;
+      *protocolIndex = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V6_IP_PROTOCOL;
+      *flagsIndex = FWPS_FIELD_ALE_FLOW_ESTABLISHED_V6_FLAGS;
+      break;
+   case FWPS_LAYER_DATAGRAM_DATA_V4:
+      *localAddressIndex = FWPS_FIELD_DATAGRAM_DATA_V4_IP_LOCAL_ADDRESS;
+      *remoteAddressIndex = FWPS_FIELD_DATAGRAM_DATA_V4_IP_REMOTE_ADDRESS;
+      *localPortIndex = FWPS_FIELD_DATAGRAM_DATA_V4_IP_LOCAL_PORT;
+      *remotePortIndex = FWPS_FIELD_DATAGRAM_DATA_V4_IP_REMOTE_PORT;
+      *protocolIndex = FWPS_FIELD_DATAGRAM_DATA_V4_IP_PROTOCOL;
+      *flagsIndex = FWPS_FIELD_DATAGRAM_DATA_V4_FLAGS;
+      break;
+   case FWPS_LAYER_DATAGRAM_DATA_V6:
+      *localAddressIndex = FWPS_FIELD_DATAGRAM_DATA_V6_IP_LOCAL_ADDRESS;
+      *remoteAddressIndex = FWPS_FIELD_DATAGRAM_DATA_V6_IP_REMOTE_ADDRESS;
+      *localPortIndex = FWPS_FIELD_DATAGRAM_DATA_V6_IP_LOCAL_PORT;
+      *remotePortIndex = FWPS_FIELD_DATAGRAM_DATA_V6_IP_REMOTE_PORT;
+      *protocolIndex = FWPS_FIELD_DATAGRAM_DATA_V6_IP_PROTOCOL;
+      *flagsIndex = FWPS_FIELD_DATAGRAM_DATA_V6_FLAGS;
       break;
    case FWPS_LAYER_ALE_AUTH_RECV_ACCEPT_V4:
       *localAddressIndex = FWPS_FIELD_ALE_AUTH_RECV_ACCEPT_V4_IP_LOCAL_ADDRESS;
