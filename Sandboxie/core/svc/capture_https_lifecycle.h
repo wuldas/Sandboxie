@@ -16,41 +16,44 @@
  */
 
 //---------------------------------------------------------------------------
-// Session capture CA -- public API, no OpenSSL types
+// HTTPS capture session lifecycle helpers
 //---------------------------------------------------------------------------
 
-#ifndef _MY_CAPTURE_CA_H
-#define _MY_CAPTURE_CA_H
+#ifndef _MY_CAPTURE_HTTPS_LIFECYCLE_H
+#define _MY_CAPTURE_HTTPS_LIFECYCLE_H
 
+#if defined(KERNEL_MODE) || defined(_NTDDK_)
+#include <ntddk.h>
+#else
 #include <windows.h>
+#endif
 
-#define CAPTURE_CA_OK               0
-#define CAPTURE_CA_ERROR            (-1)
 
-typedef struct _CAPTURE_CA CAPTURE_CA;
+#define CAPTURE_HTTPS_LIFECYCLE_WAITING     1
+#define CAPTURE_HTTPS_LIFECYCLE_SPAWN       2
+#define CAPTURE_HTTPS_LIFECYCLE_FAILED      3
+#define CAPTURE_HTTPS_LIFECYCLE_STOPPED     4
+
+#define CAPTURE_HTTPS_BROKER_ACTION_KEEP_REDIRECT   1
+#define CAPTURE_HTTPS_BROKER_ACTION_TEARDOWN        2
+
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-CAPTURE_CA *CaptureCa_Create(void);
-void CaptureCa_Free(CAPTURE_CA *ca);
+ULONG CaptureHttpsLifecycle_OnExport(
+    BOOLEAN httpsMode,
+    BOOLEAN hasPcapExport,
+    BOOLEAN hasHarExport);
 
-int CaptureCa_ExportPublicPem(
-    const CAPTURE_CA *ca,
-    char *buffer,
-    ULONG capacity,
-    ULONG *length);
-
-int CaptureCa_WritePublicPemPath(const CAPTURE_CA *ca, const WCHAR *path);
-int CaptureCa_WritePublicPemHandle(const CAPTURE_CA *ca, HANDLE file);
-int CaptureCa_ImportPublicPemToStore(
-    const char *pem,
-    ULONG pemLength,
-    const WCHAR *storeName);
+ULONG CaptureHttpsLifecycle_OnBrokerDeath(
+    BOOLEAN httpsMode,
+    BOOLEAN wasRunning);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* _MY_CAPTURE_CA_H */
+
+#endif /* _MY_CAPTURE_HTTPS_LIFECYCLE_H */

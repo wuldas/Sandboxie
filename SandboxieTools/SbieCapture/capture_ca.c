@@ -27,6 +27,7 @@
 #include <openssl/rand.h>
 #include <openssl/x509v3.h>
 
+#include <wincrypt.h>
 #include <string.h>
 
 
@@ -289,4 +290,91 @@ int CaptureCa_MintLeaf(
     *cert = leaf;
     *key = leafKey;
     return CAPTURE_CA_OK;
+}
+
+
+static const char *CaptureCa_SkipPemHeader(const char *pem, ULONG *remaining)
+{
+    const char *begin;
+    const char *cursor;
+
+    if (! pem || ! remaining)
+        return NULL;
+    begin = strstr(pem, "-----BEGIN CERTIFICATE-----");
+    if (! begin)
+        return NULL;
+    begin += 27;
+    while (*begin == '\r' || *begin == '\n')
+        ++begin;
+    cursor = strstr(begin, "-----END CERTIFICATE-----");
+    if (! cursor || cursor <= begin)
+        return NULL;
+    *remaining = (ULONG)(cursor - begin);
+    return begin;
+}
+
+
+int CaptureCa_ImportPublicPemToStore(
+    const char *pem,
+    ULONG pemLength,
+    const WCHAR *storeName)
+{
+    const char *body;
+    ULONG bodyLength = 0;
+    DWORD decodedSize = 0;
+    BYTE *decoded = NULL;
+    HCERTSTORE store = NULL;
+    PCCERT_CONTEXT cert = NULL;
+    int status = CAPTURE_CA_ERROR;
+
+    UNREFERENCED_PARAMETER(pemLength);
+    if (! pem || ! storeName || ! storeName[0])
+        return CAPTURE_CA_ERROR;
+    if (strstr(pem, "PRIVATE KEY"))
+        return CAPTURE_CA_ERROR;
+
+    body = CaptureCa_SkipPemHeader(pem, &bodyLength);
+    if (! body || ! bodyLength)
+        return CAPTURE_CA_ERROR;
+    if (! CryptStringToBinaryA(
+            body, bodyLength, CRYPT_STRING_BASE64, NULL, &decodedSize,
+            NULL, NULL) || ! decodedSize) {
+        return CAPTURE_CA_ERROR;
+    }
+    decoded = (BYTE *)HeapAlloc(GetProcessHeap(), 0, decodedSize);
+    if (! decoded)
+        return CAPTURE_CA_ERROR;
+    if (! CryptStringToBinaryA(
+            body, bodyLength, CRYPT_STRING_BASE64, decoded, &decodedSize,
+            NULL, NULL)) {
+        goto done;
+    }
+
+    store = CertOpenStore(
+        CERT_STORE_PROV_SYSTEM_W,
+        0,
+        0,
+        CERT_SYSTEM_STORE_CURRENT_USER,
+        storeName);
+    if (! store)
+        goto done;
+    if (! CertAddEncodedCertificateToStore(
+            store,
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            decoded,
+            decodedSize,
+            CERT_STORE_ADD_REPLACE_EXISTING,
+            &cert)) {
+        goto done;
+    }
+    status = CAPTURE_CA_OK;
+
+done:
+    if (cert)
+        CertFreeCertificateContext(cert);
+    if (store)
+        CertCloseStore(store, 0);
+    if (decoded)
+        HeapFree(GetProcessHeap(), 0, decoded);
+    return status;
 }

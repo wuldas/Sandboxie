@@ -24,6 +24,7 @@
 #include <winsock2.h>
 #include <ws2tcpip.h>
 #include <windows.h>
+#include <wincrypt.h>
 
 #include <openssl/bio.h>
 #include <openssl/err.h>
@@ -491,6 +492,40 @@ static int TestCaPublicPemHasNoPrivateKey(void)
                 "written file has no private key");
     free(bytes);
     DeleteFileW(path);
+    CaptureCa_Free(ca);
+    return ok;
+}
+
+
+static int TestImportPublicPemToDisposableStore(void)
+{
+    CAPTURE_CA *ca = CaptureCa_Create();
+    char pem[4096];
+    ULONG length = 0;
+    HCERTSTORE store;
+    int ok;
+
+    if (! Require(ca != NULL, "create CA for import"))
+        return 0;
+    if (! Require(CaptureCa_ExportPublicPem(ca, pem, sizeof(pem), &length) ==
+                    CAPTURE_CA_OK,
+                  "export PEM for import")) {
+        CaptureCa_Free(ca);
+        return 0;
+    }
+    ok = Require(CaptureCa_ImportPublicPemToStore(
+                     pem, length, L"SbieCaptureTest") == CAPTURE_CA_OK,
+                 "import public PEM to disposable store") &&
+        Require(CaptureCa_ImportPublicPemToStore(
+                    "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n",
+                    60, L"SbieCaptureTest") == CAPTURE_CA_ERROR,
+                "reject private key material");
+    store = CertOpenStore(
+        CERT_STORE_PROV_SYSTEM_W, 0, 0,
+        CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_DELETE_FLAG,
+        L"SbieCaptureTest");
+    if (store)
+        CertCloseStore(store, 0);
     CaptureCa_Free(ca);
     return ok;
 }
@@ -1008,6 +1043,7 @@ int main(void)
     }
 
     ok = TestCaPublicPemHasNoPrivateKey() &&
+        TestImportPublicPemToDisposableStore() &&
         TestTls13RoundTrip() &&
         TestTls12RoundTrip() &&
         TestMissingContextRejected() &&

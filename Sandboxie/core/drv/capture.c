@@ -49,6 +49,7 @@ typedef struct _CAPTURE_SESSION {
     CAPTURE_PACKET_QUEUE *packet_queue;
     CAPTURE_STREAM_QUEUE *stream_queue;
     BOOLEAN payload_enabled;
+    BOOLEAN https_redirect_enabled;
     HANDLE section_kernel_handle;
     PVOID section_object;
     CAPTURE_BROKER_SECTION *section_system_address;
@@ -566,6 +567,24 @@ static NTSTATUS Capture_Stop(
 }
 
 
+static NTSTATUS Capture_EnableHttps(
+    const CAPTURE_DRIVER_SESSION_ID *captureId)
+{
+    KIRQL irql;
+    CAPTURE_SESSION *session;
+    NTSTATUS status = STATUS_NOT_FOUND;
+
+    KeAcquireSpinLock(&Capture_Lock, &irql);
+    session = Capture_FindSessionLocked(captureId);
+    if (session) {
+        session->https_redirect_enabled = TRUE;
+        status = STATUS_SUCCESS;
+    }
+    KeReleaseSpinLock(&Capture_Lock, irql);
+    return status;
+}
+
+
 //---------------------------------------------------------------------------
 // Driver API
 //---------------------------------------------------------------------------
@@ -643,6 +662,8 @@ static NTSTATUS Capture_Api_Control(PROCESS *proc, ULONG64 *parms)
                 CAPTURE_DRIVER_FLAG_INCLUDE_LOOPBACK;
             if (WFP_IsPayloadInspectionEnabled())
                 control->flags |= CAPTURE_DRIVER_FLAG_INCLUDE_PAYLOAD;
+            if (WFP_IsHttpsRedirectAvailable())
+                control->flags |= CAPTURE_DRIVER_FLAG_HTTPS_REDIRECT;
             control->queue_capacity = CAPTURE_DRIVER_QUEUE_CAPACITY;
             control->initial_process_count = 0;
             control->reserved = 0;
@@ -666,6 +687,18 @@ static NTSTATUS Capture_Api_Control(PROCESS *proc, ULONG64 *parms)
         }
         else {
             status = Capture_Stop(&control->capture_id);
+        }
+    }
+    else if (control->operation == CAPTURE_DRIVER_CONTROL_ENABLE_HTTPS) {
+        if (controlSize != CAPTURE_DRIVER_CONTROL_BASE_SIZE ||
+                Capture_IdIsZero(&control->capture_id)) {
+            status = STATUS_INVALID_PARAMETER;
+        }
+        else if (! WFP_IsHttpsRedirectAvailable()) {
+            status = STATUS_NOT_SUPPORTED;
+        }
+        else {
+            status = Capture_EnableHttps(&control->capture_id);
         }
     }
     else {
@@ -1197,7 +1230,8 @@ BOOLEAN Capture_LookupHttpsRedirect(
             ULONG port = 0;
             if (session->section_system_address)
                 port = session->section_system_address->https_listen_port;
-            if (port != 0 && port <= 0xFFFFul &&
+            if (session->https_redirect_enabled &&
+                    port != 0 && port <= 0xFFFFul &&
                     CaptureFilter_Matches(&session->target, identity)) {
                 *listenPort = (USHORT)port;
                 *captureIdHigh = session->capture_id.high;

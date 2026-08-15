@@ -20,6 +20,7 @@
 
 #include "capture_https_broker.h"
 #include "capture_broker.h"
+#include "capture_ca.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -99,6 +100,11 @@ int __cdecl wmain(int argc, WCHAR **argv)
     BOOL haveGeneration = FALSE;
     BOOL httpsListen = FALSE;
     BOOL httpsTestPreamble = FALSE;
+    BOOL importCa = FALSE;
+    ULONG64 rawImport = 0;
+    HANDLE importHandle = NULL;
+    const WCHAR *importPath = NULL;
+    const WCHAR *storeName = L"Root";
     HANDLE sectionHandle = NULL;
     HANDLE outputFile = NULL;
     HANDLE stopEvent = NULL;
@@ -188,6 +194,23 @@ int __cdecl wmain(int argc, WCHAR **argv)
         else if (_wcsicmp(argv[index], L"--https-test-preamble") == 0) {
             httpsTestPreamble = TRUE;
         }
+        else if (ReadOption(argc, argv, &index, L"--import-ca", &text)) {
+            if (importCa || ! ParseUInt64(text, 16, &rawImport) || rawImport == 0)
+                goto InvalidArguments;
+            importCa = TRUE;
+            importHandle = (HANDLE)(ULONG_PTR)rawImport;
+        }
+        else if (ReadOption(argc, argv, &index, L"--import-ca-path", &text)) {
+            if (importCa || ! text || ! text[0])
+                goto InvalidArguments;
+            importCa = TRUE;
+            importPath = text;
+        }
+        else if (ReadOption(argc, argv, &index, L"--store", &text)) {
+            if (! text || ! text[0])
+                goto InvalidArguments;
+            storeName = text;
+        }
         else if (_wcsicmp(argv[index], L"--help") == 0 ||
                  _wcsicmp(argv[index], L"-h") == 0) {
             PrintUsage();
@@ -196,6 +219,41 @@ int __cdecl wmain(int argc, WCHAR **argv)
         else {
             goto InvalidArguments;
         }
+    }
+
+    if (importCa) {
+        HANDLE file = importHandle;
+        int importStatus;
+        if (haveSection || haveFile || httpsListen)
+            goto InvalidArguments;
+        if (importPath) {
+            file = CreateFileW(
+                importPath, GENERIC_READ,
+                FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+            if (file == INVALID_HANDLE_VALUE)
+                return CAPTURE_BROKER_ERROR;
+        }
+        if (file == NULL || file == INVALID_HANDLE_VALUE)
+            goto InvalidArguments;
+        {
+            char pem[4096];
+            DWORD readSize = 0;
+            SetFilePointer(file, 0, NULL, FILE_BEGIN);
+            if (! ReadFile(file, pem, sizeof(pem) - 1, &readSize, NULL) ||
+                    ! readSize) {
+                if (importPath)
+                    CloseHandle(file);
+                return CAPTURE_BROKER_ERROR;
+            }
+            pem[readSize] = 0;
+            importStatus = CaptureCa_ImportPublicPemToStore(
+                pem, readSize, storeName);
+        }
+        if (importPath)
+            CloseHandle(file);
+        return importStatus == CAPTURE_CA_OK ?
+            CAPTURE_BROKER_OK : CAPTURE_BROKER_ERROR;
     }
 
     if (! haveSection || ! haveFile || !haveCaptureHigh ||

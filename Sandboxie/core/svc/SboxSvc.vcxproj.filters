@@ -45,6 +45,7 @@
     </ClCompile>
     <ClCompile Include="EpMapperServer.cpp" />
     <ClCompile Include="CaptureServer.cpp" />
+    <ClCompile Include="capture_https_lifecycle.c" />
     <ClCompile Include="fileserver.cpp" />
     <ClCompile Include="iphlpserver.cpp" />
     <ClCompile Include="namedpipeserver.cpp" />

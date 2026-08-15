@@ -512,6 +512,9 @@
     </ClCompile>
     <ClCompile Include="EpMapperServer.cpp" />
     <ClCompile Include="CaptureServer.cpp" />
+    <ClCompile Include="capture_https_lifecycle.c">
+      <PrecompiledHeader>NotUsing</PrecompiledHeader>
+    </ClCompile>
     <ClCompile Include="fileserver.cpp" />
     <ClCompile Include="GuiServer.cpp" />
     <ClCompile Include="HostInjectProcessUtil.cpp">
@@ -616,6 +619,7 @@
     <ClInclude Include="comwire.h" />
     <ClInclude Include="CaptureServer.h" />
     <ClInclude Include="capturewire.h" />
+    <ClInclude Include="capture_https_lifecycle.h" />
     <ClInclude Include="DriverAssist.h" />
     <ClInclude Include="EpMapperServer.h" />
     <ClInclude Include="EpMapperWire.h" />

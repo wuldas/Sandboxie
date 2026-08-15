@@ -24,6 +24,7 @@
 #include "CaptureServer.h"
 #include "capturewire.h"
 #include "capturebrokerwire.h"
+#include "capture_https_lifecycle.h"
 #include "core/dll/sbieapi.h"
 #include "core/drv/api_defs.h"
 #include "core/drv/api_flags.h"
@@ -58,6 +59,8 @@ typedef struct _CAPTURE_SESSION_OBJ {
     WCHAR owner_sid[96];
     BOOLEAN backend_active;
     HANDLE export_file;
+    HANDLE har_file;
+    HANDLE ca_file;
     HANDLE section_handle;
     HANDLE broker_job;
     HANDLE broker_process;
@@ -423,7 +426,16 @@ static ULONG CaptureServer_DuplicateWritableFile(
 static BOOLEAN CaptureServer_IsPacketMode(
     const CAPTURE_SESSION_OBJ *session)
 {
-    return session && session->info.mode == CAPTURE_MODE_PACKETS;
+    return session &&
+        (session->info.mode == CAPTURE_MODE_PACKETS ||
+         session->info.mode == CAPTURE_MODE_HTTPS);
+}
+
+
+static BOOLEAN CaptureServer_IsHttpsMode(
+    const CAPTURE_SESSION_OBJ *session)
+{
+    return session && session->info.mode == CAPTURE_MODE_HTTPS;
 }
 
 
@@ -492,7 +504,8 @@ static ULONG CaptureServer_StartDriver(
     control->operation = CAPTURE_DRIVER_CONTROL_START;
     control->scope = session->info.scope;
     control->flags = session->info.flags;
-    if (session->info.mode == CAPTURE_MODE_PACKETS)
+    if (session->info.mode == CAPTURE_MODE_PACKETS ||
+            session->info.mode == CAPTURE_MODE_HTTPS)
         control->flags |= CAPTURE_DRIVER_FLAG_INCLUDE_PAYLOAD;
     control->target_pid = session->info.target_pid;
     control->target_session_id = session->info.target_session_id;
@@ -895,7 +908,8 @@ MSG_HEADER *CaptureServer::StartHandler(MSG_HEADER *msg)
         return SHORT_REPLY(STATUS_INVALID_PARAMETER);
 
     if (req->mode != CAPTURE_MODE_CONNECTIONS &&
-            req->mode != CAPTURE_MODE_PACKETS)
+            req->mode != CAPTURE_MODE_PACKETS &&
+            req->mode != CAPTURE_MODE_HTTPS)
         return SHORT_REPLY(STATUS_NOT_SUPPORTED);
 
     if ((req->flags & ~CAPTURE_FLAG_ALL) != 0)
@@ -950,13 +964,18 @@ MSG_HEADER *CaptureServer::StartHandler(MSG_HEADER *msg)
     status = CaptureServer_QueryDriver(&driverFlags);
     if (! NT_SUCCESS(status))
         return SHORT_REPLY(status);
-    if (req->mode == CAPTURE_MODE_PACKETS) {
+    if (req->mode == CAPTURE_MODE_PACKETS ||
+            req->mode == CAPTURE_MODE_HTTPS) {
 #if CAPTURE_PACKET_CAPTURE_RELEASE_GATE
         if (!(driverFlags & CAPTURE_DRIVER_FLAG_INCLUDE_PAYLOAD))
             return SHORT_REPLY(STATUS_NOT_SUPPORTED);
 #else
         return SHORT_REPLY(STATUS_NOT_SUPPORTED);
 #endif
+    }
+    if (req->mode == CAPTURE_MODE_HTTPS &&
+            !(driverFlags & CAPTURE_DRIVER_FLAG_HTTPS_REDIRECT)) {
+        return SHORT_REPLY(STATUS_NOT_SUPPORTED);
     }
 
     ULONG ownerPid;
@@ -1141,7 +1160,8 @@ MSG_HEADER *CaptureServer::StartHandler(MSG_HEADER *msg)
         return SHORT_REPLY(status);
     }
 
-    if (session->info.mode == CAPTURE_MODE_PACKETS) {
+    if (session->info.mode == CAPTURE_MODE_PACKETS ||
+            session->info.mode == CAPTURE_MODE_HTTPS) {
         status = CaptureServer_MapDriver(session);
         if (! NT_SUCCESS(status)) {
             CaptureServer_StopDriver(&session->info.capture_id);
@@ -1158,7 +1178,8 @@ MSG_HEADER *CaptureServer::StartHandler(MSG_HEADER *msg)
     }
 
     session->backend_active = TRUE;
-    if (session->info.mode != CAPTURE_MODE_PACKETS) {
+    if (session->info.mode != CAPTURE_MODE_PACKETS &&
+            session->info.mode != CAPTURE_MODE_HTTPS) {
         session->info.state = CAPTURE_STATE_RUNNING;
         session->info.backend_status = STATUS_SUCCESS;
     }
@@ -1483,7 +1504,8 @@ MSG_HEADER *CaptureServer::ReadEventsHandler(MSG_HEADER *msg)
             &droppedCount);
         if (NT_SUCCESS(status)) {
             session->info.event_count += returnedEvents;
-            if (session->info.mode != CAPTURE_MODE_PACKETS)
+            if (session->info.mode != CAPTURE_MODE_PACKETS &&
+                    session->info.mode != CAPTURE_MODE_HTTPS)
                 session->info.dropped_count = droppedCount;
         }
         else if (status == STATUS_NOT_FOUND) {
@@ -1776,7 +1798,11 @@ MSG_HEADER *CaptureServer::SetExportHandler(MSG_HEADER *msg)
     duplicateFile = NULL;
     session->info.backend_status = STATUS_PENDING;
 
-    if (session->section_handle) {
+    if (session->section_handle &&
+            CaptureHttpsLifecycle_OnExport(
+                CaptureServer_IsHttpsMode(session),
+                session->export_file != NULL,
+                session->har_file != NULL) == CAPTURE_HTTPS_LIFECYCLE_SPAWN) {
         status = CaptureServer_StartBroker(session);
         if (! NT_SUCCESS(status)) {
             ULONG teardownStatus = StopBackend(session, FALSE);
@@ -1819,7 +1845,88 @@ MSG_HEADER *CaptureServer::SetHarExportHandler(MSG_HEADER *msg)
             req->file_handle == 0 || req->reserved || req->reserved2)
         return SHORT_REPLY(STATUS_INVALID_PARAMETER);
 
-    return SHORT_REPLY(STATUS_NOT_SUPPORTED);
+    ULONG ownerPid;
+    ULONG ownerSessionId;
+    ULONG64 ownerCreateTime;
+    WCHAR ownerSid[96];
+    status = CaptureServer_GetCallerIdentity(
+        &ownerPid, &ownerSessionId, &ownerCreateTime, ownerSid);
+    if (! NT_SUCCESS(status))
+        return SHORT_REPLY(status);
+
+    HANDLE duplicateFile = NULL;
+    status = CaptureServer_DuplicateWritableFile(
+        ownerPid, ownerCreateTime, req->file_handle, &duplicateFile);
+    if (! NT_SUCCESS(status))
+        return SHORT_REPLY(status);
+
+    EnterCriticalSection(&m_lock);
+
+    CAPTURE_SESSION_OBJ *session = FindSession(
+        &req->capture_id, ownerPid, ownerCreateTime, ownerSid);
+    if (! session) {
+        LeaveCriticalSection(&m_lock);
+        CloseHandle(duplicateFile);
+        return SHORT_REPLY(STATUS_OBJECT_NAME_NOT_FOUND);
+    }
+
+    if (session->owner_session_id != ownerSessionId) {
+        LeaveCriticalSection(&m_lock);
+        CloseHandle(duplicateFile);
+        return SHORT_REPLY(STATUS_ACCESS_DENIED);
+    }
+
+    if (! CaptureServer_IsHttpsMode(session)) {
+        LeaveCriticalSection(&m_lock);
+        CloseHandle(duplicateFile);
+        return SHORT_REPLY(STATUS_NOT_SUPPORTED);
+    }
+
+    if (! CaptureServer_IsWaitingForBackend(session) || session->har_file) {
+        LeaveCriticalSection(&m_lock);
+        CloseHandle(duplicateFile);
+        return SHORT_REPLY(STATUS_INVALID_DEVICE_STATE);
+    }
+
+    CAPTURE_SET_HAR_EXPORT_RPL *rpl = (CAPTURE_SET_HAR_EXPORT_RPL *)
+        LONG_REPLY(sizeof(CAPTURE_SET_HAR_EXPORT_RPL));
+    if (! rpl) {
+        LeaveCriticalSection(&m_lock);
+        CloseHandle(duplicateFile);
+        return SHORT_REPLY(STATUS_INSUFFICIENT_RESOURCES);
+    }
+
+    session->har_file = duplicateFile;
+    duplicateFile = NULL;
+    session->info.backend_status = STATUS_PENDING;
+
+    if (session->section_handle &&
+            CaptureHttpsLifecycle_OnExport(
+                TRUE,
+                session->export_file != NULL,
+                session->har_file != NULL) == CAPTURE_HTTPS_LIFECYCLE_SPAWN) {
+        status = CaptureServer_StartBroker(session);
+        if (! NT_SUCCESS(status)) {
+            ULONG teardownStatus = StopBackend(session, FALSE);
+            if (NT_SUCCESS(teardownStatus) && !NT_SUCCESS(status))
+                teardownStatus = status;
+            session->info.state = CAPTURE_STATE_FAILED;
+            session->info.backend_status = teardownStatus;
+            PipeServer::GetPipeServer()->FreeMsg(&rpl->h);
+            LeaveCriticalSection(&m_lock);
+            return SHORT_REPLY(teardownStatus);
+        }
+    }
+
+    memzero(rpl, sizeof(*rpl));
+    rpl->h.length = sizeof(*rpl);
+    rpl->h.status = STATUS_SUCCESS;
+    rpl->wire_version = CAPTURE_WIRE_VERSION;
+    rpl->struct_size = sizeof(*rpl);
+    memcpy(&rpl->session, &session->info, sizeof(rpl->session));
+
+    LeaveCriticalSection(&m_lock);
+    return &rpl->h;
 }
 
 
@@ -1924,9 +2031,187 @@ static void CaptureServer_UpdateBrokerCounters(CAPTURE_SESSION_OBJ *session)
 }
 
 
+static ULONG CaptureServer_WaitListenPort(
+    HANDLE sectionHandle,
+    USHORT *listenPort)
+{
+    CAPTURE_BROKER_SECTION *section;
+    DWORD startTick;
+    ULONG status = STATUS_TIMEOUT;
+
+    if (! sectionHandle || ! listenPort)
+        return STATUS_INVALID_PARAMETER;
+    section = (CAPTURE_BROKER_SECTION *)MapViewOfFile(
+        sectionHandle, FILE_MAP_READ, 0, 0, 0);
+    if (! section)
+        return STATUS_INVALID_HANDLE;
+    startTick = GetTickCount();
+    for (;;) {
+        MemoryBarrier();
+        if (section->https_listen_port != 0 &&
+                section->https_listen_port <= 0xFFFFul) {
+            *listenPort = (USHORT)section->https_listen_port;
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (GetTickCount() - startTick >= 5000)
+            break;
+        Sleep(20);
+    }
+    UnmapViewOfFile(section);
+    return status;
+}
+
+
+static ULONG CaptureServer_EnableHttpsRedirect(
+    const CAPTURE_SESSION_ID *captureId)
+{
+    UCHAR buffer[CAPTURE_DRIVER_CONTROL_BASE_SIZE];
+    memzero(buffer, sizeof(buffer));
+    CAPTURE_DRIVER_CONTROL *control = (CAPTURE_DRIVER_CONTROL *)buffer;
+    control->version = CAPTURE_DRIVER_VERSION;
+    control->size = sizeof(buffer);
+    control->operation = CAPTURE_DRIVER_CONTROL_ENABLE_HTTPS;
+    control->capture_id.high = captureId->high;
+    control->capture_id.low = captureId->low;
+    return SbieApi_Call(API_CAPTURE_CONTROL, 1, (ULONG_PTR)control);
+}
+
+
+static ULONG CaptureServer_ImportCaInBox(CAPTURE_SESSION_OBJ *session)
+{
+    HANDLE ownerProcess = NULL;
+    HANDLE ownerToken = NULL;
+    HANDLE primaryToken = NULL;
+    HANDLE childCa = NULL;
+    HANDLE inheritedHandles[1] = { 0 };
+    WCHAR homePath[512];
+    WCHAR executablePath[512];
+    WCHAR commandLine[768];
+    SBIE_STARTUPINFOEXW startup = { 0 };
+    PROCESS_INFORMATION processInfo = { 0 };
+    PVOID attributes = NULL;
+    SIZE_T attributesSize = 0;
+    BOOL attributesInitialized = FALSE;
+    ULONG status = STATUS_UNSUCCESSFUL;
+    DWORD exitCode = STILL_ACTIVE;
+    HMODULE kernel32;
+    SBIE_INITIALIZE_ATTRIBUTE_LIST initializeAttributes;
+    SBIE_UPDATE_ATTRIBUTE updateAttribute;
+    SBIE_DELETE_ATTRIBUTE_LIST deleteAttributes;
+
+    if (! session || ! session->ca_file)
+        return STATUS_DEVICE_NOT_READY;
+
+    ownerProcess = OpenProcess(
+        PROCESS_QUERY_INFORMATION, FALSE, session->owner_pid);
+    if (! ownerProcess)
+        goto cleanup;
+    if (! OpenProcessToken(
+            ownerProcess,
+            TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY,
+            &ownerToken) ||
+            ! DuplicateTokenEx(
+                ownerToken,
+                TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY,
+                NULL, SecurityImpersonation, TokenPrimary, &primaryToken)) {
+        goto cleanup;
+    }
+    if (! CaptureServer_DuplicateInheritable(session->ca_file, &childCa))
+        goto cleanup;
+    inheritedHandles[0] = childCa;
+
+    if (SbieApi_GetHomePath(NULL, 0, homePath, ARRAYSIZE(homePath)) != 0)
+        goto cleanup;
+    if (wcscpy_s(executablePath, ARRAYSIZE(executablePath), homePath) != 0 ||
+            wcscat_s(executablePath, ARRAYSIZE(executablePath),
+                     L"\\SbieCapture.exe") != 0) {
+        goto cleanup;
+    }
+    if (swprintf_s(
+            commandLine, ARRAYSIZE(commandLine),
+            L"\"%s\" --import-ca %p --store Root",
+            executablePath, childCa) < 0) {
+        goto cleanup;
+    }
+
+    kernel32 = GetModuleHandleW(L"kernel32.dll");
+    if (! kernel32)
+        goto cleanup;
+    initializeAttributes = (SBIE_INITIALIZE_ATTRIBUTE_LIST)
+        GetProcAddress(kernel32, "InitializeProcThreadAttributeList");
+    updateAttribute = (SBIE_UPDATE_ATTRIBUTE)
+        GetProcAddress(kernel32, "UpdateProcThreadAttribute");
+    deleteAttributes = (SBIE_DELETE_ATTRIBUTE_LIST)
+        GetProcAddress(kernel32, "DeleteProcThreadAttributeList");
+    if (! initializeAttributes || ! updateAttribute || ! deleteAttributes)
+        goto cleanup;
+    initializeAttributes(NULL, 1, 0, &attributesSize);
+    attributes = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, attributesSize);
+    if (! attributes ||
+            ! initializeAttributes(attributes, 1, 0, &attributesSize)) {
+        goto cleanup;
+    }
+    attributesInitialized = TRUE;
+    if (! updateAttribute(
+            attributes, 0, SBIE_PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
+            inheritedHandles, sizeof(inheritedHandles), NULL, NULL)) {
+        goto cleanup;
+    }
+
+    startup.StartupInfo.cb = sizeof(startup);
+    startup.attribute_list = attributes;
+    if (! CreateProcessAsUserW(
+            primaryToken, NULL, commandLine, NULL, NULL, TRUE,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED |
+                CREATE_NO_WINDOW,
+            NULL, NULL, &startup.StartupInfo, &processInfo)) {
+        goto cleanup;
+    }
+    if (SbieApi_Call(
+            API_START_PROCESS, 2,
+            (ULONG_PTR)session->info.box_name,
+            (ULONG_PTR)processInfo.dwProcessId) != 0) {
+        TerminateProcess(processInfo.hProcess, ERROR_PROCESS_ABORTED);
+        goto cleanup;
+    }
+    if (ResumeThread(processInfo.hThread) == (DWORD)-1) {
+        TerminateProcess(processInfo.hProcess, ERROR_PROCESS_ABORTED);
+        goto cleanup;
+    }
+    if (WaitForSingleObject(processInfo.hProcess, 10000) != WAIT_OBJECT_0 ||
+            ! GetExitCodeProcess(processInfo.hProcess, &exitCode) ||
+            exitCode != 0) {
+        goto cleanup;
+    }
+    status = STATUS_SUCCESS;
+
+cleanup:
+    if (attributesInitialized)
+        deleteAttributes(attributes);
+    if (attributes)
+        HeapFree(GetProcessHeap(), 0, attributes);
+    if (processInfo.hThread)
+        CloseHandle(processInfo.hThread);
+    if (processInfo.hProcess)
+        CloseHandle(processInfo.hProcess);
+    if (childCa)
+        CloseHandle(childCa);
+    if (primaryToken)
+        CloseHandle(primaryToken);
+    if (ownerToken)
+        CloseHandle(ownerToken);
+    if (ownerProcess)
+        CloseHandle(ownerProcess);
+    return status;
+}
+
+
 static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session)
 {
     if (! session || ! session->section_handle || ! session->export_file)
+        return STATUS_DEVICE_NOT_READY;
+    if (CaptureServer_IsHttpsMode(session) && ! session->har_file)
         return STATUS_DEVICE_NOT_READY;
     if (session->broker_process || session->broker_job)
         return STATUS_OBJECT_NAME_COLLISION;
@@ -1939,7 +2224,10 @@ static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session)
     HANDLE childSection = NULL;
     HANDLE childFile = NULL;
     HANDLE childStopEvent = NULL;
-    HANDLE inheritedHandles[3] = { 0 };
+    HANDLE childHar = NULL;
+    HANDLE childCa = NULL;
+    HANDLE inheritedHandles[5] = { 0 };
+    ULONG inheritedCount = 3;
     SBIE_STARTUPINFOEXW startup = { 0 };
     PROCESS_INFORMATION processInfo = { 0 };
     PVOID attributes = NULL;
@@ -2010,10 +2298,34 @@ static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session)
                 stopEvent, &childStopEvent)) {
         goto cleanup;
     }
-
     inheritedHandles[0] = childSection;
     inheritedHandles[1] = childFile;
     inheritedHandles[2] = childStopEvent;
+    if (CaptureServer_IsHttpsMode(session)) {
+        WCHAR tempDir[MAX_PATH];
+        WCHAR tempPath[MAX_PATH];
+        if (! GetTempPathW(ARRAYSIZE(tempDir), tempDir) ||
+                ! GetTempFileNameW(tempDir, L"sca", 0, tempPath)) {
+            goto cleanup;
+        }
+        session->ca_file = CreateFileW(
+            tempPath, GENERIC_READ | GENERIC_WRITE,
+            FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS,
+            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+        if (! session->ca_file || session->ca_file == INVALID_HANDLE_VALUE) {
+            session->ca_file = NULL;
+            goto cleanup;
+        }
+        if (! CaptureServer_DuplicateInheritable(
+                session->har_file, &childHar) ||
+                ! CaptureServer_DuplicateInheritable(
+                    session->ca_file, &childCa)) {
+            goto cleanup;
+        }
+        inheritedHandles[3] = childHar;
+        inheritedHandles[4] = childCa;
+        inheritedCount = 5;
+    }
 
     if (SbieApi_GetHomePath(NULL, 0, homePath, ARRAYSIZE(homePath)) != 0)
         goto cleanup;
@@ -2045,6 +2357,16 @@ static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session)
             session->rotate_count) < 0) {
         goto cleanup;
     }
+    if (CaptureServer_IsHttpsMode(session)) {
+        WCHAR extra[256];
+        if (swprintf_s(
+                extra, ARRAYSIZE(extra),
+                L" --https-listen --har %p --ca-file %p",
+                childHar, childCa) < 0 ||
+                wcscat_s(commandLine, ARRAYSIZE(commandLine), extra) != 0) {
+            goto cleanup;
+        }
+    }
 
     kernel32 = GetModuleHandleW(L"kernel32.dll");
     if (! kernel32)
@@ -2070,7 +2392,7 @@ static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session)
             0,
             SBIE_PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
             inheritedHandles,
-            sizeof(inheritedHandles),
+            inheritedCount * sizeof(HANDLE),
             NULL,
             NULL)) {
         goto cleanup;
@@ -2109,6 +2431,18 @@ static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session)
         session->section_handle, &session->info.capture_id);
     if (! NT_SUCCESS(status))
         goto cleanup;
+    if (CaptureServer_IsHttpsMode(session)) {
+        USHORT listenPort = 0;
+        status = CaptureServer_WaitListenPort(
+            session->section_handle, &listenPort);
+        if (NT_SUCCESS(status))
+            status = CaptureServer_ImportCaInBox(session);
+        if (NT_SUCCESS(status))
+            status = CaptureServer_EnableHttpsRedirect(
+                &session->info.capture_id);
+        if (! NT_SUCCESS(status))
+            goto cleanup;
+    }
 
     session->broker_job = job;
     job = NULL;
@@ -2141,6 +2475,10 @@ cleanup:
         CloseHandle(childFile);
     if (childStopEvent)
         CloseHandle(childStopEvent);
+    if (childHar)
+        CloseHandle(childHar);
+    if (childCa)
+        CloseHandle(childCa);
     if (job)
         CloseHandle(job);
     if (stopEvent)
@@ -2212,6 +2550,16 @@ static void CaptureServer_PollBroker(CAPTURE_SESSION_OBJ *session)
 
     CaptureServer_UpdateBrokerCounters(session);
     ULONG brokerStatus = CaptureServer_StopBroker(session);
+    if (CaptureHttpsLifecycle_OnBrokerDeath(
+            CaptureServer_IsHttpsMode(session),
+            session->info.state == CAPTURE_STATE_RUNNING) ==
+            CAPTURE_HTTPS_BROKER_ACTION_KEEP_REDIRECT) {
+        session->info.state = CAPTURE_STATE_FAILED;
+        session->info.backend_status = NT_SUCCESS(brokerStatus) ?
+            STATUS_UNSUCCESSFUL : brokerStatus;
+        return;
+    }
+
     ULONG driverStatus = STATUS_SUCCESS;
     if (session->backend_active) {
         driverStatus = CaptureServer_StopDriver(&session->info.capture_id);
@@ -2340,7 +2688,8 @@ ULONG CaptureServer::StopBackend(
 
             session->stopped_event_count += returnedEvents;
             session->info.event_count += returnedEvents;
-            if (session->info.mode != CAPTURE_MODE_PACKETS)
+            if (session->info.mode != CAPTURE_MODE_PACKETS &&
+                    session->info.mode != CAPTURE_MODE_HTTPS)
                 session->info.dropped_count = droppedCount;
 
             if (! remainingEvents || ! returnedEvents)
@@ -2355,6 +2704,14 @@ ULONG CaptureServer::StopBackend(
     if (! session->backend_active && session->export_file) {
         CloseHandle(session->export_file);
         session->export_file = NULL;
+    }
+    if (! session->backend_active && session->har_file) {
+        CloseHandle(session->har_file);
+        session->har_file = NULL;
+    }
+    if (! session->backend_active && session->ca_file) {
+        CloseHandle(session->ca_file);
+        session->ca_file = NULL;
     }
     if (! session->backend_active && session->section_handle) {
         CloseHandle(session->section_handle);
@@ -2398,11 +2755,16 @@ void CaptureServer::DeleteSession(CAPTURE_SESSION_OBJ *session)
 {
     if (session->backend_active || session->broker_process ||
             session->broker_job || session->export_file ||
+            session->har_file || session->ca_file ||
             session->section_handle)
         StopBackend(session, FALSE);
     List_Remove(&m_sessions, session);
     if (session->export_file)
         CloseHandle(session->export_file);
+    if (session->har_file)
+        CloseHandle(session->har_file);
+    if (session->ca_file)
+        CloseHandle(session->ca_file);
     if (session->section_handle)
         CloseHandle(session->section_handle);
     if (session->stopped_events)
