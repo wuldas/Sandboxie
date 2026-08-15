@@ -19,6 +19,8 @@ HEADERS += ./stdafx.h \
     ./Views/TraceView.h \
     ./Views/CaptureView.h \
     ./Views/PacketCaptureView.h \
+    ./Views/HttpsCaptureView.h \
+    ./Views/https_capture_model.h \
     ./Views/StackView.h \
     ./Helpers/FindTool.h \
     ./Helpers/FullScreen.h \
@@ -80,6 +82,8 @@ SOURCES += ./main.cpp \
     ./Views/TraceView.cpp \
     ./Views/CaptureView.cpp \
     ./Views/PacketCaptureView.cpp \
+    ./Views/HttpsCaptureView.cpp \
+    ./Views/https_capture_model.c \
     ./Views/StackView.cpp \
     ./Helpers/FindTool.cpp \
     ./Helpers/FullScreen.cpp \
@@ -159,3 +163,7 @@ TRANSLATIONS += sandman_ar.ts \
 
 
 RESOURCES += Resources/SandMan.qrc
+
+https_capture_model.c {
+    PRECOMPILED_HEADER =
+}

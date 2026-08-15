@@ -23,6 +23,8 @@ class CTraceView;
 class CCaptureView;
 class CPacketCaptureView;
 class CPacketCaptureWindow;
+class CHttpsCaptureView;
+class CHttpsCaptureWindow;
 class CScriptManager;
 class CAddonManager;
 
@@ -223,6 +225,8 @@ public slots:
 	void				OnProcessConnectionAudit();
 	void				OnBoxPacketCapture();
 	void				OnProcessPacketCapture();
+	void				OnBoxHttpsCapture();
+	void				OnProcessHttpsCapture();
 	void				RebuildUI();
 	void				OnIniReloaded();
 
@@ -291,6 +295,7 @@ private slots:
 	void				OnMonitoring();
 	void				OnConnectionAudit();
 	void				OnPacketCapture();
+	void				OnHttpsCapture();
 	void				ShowConnectionAudit(bool bStart);
 
 	void				OnSymbolStatus(const QString& Message);
@@ -387,6 +392,8 @@ private:
 	CCaptureView*		m_pCaptureView;
 	CPacketCaptureView*	m_pPacketCaptureView;
 	CPacketCaptureWindow*	m_pPacketCaptureWindow;
+	CHttpsCaptureView*	m_pHttpsCaptureView;
+	CHttpsCaptureWindow*	m_pHttpsCaptureWindow;
 	CPanelWidgetEx*		m_pRecoveryLog;
 	class CRecoveryLogWnd* m_pRecoveryLogWnd;
 
@@ -459,6 +466,7 @@ private:
 	QAction*			m_pEnableMonitoring;
 	QAction*			m_pEnableCapture;
 	QAction*			m_pEnablePacketCapture;
+	QAction*			m_pEnableHttpsCapture;
 
 	//QMenu*				m_pMenuTools;
 	QAction*			m_pBoxAssistant;

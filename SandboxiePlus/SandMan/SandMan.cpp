@@ -20,6 +20,7 @@
 #include "Views/TraceView.h"
 #include "Views/CaptureView.h"
 #include "Views/PacketCaptureView.h"
+#include "Views/HttpsCaptureView.h"
 #include "Windows/SelectBoxWindow.h"
 #include "../UGlobalHotkey/uglobalhotkeys.h"
 #include "Wizards/SetupWizard.h"
@@ -945,6 +946,7 @@ void CSandMan::CreateMenus(bool bAdvanced)
 		m_pEnableMonitoring->setCheckable(true);
 		m_pEnableCapture = m_pMenuView->addAction(CSandMan::GetIcon("Connect"), tr("Connection Audit"), this, SLOT(OnConnectionAudit()));
 		m_pEnablePacketCapture = m_pMenuView->addAction(CSandMan::GetIcon("Connect"), tr("Packet Capture"), this, SLOT(OnPacketCapture()));
+		m_pEnableHttpsCapture = m_pMenuView->addAction(CSandMan::GetIcon("Connect"), tr("HTTPS Capture"), this, SLOT(OnHttpsCapture()));
 	if (!bAdvanced)
 		m_pMenuView->addAction(CSandMan::GetIcon("Recover"), tr("Recovery Log"), this, SLOT(OnRecoveryLog()));
 
@@ -1021,6 +1023,7 @@ void CSandMan::CreateOldMenus()
 		m_pEnableMonitoring = m_pMenuFile->addAction(CSandMan::GetIcon("SetLogging"), tr("Resource Access Monitor"), this, SLOT(OnMonitoring()));
 		m_pEnableCapture = m_pMenuFile->addAction(CSandMan::GetIcon("Connect"), tr("Connection Audit"), this, SLOT(OnConnectionAudit()));
 		m_pEnablePacketCapture = m_pMenuFile->addAction(CSandMan::GetIcon("Connect"), tr("Packet Capture"), this, SLOT(OnPacketCapture()));
+		m_pEnableHttpsCapture = m_pMenuFile->addAction(CSandMan::GetIcon("Connect"), tr("HTTPS Capture"), this, SLOT(OnHttpsCapture()));
 
 		m_pMenuFile->addSeparator();
 
@@ -1563,6 +1566,8 @@ void CSandMan::CreateView(int iViewMode)
 		m_pCaptureView = NULL;
 		m_pPacketCaptureView = NULL;
 		m_pPacketCaptureWindow = NULL;
+		m_pHttpsCaptureView = NULL;
+		m_pHttpsCaptureWindow = NULL;
 		m_pRecoveryLog = NULL;
 
 		return;
@@ -1638,6 +1643,10 @@ void CSandMan::CreateView(int iViewMode)
 		m_pPacketCaptureView = new CPacketCaptureView(false, this);
 		m_pLogTabs->addTab(m_pPacketCaptureView, tr("Packet Capture"));
 
+		m_pHttpsCaptureView = new CHttpsCaptureView(false, this);
+		m_pLogTabs->addTab(m_pHttpsCaptureView, tr("HTTPS Capture"));
+		m_pHttpsCaptureWindow = NULL;
+
 
 		// Recovery Log
 		m_pRecoveryLog = new CPanelWidgetEx();
@@ -1671,6 +1680,8 @@ void CSandMan::CreateView(int iViewMode)
 		m_pCaptureView = NULL;
 		m_pPacketCaptureView = NULL;
 		m_pPacketCaptureWindow = NULL;
+		m_pHttpsCaptureView = NULL;
+		m_pHttpsCaptureWindow = NULL;
 		m_pRecoveryLog = NULL;
 	}
 }
@@ -3125,6 +3136,7 @@ void CSandMan::UpdateState()
 	if(m_pEnableMonitoring) m_pEnableMonitoring->setEnabled(isConnected);
 	if(m_pEnableCapture) m_pEnableCapture->setEnabled(isConnected);
 	if(m_pEnablePacketCapture) m_pEnablePacketCapture->setEnabled(isConnected);
+	if(m_pEnableHttpsCapture) m_pEnableHttpsCapture->setEnabled(isConnected);
 
 	if (m_pNewBoxButton) m_pNewBoxButton->setEnabled(isConnected);
 	if (m_pEditIniButton) m_pEditIniButton->setEnabled(isConnected);
@@ -4572,6 +4584,75 @@ void CSandMan::OnPacketCapture()
         m_pPacketCaptureWindow = NULL;
     });
     SafeShow(m_pPacketCaptureWindow);
+}
+
+
+void CSandMan::OnHttpsCapture()
+{
+    if (m_pHttpsCaptureView) {
+        m_pHttpsCaptureView->RefreshBoxes();
+        m_pHttpsCaptureView->RefreshCapabilities();
+        if (m_pLogTabs) {
+            if (!m_pToolBar->isVisible())
+                m_pLogTabs->show();
+            int index = m_pLogTabs->indexOf(m_pHttpsCaptureView);
+            if (index >= 0)
+                m_pLogTabs->setCurrentIndex(index);
+        }
+        return;
+    }
+
+    if (m_pHttpsCaptureWindow) {
+        SafeShow(m_pHttpsCaptureWindow);
+        return;
+    }
+
+    m_pHttpsCaptureWindow = new CHttpsCaptureWindow();
+    connect(this, SIGNAL(Closed()), m_pHttpsCaptureWindow, SLOT(close()));
+    connect(m_pHttpsCaptureWindow, &CHttpsCaptureWindow::Closed, this, [this]() {
+        m_pHttpsCaptureWindow = NULL;
+    });
+    SafeShow(m_pHttpsCaptureWindow);
+}
+
+
+void CSandMan::OnBoxHttpsCapture()
+{
+    QString BoxName;
+    if (m_pBoxView) {
+        QList<CSandBoxPtr> Boxes = m_pBoxView->GetSelectedBoxes();
+        if (Boxes.count() == 1 && !Boxes.first().isNull())
+            BoxName = Boxes.first()->GetName();
+    }
+
+    OnHttpsCapture();
+
+    CHttpsCaptureView* pView = m_pHttpsCaptureView;
+    if (!pView && m_pHttpsCaptureWindow)
+        pView = m_pHttpsCaptureWindow->findChild<CHttpsCaptureView*>();
+    if (pView)
+        pView->SetPreferredBox(BoxName);
+}
+
+
+void CSandMan::OnProcessHttpsCapture()
+{
+    if (!m_pBoxView)
+        return;
+
+    QList<CBoxedProcessPtr> Processes = m_pBoxView->GetSelectedProcesses();
+    if (Processes.count() != 1 || Processes.first().isNull())
+        return;
+
+    const CBoxedProcessPtr Process = Processes.first();
+    OnHttpsCapture();
+
+    CHttpsCaptureView* pView = m_pHttpsCaptureView;
+    if (!pView && m_pHttpsCaptureWindow)
+        pView = m_pHttpsCaptureWindow->findChild<CHttpsCaptureView*>();
+    if (pView)
+        pView->SetPreferredProcess(
+            Process->GetBoxName(), Process->GetProcessId());
 }
 
 void CSandMan::OnBoxPacketCapture()
