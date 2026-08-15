@@ -86,14 +86,20 @@
   </ItemDefinitionGroup>
   <ItemGroup>
     <ClInclude Include="capture_broker.h" />
+    <ClInclude Include="har.h" />
+    <ClInclude Include="http11.h" />
     <ClInclude Include="pcapng.h" />
+    <ClInclude Include="redact.h" />
     <ClInclude Include="..\..\Sandboxie\core\svc\capturebrokerwire.h" />
     <ClInclude Include="..\..\Sandboxie\core\drv\capture_packet.h" />
   </ItemGroup>
   <ItemGroup>
     <ClCompile Include="capture_broker.c" />
+    <ClCompile Include="har.c" />
+    <ClCompile Include="http11.c" />
     <ClCompile Include="main.c" />
     <ClCompile Include="pcapng.c" />
+    <ClCompile Include="redact.c" />
   </ItemGroup>
   <Import Project="$(VCTargetsPath)\Microsoft.Cpp.targets" />
   <ImportGroup Label="ExtensionTargets" />

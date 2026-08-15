@@ -20,9 +20,27 @@
     <ClCompile Include="pcapng.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="http11.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="redact.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="har.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="capture_broker.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="http11.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="redact.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="har.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="pcapng.h">
