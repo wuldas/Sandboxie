@@ -29,6 +29,12 @@
     <ClCompile Include="har.c">
       <Filter>Source Files</Filter>
     </ClCompile>
+    <ClCompile Include="capture_ca.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
+    <ClCompile Include="https_mitm.c">
+      <Filter>Source Files</Filter>
+    </ClCompile>
   </ItemGroup>
   <ItemGroup>
     <ClInclude Include="capture_broker.h">
@@ -41,6 +47,15 @@
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="har.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="capture_ca.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="capture_ca_priv.h">
+      <Filter>Header Files</Filter>
+    </ClInclude>
+    <ClInclude Include="https_mitm.h">
       <Filter>Header Files</Filter>
     </ClInclude>
     <ClInclude Include="pcapng.h">
