@@ -9,6 +9,9 @@
     <ClCompile Include="capture_filter.c">
       <Filter>net</Filter>
     </ClCompile>
+    <ClCompile Include="capture_https.c">
+      <Filter>net</Filter>
+    </ClCompile>
     <ClCompile Include="capture_network.c">
       <Filter>net</Filter>
     </ClCompile>
@@ -188,6 +191,9 @@
       <Filter>net</Filter>
     </ClInclude>
     <ClInclude Include="capture_filter.h">
+      <Filter>net</Filter>
+    </ClInclude>
+    <ClInclude Include="capture_https.h">
       <Filter>net</Filter>
     </ClInclude>
     <ClInclude Include="capture_network.h">

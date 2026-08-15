@@ -64,4 +64,12 @@ void Capture_RecordPayloadByFlow(
     UCHAR layer);
 
 
+BOOLEAN Capture_LookupHttpsRedirect(
+    const CAPTURE_FILTER_IDENTITY *identity,
+    USHORT *listenPort,
+    ULONG64 *captureIdHigh,
+    ULONG64 *captureIdLow,
+    ULONG64 *generation);
+
+
 #endif /* _MY_CAPTURE_H */

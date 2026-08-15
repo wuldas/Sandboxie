@@ -25,6 +25,7 @@
 #include "api.h"
 #include "box.h"
 #include "wfp.h"
+#include "capture_https.h"
 #include "../svc/capturebrokerwire.h"
 
 NTSTATUS NTAPI FwpsFlowRemoveContext0(
@@ -1168,6 +1169,50 @@ void Capture_RecordEvent(
     }
 
     KeReleaseSpinLock(&Capture_Lock, irql);
+}
+
+
+BOOLEAN Capture_LookupHttpsRedirect(
+    const CAPTURE_FILTER_IDENTITY *identity,
+    USHORT *listenPort,
+    ULONG64 *captureIdHigh,
+    ULONG64 *captureIdLow,
+    ULONG64 *generation)
+{
+    BOOLEAN found = FALSE;
+
+    if (! identity || ! listenPort || ! captureIdHigh ||
+            ! captureIdLow || ! generation || ! Capture_Initialized) {
+        return FALSE;
+    }
+
+    KIRQL irql;
+    KeAcquireSpinLock(&Capture_Lock, &irql);
+
+    if (! Capture_Unloading) {
+        PLIST_ENTRY entry = Capture_Sessions.Flink;
+        while (entry != &Capture_Sessions) {
+            CAPTURE_SESSION *session = CONTAINING_RECORD(
+                entry, CAPTURE_SESSION, link);
+            ULONG port = 0;
+            if (session->section_system_address)
+                port = session->section_system_address->https_listen_port;
+            if (port != 0 && port <= 0xFFFFul &&
+                    CaptureFilter_Matches(&session->target, identity)) {
+                *listenPort = (USHORT)port;
+                *captureIdHigh = session->capture_id.high;
+                *captureIdLow = session->capture_id.low;
+                *generation = CaptureBroker_CalculateGeneration(
+                    session->capture_id.high, session->capture_id.low);
+                found = TRUE;
+                break;
+            }
+            entry = entry->Flink;
+        }
+    }
+
+    KeReleaseSpinLock(&Capture_Lock, irql);
+    return found;
 }
 
 

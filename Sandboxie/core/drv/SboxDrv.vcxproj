@@ -505,6 +505,9 @@
     <ClCompile Include="capture_filter.c">
       <PreprocessorDefinitions>KERNEL_MODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
+    <ClCompile Include="capture_https.c">
+      <PreprocessorDefinitions>KERNEL_MODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
+    </ClCompile>
     <ClCompile Include="capture_network.c">
       <PreprocessorDefinitions>KERNEL_MODE;%(PreprocessorDefinitions)</PreprocessorDefinitions>
     </ClCompile>
@@ -763,6 +766,7 @@
     <ClInclude Include="box.h" />
     <ClInclude Include="capture.h" />
     <ClInclude Include="capture_filter.h" />
+    <ClInclude Include="capture_https.h" />
     <ClInclude Include="capture_network.h" />
     <ClInclude Include="capture_queue.h" />
     <ClInclude Include="capture_packet.h" />

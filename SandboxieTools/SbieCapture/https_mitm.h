@@ -27,30 +27,11 @@
 #include <windows.h>
 
 #include "capture_ca.h"
+#include "../../Sandboxie/core/drv/capture_https.h"
 
 #define HTTPS_MITM_OK               0
 #define HTTPS_MITM_ERROR            (-1)
 #define HTTPS_MITM_REJECTED         (-2)
-
-#define HTTPS_REDIRECT_CONTEXT_MAGIC    0x48524443ul
-#define HTTPS_REDIRECT_CONTEXT_VERSION  1
-
-typedef struct _HTTPS_REDIRECT_CONTEXT {
-
-    ULONG magic;
-    ULONG version;
-    ULONG64 capture_id_high;
-    ULONG64 capture_id_low;
-    ULONG64 generation;
-    ULONG process_id;
-    ULONG session_id;
-    ULONG64 process_create_time;
-    ULONG address_family;
-    USHORT original_port;
-    USHORT reserved;
-    UCHAR original_address[16];
-
-} HTTPS_REDIRECT_CONTEXT;
 
 typedef struct _HTTPS_MITM_OPTIONS {
 
