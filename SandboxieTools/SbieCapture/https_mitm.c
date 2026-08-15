@@ -49,8 +49,10 @@ struct _HTTPS_MITM {
     USHORT upstream_port;
     char *upstream_ca_pem;
     WCHAR har_path[MAX_PATH];
+    HAR_WRITER *har_writer;
     BOOL redact;
     BOOL include_bodies;
+    BOOL allow_unverified_upstream;
 
 };
 
@@ -133,7 +135,7 @@ static SSL_CTX *HttpsMitm_NewDownstreamCtx(CAPTURE_CA *ca)
 }
 
 
-static SSL_CTX *HttpsMitm_NewUpstreamCtx(const char *caPem)
+static SSL_CTX *HttpsMitm_NewUpstreamCtx(const char *caPem, BOOL allowUnverified)
 {
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
     BIO *bio;
@@ -143,11 +145,11 @@ static SSL_CTX *HttpsMitm_NewUpstreamCtx(const char *caPem)
     if (! ctx)
         return NULL;
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
-    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
-    if (! caPem || ! caPem[0]) {
-        SSL_CTX_free(ctx);
-        return NULL;
+    if (allowUnverified || ! caPem || ! caPem[0]) {
+        SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+        return ctx;
     }
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
     bio = BIO_new_mem_buf(caPem, -1);
     cert = bio ? PEM_read_bio_X509(bio, NULL, NULL, NULL) : NULL;
     store = SSL_CTX_get_cert_store(ctx);
@@ -290,12 +292,10 @@ static int HttpsMitm_WriteHar(
     ULONG responseBodyLen = 0;
     int status;
 
-    if (! mitm->har_path[0])
+    if (! mitm->har_writer)
         return HTTPS_MITM_OK;
 
-    writer = HarWriter_OpenPath(mitm->har_path);
-    if (! writer)
-        return HTTPS_MITM_ERROR;
+    writer = mitm->har_writer;
 
     sni = SSL_get_servername(downstream, TLSEXT_NAMETYPE_host_name);
     if (! sni)
@@ -345,7 +345,6 @@ static int HttpsMitm_WriteHar(
     exchange.body_cap = 64 * 1024;
 
     status = HarWriter_WriteExchange(writer, &exchange);
-    HarWriter_Close(writer);
     return status == HAR_OK ? HTTPS_MITM_OK : HTTPS_MITM_ERROR;
 }
 
@@ -382,6 +381,11 @@ HTTPS_MITM *HttpsMitm_Listen(const HTTPS_MITM_OPTIONS *options)
         wcscpy_s(mitm->har_path, MAX_PATH, options->har_path);
     mitm->redact = options->redact;
     mitm->include_bodies = options->include_bodies;
+    mitm->allow_unverified_upstream = options->allow_unverified_upstream;
+    if (options->har_file && options->har_file != INVALID_HANDLE_VALUE)
+        mitm->har_writer = HarWriter_OpenHandle(options->har_file);
+    else if (options->har_path && options->har_path[0])
+        mitm->har_writer = HarWriter_OpenPath(options->har_path);
 
     mitm->listen_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (mitm->listen_socket == INVALID_SOCKET)
@@ -420,6 +424,44 @@ SOCKET HttpsMitm_Accept(HTTPS_MITM *mitm)
 }
 
 
+SOCKET HttpsMitm_TryAccept(HTTPS_MITM *mitm, ULONG timeoutMs)
+{
+    fd_set readSet;
+    struct timeval timeout;
+    u_int listenSocket;
+
+    if (! mitm || mitm->listen_socket == INVALID_SOCKET)
+        return INVALID_SOCKET;
+    listenSocket = (u_int)mitm->listen_socket;
+    FD_ZERO(&readSet);
+    FD_SET(listenSocket, &readSet);
+    timeout.tv_sec = (long)(timeoutMs / 1000);
+    timeout.tv_usec = (long)((timeoutMs % 1000) * 1000);
+    if (select(0, &readSet, NULL, NULL, &timeout) <= 0)
+        return INVALID_SOCKET;
+    return accept(mitm->listen_socket, NULL, NULL);
+}
+
+
+int HttpsMitm_RecvContext(SOCKET client, HTTPS_REDIRECT_CONTEXT *context)
+{
+    ULONG got = 0;
+    char *bytes;
+
+    if (client == INVALID_SOCKET || ! context)
+        return 0;
+    bytes = (char *)context;
+    memset(context, 0, sizeof(*context));
+    while (got < sizeof(*context)) {
+        int received = recv(client, bytes + got, (int)(sizeof(*context) - got), 0);
+        if (received <= 0)
+            return 0;
+        got += (ULONG)received;
+    }
+    return 1;
+}
+
+
 int HttpsMitm_ServeOnce(
     HTTPS_MITM *mitm,
     SOCKET client,
@@ -447,7 +489,8 @@ int HttpsMitm_ServeOnce(
     }
 
     downCtx = HttpsMitm_NewDownstreamCtx(mitm->ca);
-    upCtx = HttpsMitm_NewUpstreamCtx(mitm->upstream_ca_pem);
+    upCtx = HttpsMitm_NewUpstreamCtx(
+        mitm->upstream_ca_pem, mitm->allow_unverified_upstream);
     if (! downCtx || ! upCtx)
         goto done;
     down = SSL_new(downCtx);
@@ -457,7 +500,18 @@ int HttpsMitm_ServeOnce(
     if (SSL_accept(down) != 1)
         goto done;
 
-    upstream = HttpsMitm_ConnectTcp(mitm->upstream_host, mitm->upstream_port);
+    {
+        char host[64];
+        const char *upstreamHost = mitm->upstream_host;
+        USHORT upstreamPort = mitm->upstream_port;
+        if ((! upstreamHost[0] || upstreamPort == 0) && context) {
+            HttpsMitm_FormatIpv4(context->original_address, host, sizeof(host));
+            upstreamHost = host;
+            if (upstreamPort == 0)
+                upstreamPort = context->original_port;
+        }
+        upstream = HttpsMitm_ConnectTcp(upstreamHost, upstreamPort);
+    }
     if (upstream == INVALID_SOCKET)
         goto done;
     up = SSL_new(upCtx);
@@ -509,6 +563,8 @@ void HttpsMitm_Close(HTTPS_MITM *mitm)
         return;
     if (mitm->listen_socket != INVALID_SOCKET)
         closesocket(mitm->listen_socket);
+    if (mitm->har_writer)
+        HarWriter_Close(mitm->har_writer);
     free(mitm->upstream_ca_pem);
     HeapFree(GetProcessHeap(), 0, mitm);
 }

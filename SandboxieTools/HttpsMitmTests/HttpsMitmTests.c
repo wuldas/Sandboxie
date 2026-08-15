@@ -37,9 +37,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <stddef.h>
 
 #include "../SbieCapture/capture_ca.h"
 #include "../SbieCapture/https_mitm.h"
+#include "../SbieCapture/capture_https_broker.h"
+#include "../SbieCapture/capture_broker.h"
 
 
 static int Require(int condition, const char *message)
@@ -64,7 +67,7 @@ static void MakeTempPath(WCHAR *buffer, size_t capacity, const WCHAR *name)
 static int ReadAll(const WCHAR *path, UCHAR **bytes, DWORD *size)
 {
     HANDLE file = CreateFileW(
-        path, GENERIC_READ, FILE_SHARE_READ, NULL, OPEN_EXISTING,
+        path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, OPEN_EXISTING,
         FILE_ATTRIBUTE_NORMAL, NULL);
     if (file == INVALID_HANDLE_VALUE)
         return 0;
@@ -719,6 +722,280 @@ static int TestMissingContextRejected(void)
 }
 
 
+static CAPTURE_BROKER_SECTION *CreateBrokerSection(void)
+{
+    size_t size = offsetof(CAPTURE_BROKER_SECTION, records) +
+        (size_t)CAPTURE_BROKER_MAX_RECORD_CAPACITY *
+        sizeof(CAPTURE_PACKET_RECORD);
+    CAPTURE_BROKER_SECTION *section =
+        (CAPTURE_BROKER_SECTION *)calloc(1, size);
+    if (! section)
+        return NULL;
+    section->magic = CAPTURE_BROKER_SECTION_MAGIC;
+    section->version = CAPTURE_BROKER_SECTION_VERSION;
+    section->size = (ULONG)size;
+    section->record_capacity = CAPTURE_BROKER_MAX_RECORD_CAPACITY;
+    section->capture_id_high = 0x1111111111111111ull;
+    section->capture_id_low = 0x2222222222222222ull;
+    section->generation = CaptureBroker_CalculateGeneration(
+        section->capture_id_high, section->capture_id_low);
+    wcscpy_s(section->box_name, ARRAYSIZE(section->box_name), L"DefaultBox");
+    wcscpy_s(section->sid_string, ARRAYSIZE(section->sid_string),
+             L"S-1-5-21-1-2-3-1001");
+    return section;
+}
+
+
+static void FillTransportRecord(CAPTURE_PACKET_RECORD *record)
+{
+    memset(record, 0, sizeof(*record));
+    record->sequence = 1;
+    record->timestamp = 133000000000000000ull;
+    record->process_create_time = 133000000000000001ull;
+    record->process_id = 4242;
+    record->session_id = 1;
+    record->address_family = AF_INET;
+    record->protocol = 6;
+    record->direction = CAPTURE_PACKET_DIRECTION_OUTBOUND;
+    record->layer = CAPTURE_PACKET_LAYER_TRANSPORT;
+    record->original_length = 40;
+    record->captured_length = 40;
+    record->local_address[0] = 10;
+    record->local_address[3] = 1;
+    record->remote_address[0] = 1;
+    record->remote_address[3] = 1;
+    record->local_port = 40000;
+    record->remote_port = 80;
+    memset(record->data, 0xAB, 40);
+}
+
+
+typedef struct _BROKER_JOB {
+
+    CAPTURE_BROKER_SECTION *section;
+    CAPTURE_BROKER_OPTIONS options;
+    int result;
+
+} BROKER_JOB;
+
+
+static DWORD WINAPI BrokerThread(void *param)
+{
+    BROKER_JOB *job = (BROKER_JOB *)param;
+    job->result = CaptureBroker_Run(job->section, &job->options);
+    return 0;
+}
+
+
+static int FileHasBytes(const WCHAR *path);
+
+static int TestBrokerHttpsListenWritesHarAndPcapng(void)
+{
+    UPSTREAM_SERVER upstream;
+    CAPTURE_BROKER_SECTION *section;
+    CAPTURE_HTTPS_OPTIONS httpsOptions;
+    CAPTURE_HTTPS_RUNTIME *https;
+    BROKER_JOB job;
+    HANDLE brokerThread;
+    HANDLE stopEvent;
+    HANDLE pcapFile;
+    HANDLE harFile;
+    HANDLE caFile;
+    WCHAR pcapPath[MAX_PATH];
+    WCHAR harPath[MAX_PATH];
+    WCHAR caPath[MAX_PATH];
+    HTTPS_REDIRECT_CONTEXT context;
+    SOCKET probe;
+    struct sockaddr_in addr;
+    char sessionPem[4096];
+    char response[1024];
+    UCHAR *harBytes = NULL;
+    DWORD harSize = 0;
+    DWORD wait;
+    int ok;
+
+    if (! StartUpstream(&upstream)) {
+        StopUpstream(&upstream);
+        return Require(0, "start upstream for broker HTTPS");
+    }
+
+    section = CreateBrokerSection();
+    if (! Require(section != NULL, "create broker section")) {
+        StopUpstream(&upstream);
+        return 0;
+    }
+
+    MakeTempPath(pcapPath, MAX_PATH, L"sbie-broker-https.pcapng");
+    MakeTempPath(harPath, MAX_PATH, L"sbie-broker-https.har");
+    MakeTempPath(caPath, MAX_PATH, L"sbie-broker-https-ca.pem");
+    DeleteFileW(pcapPath);
+    DeleteFileW(harPath);
+    DeleteFileW(caPath);
+
+    pcapFile = CreateFileW(
+        pcapPath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    harFile = CreateFileW(
+        harPath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    caFile = CreateFileW(
+        caPath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ, NULL,
+        CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    stopEvent = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (pcapFile == INVALID_HANDLE_VALUE || harFile == INVALID_HANDLE_VALUE ||
+            caFile == INVALID_HANDLE_VALUE || ! stopEvent) {
+        StopUpstream(&upstream);
+        free(section);
+        return Require(0, "create broker HTTPS files");
+    }
+
+    context = MakeContext();
+    context.original_port = upstream.port;
+    memset(context.original_address, 0, sizeof(context.original_address));
+    context.original_address[0] = 127;
+    context.original_address[3] = 1;
+
+    memset(&httpsOptions, 0, sizeof(httpsOptions));
+    httpsOptions.har_file = harFile;
+    httpsOptions.ca_file = caFile;
+    httpsOptions.test_preamble = TRUE;
+    httpsOptions.redact = TRUE;
+    httpsOptions.include_bodies = TRUE;
+    httpsOptions.expected_context = context;
+
+    https = CaptureHttps_Start(section, &httpsOptions);
+    if (! Require(https != NULL, "start broker HTTPS") ||
+            ! Require(CaptureHttps_ListenPort(https) != 0,
+                      "publish listen port") ||
+            ! Require(section->https_listen_port ==
+                      CaptureHttps_ListenPort(https),
+                      "section listen port matches")) {
+        CaptureHttps_Stop(https);
+        CloseHandle(pcapFile);
+        CloseHandle(stopEvent);
+        StopUpstream(&upstream);
+        free(section);
+        DeleteFileW(pcapPath);
+        DeleteFileW(harPath);
+        DeleteFileW(caPath);
+        return 0;
+    }
+
+    memset(&job, 0, sizeof(job));
+    job.section = section;
+    job.options.output_file = pcapFile;
+    job.options.stop_event = stopEvent;
+    job.options.expected_capture_id_high = section->capture_id_high;
+    job.options.expected_capture_id_low = section->capture_id_low;
+    job.options.expected_generation = section->generation;
+    brokerThread = CreateThread(NULL, 0, BrokerThread, &job, 0, NULL);
+    if (! Require(brokerThread != NULL, "start packet drain thread")) {
+        CaptureHttps_Stop(https);
+        CloseHandle(stopEvent);
+        StopUpstream(&upstream);
+        free(section);
+        return 0;
+    }
+
+    FillTransportRecord(&section->records[0]);
+    MemoryBarrier();
+    section->write_index = 1;
+
+    if (! Require(ReadAll(caPath, &harBytes, &harSize),
+                  "read CA public pem") ||
+            ! Require(strstr((const char *)harBytes, "BEGIN CERTIFICATE") != NULL,
+                      "CA file is a public cert") ||
+            ! Require(strstr((const char *)harBytes, "PRIVATE KEY") == NULL,
+                      "CA file has no private key")) {
+        free(harBytes);
+        SetEvent(stopEvent);
+        WaitForSingleObject(brokerThread, 5000);
+        CloseHandle(brokerThread);
+        CaptureHttps_Stop(https);
+        CloseHandle(stopEvent);
+        StopUpstream(&upstream);
+        free(section);
+        DeleteFileW(pcapPath);
+        DeleteFileW(harPath);
+        DeleteFileW(caPath);
+        return 0;
+    }
+    if (harSize >= sizeof(sessionPem))
+        harSize = sizeof(sessionPem) - 1;
+    memcpy(sessionPem, harBytes, harSize);
+    sessionPem[harSize] = 0;
+    free(harBytes);
+    harBytes = NULL;
+
+    probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(CaptureHttps_ListenPort(https));
+    if (connect(probe, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+            send(probe, (const char *)&context, sizeof(context), 0) !=
+                (int)sizeof(context)) {
+        closesocket(probe);
+        SetEvent(stopEvent);
+        WaitForSingleObject(brokerThread, 5000);
+        CloseHandle(brokerThread);
+        CaptureHttps_Stop(https);
+        CloseHandle(stopEvent);
+        StopUpstream(&upstream);
+        free(section);
+        return Require(0, "connect broker HTTPS with preamble");
+    }
+
+    ok = ClientGetOnSocket(
+        probe, sessionPem, TLS1_3_VERSION, TLS1_3_VERSION,
+        response, sizeof(response));
+    SetEvent(stopEvent);
+    wait = WaitForSingleObject(brokerThread, 10000);
+    CloseHandle(brokerThread);
+    CaptureHttps_Stop(https);
+    CloseHandle(stopEvent);
+    StopUpstream(&upstream);
+    free(section);
+
+    if (! Require(ok, "broker HTTPS client GET") ||
+            ! Require(strstr(response, "upstream-ok") != NULL,
+                      "broker HTTPS proxied body") ||
+            ! Require(wait == WAIT_OBJECT_0, "packet drain stopped") ||
+            ! Require(ReadAll(harPath, &harBytes, &harSize),
+                      "read broker HAR")) {
+        DeleteFileW(pcapPath);
+        DeleteFileW(harPath);
+        DeleteFileW(caPath);
+        return 0;
+    }
+
+    ok = Require(strstr((const char *)harBytes, "https://example.com/") != NULL,
+                 "broker HAR uses SNI") &&
+        Require(strstr((const char *)harBytes, "secret-token") == NULL,
+                "broker HAR redacts authorization") &&
+        Require(FileHasBytes(pcapPath), "broker still wrote PCAPNG");
+    free(harBytes);
+    DeleteFileW(pcapPath);
+    DeleteFileW(harPath);
+    DeleteFileW(caPath);
+    return ok;
+}
+
+
+static int FileHasBytes(const WCHAR *path)
+{
+    HANDLE file = CreateFileW(
+        path, GENERIC_READ, FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+        OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    DWORD size;
+    if (file == INVALID_HANDLE_VALUE)
+        return 0;
+    size = GetFileSize(file, NULL);
+    CloseHandle(file);
+    return size > 32;
+}
+
+
 int main(void)
 {
     WSADATA wsa;
@@ -733,7 +1010,8 @@ int main(void)
     ok = TestCaPublicPemHasNoPrivateKey() &&
         TestTls13RoundTrip() &&
         TestTls12RoundTrip() &&
-        TestMissingContextRejected();
+        TestMissingContextRejected() &&
+        TestBrokerHttpsListenWritesHarAndPcapng();
 
     WSACleanup();
     if (! ok)

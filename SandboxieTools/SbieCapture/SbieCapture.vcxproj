@@ -104,6 +104,7 @@ copy /Y "$(VcpkgInstalled)\bin\libcrypto-3-x64.dll" "$(OutDir)"</Command>
     <ClInclude Include="capture_broker.h" />
     <ClInclude Include="capture_ca.h" />
     <ClInclude Include="capture_ca_priv.h" />
+    <ClInclude Include="capture_https_broker.h" />
     <ClInclude Include="har.h" />
     <ClInclude Include="http11.h" />
     <ClInclude Include="https_mitm.h" />
@@ -115,6 +116,7 @@ copy /Y "$(VcpkgInstalled)\bin\libcrypto-3-x64.dll" "$(OutDir)"</Command>
   <ItemGroup>
     <ClCompile Include="capture_broker.c" />
     <ClCompile Include="capture_ca.c" />
+    <ClCompile Include="capture_https_broker.c" />
     <ClCompile Include="har.c" />
     <ClCompile Include="http11.c" />
     <ClCompile Include="https_mitm.c" />

@@ -45,7 +45,6 @@ static BOOL CaptureBroker_ValidateSection(
             section->size != CAPTURE_BROKER_SECTION_SIZE(
                 section->record_capacity) ||
             section->reserved != 0 ||
-            section->reserved2 != 0 ||
             section->capture_id_high == 0 ||
             section->capture_id_low == 0 ||
             section->generation != CaptureBroker_CalculateGeneration(
@@ -114,7 +113,7 @@ static BOOL CaptureBroker_ValidateRuntimeSection(
         section->capture_id_low != 0 &&
         section->generation == CaptureBroker_CalculateGeneration(
             section->capture_id_high, section->capture_id_low) &&
-        section->reserved == 0 && section->reserved2 == 0 &&
+        section->reserved == 0 &&
         CaptureBroker_StringTerminated(
             section->box_name, ARRAYSIZE(section->box_name)) &&
         CaptureBroker_StringTerminated(

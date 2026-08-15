@@ -249,6 +249,22 @@ int CaptureCa_WritePublicPemPath(const CAPTURE_CA *ca, const WCHAR *path)
 }
 
 
+int CaptureCa_WritePublicPemHandle(const CAPTURE_CA *ca, HANDLE file)
+{
+    char pem[4096];
+    ULONG length = 0;
+    DWORD written = 0;
+
+    if (file == NULL || file == INVALID_HANDLE_VALUE)
+        return CAPTURE_CA_ERROR;
+    if (CaptureCa_ExportPublicPem(ca, pem, sizeof(pem), &length) != CAPTURE_CA_OK)
+        return CAPTURE_CA_ERROR;
+    if (! WriteFile(file, pem, length, &written, NULL) || written != length)
+        return CAPTURE_CA_ERROR;
+    return CAPTURE_CA_OK;
+}
+
+
 int CaptureCa_MintLeaf(
     CAPTURE_CA *ca,
     const char *sni,

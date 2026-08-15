@@ -60,8 +60,10 @@ typedef struct _HTTPS_MITM_OPTIONS {
     USHORT upstream_port;
     const char *upstream_ca_pem;
     const WCHAR *har_path;
+    HANDLE har_file;
     BOOL redact;
     BOOL include_bodies;
+    BOOL allow_unverified_upstream;
 
 } HTTPS_MITM_OPTIONS;
 
@@ -74,6 +76,8 @@ extern "C" {
 HTTPS_MITM *HttpsMitm_Listen(const HTTPS_MITM_OPTIONS *options);
 USHORT HttpsMitm_ListenPort(const HTTPS_MITM *mitm);
 SOCKET HttpsMitm_Accept(HTTPS_MITM *mitm);
+SOCKET HttpsMitm_TryAccept(HTTPS_MITM *mitm, ULONG timeoutMs);
+int HttpsMitm_RecvContext(SOCKET client, HTTPS_REDIRECT_CONTEXT *context);
 int HttpsMitm_ServeOnce(
     HTTPS_MITM *mitm,
     SOCKET client,

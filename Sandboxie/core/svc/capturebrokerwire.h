@@ -70,7 +70,7 @@ typedef struct _CAPTURE_BROKER_SECTION {
     ULONG64 byte_count;
     ULONG64 dropped_count;
     ULONG current_file_index;
-    ULONG reserved2;
+    ULONG https_listen_port;
     WCHAR box_name[BOXNAME_COUNT];
     WCHAR sid_string[96];
     CAPTURE_PACKET_RECORD records[1];

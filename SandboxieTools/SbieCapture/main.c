@@ -16,6 +16,9 @@
 // SbieCapture broker process entry point
 //---------------------------------------------------------------------------
 
+#define WIN32_LEAN_AND_MEAN
+
+#include "capture_https_broker.h"
 #include "capture_broker.h"
 
 #include <errno.h>
@@ -72,7 +75,9 @@ static void PrintUsage(void)
         L"Usage: SbieCapture.exe --section HANDLE --file HANDLE "
         L"--capture-high N --capture-low N --generation N "
         L"[--stop-event HANDLE] [--snaplen N] [--max-file-bytes N] "
-        L"[--max-seconds N] [--rotate-count N]\n");
+        L"[--max-seconds N] [--rotate-count N] "
+        L"[--https-listen --har HANDLE --ca-file HANDLE "
+        L"[--https-test-preamble]]\n");
 }
 
 
@@ -84,15 +89,21 @@ int __cdecl wmain(int argc, WCHAR **argv)
     ULONG64 rawCaptureHigh = 0;
     ULONG64 rawCaptureLow = 0;
     ULONG64 rawGeneration = 0;
+    ULONG64 rawHar = 0;
+    ULONG64 rawCa = 0;
     ULONG64 value = 0;
     BOOL haveSection = FALSE;
     BOOL haveFile = FALSE;
     BOOL haveCaptureHigh = FALSE;
     BOOL haveCaptureLow = FALSE;
     BOOL haveGeneration = FALSE;
+    BOOL httpsListen = FALSE;
+    BOOL httpsTestPreamble = FALSE;
     HANDLE sectionHandle = NULL;
     HANDLE outputFile = NULL;
     HANDLE stopEvent = NULL;
+    HANDLE harFile = NULL;
+    HANDLE caFile = NULL;
     ULONG snapLength = 0;
     ULONG maxFileBytes = 0;
     ULONG maxSeconds = 0;
@@ -161,6 +172,22 @@ int __cdecl wmain(int argc, WCHAR **argv)
                 goto InvalidArguments;
             rotateCount = (ULONG)value;
         }
+        else if (ReadOption(argc, argv, &index, L"--har", &text)) {
+            if (harFile || ! ParseUInt64(text, 16, &rawHar) || rawHar == 0)
+                goto InvalidArguments;
+            harFile = (HANDLE)(ULONG_PTR)rawHar;
+        }
+        else if (ReadOption(argc, argv, &index, L"--ca-file", &text)) {
+            if (caFile || ! ParseUInt64(text, 16, &rawCa) || rawCa == 0)
+                goto InvalidArguments;
+            caFile = (HANDLE)(ULONG_PTR)rawCa;
+        }
+        else if (_wcsicmp(argv[index], L"--https-listen") == 0) {
+            httpsListen = TRUE;
+        }
+        else if (_wcsicmp(argv[index], L"--https-test-preamble") == 0) {
+            httpsTestPreamble = TRUE;
+        }
         else if (_wcsicmp(argv[index], L"--help") == 0 ||
                  _wcsicmp(argv[index], L"-h") == 0) {
             PrintUsage();
@@ -173,6 +200,10 @@ int __cdecl wmain(int argc, WCHAR **argv)
 
     if (! haveSection || ! haveFile || !haveCaptureHigh ||
             !haveCaptureLow || !haveGeneration)
+        goto InvalidArguments;
+    if (httpsListen && (! harFile || ! caFile))
+        goto InvalidArguments;
+    if (! httpsListen && (harFile || caFile || httpsTestPreamble))
         goto InvalidArguments;
 
     sectionHandle = (HANDLE)(ULONG_PTR)rawSection;
@@ -187,6 +218,10 @@ int __cdecl wmain(int argc, WCHAR **argv)
     }
 
     CAPTURE_BROKER_OPTIONS options;
+    CAPTURE_HTTPS_RUNTIME *https = NULL;
+    WSADATA wsa;
+    int status;
+
     memset(&options, 0, sizeof(options));
     options.output_file = outputFile;
     options.stop_event = stopEvent;
@@ -198,12 +233,48 @@ int __cdecl wmain(int argc, WCHAR **argv)
     options.expected_capture_id_low = rawCaptureLow;
     options.expected_generation = rawGeneration;
 
-    int status = CaptureBroker_Run(
+    if (httpsListen) {
+        CAPTURE_HTTPS_OPTIONS httpsOptions;
+        if (WSAStartup(MAKEWORD(2, 2), &wsa) != 0) {
+            UnmapViewOfFile(mapped);
+            CloseHandle(outputFile);
+            return CAPTURE_BROKER_ERROR;
+        }
+        memset(&httpsOptions, 0, sizeof(httpsOptions));
+        httpsOptions.har_file = harFile;
+        httpsOptions.ca_file = caFile;
+        httpsOptions.test_preamble = httpsTestPreamble;
+        httpsOptions.redact = TRUE;
+        httpsOptions.include_bodies = FALSE;
+        httpsOptions.expected_context.magic = HTTPS_REDIRECT_CONTEXT_MAGIC;
+        httpsOptions.expected_context.version = HTTPS_REDIRECT_CONTEXT_VERSION;
+        httpsOptions.expected_context.capture_id_high = rawCaptureHigh;
+        httpsOptions.expected_context.capture_id_low = rawCaptureLow;
+        httpsOptions.expected_context.generation = rawGeneration;
+        https = CaptureHttps_Start(
+            (CAPTURE_BROKER_SECTION *)mapped, &httpsOptions);
+        if (! https) {
+            WSACleanup();
+            UnmapViewOfFile(mapped);
+            CloseHandle(outputFile);
+            return CAPTURE_BROKER_ERROR;
+        }
+    }
+
+    status = CaptureBroker_Run(
         (CAPTURE_BROKER_SECTION *)mapped, &options);
+    if (https) {
+        CaptureHttps_Stop(https);
+        WSACleanup();
+    }
     UnmapViewOfFile(mapped);
     CloseHandle(sectionHandle);
     if (stopEvent)
         CloseHandle(stopEvent);
+    if (harFile)
+        CloseHandle(harFile);
+    if (caFile)
+        CloseHandle(caFile);
     return status;
 
 InvalidArguments:

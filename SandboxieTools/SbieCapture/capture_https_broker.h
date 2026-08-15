@@ -16,37 +16,42 @@
  */
 
 //---------------------------------------------------------------------------
-// Session capture CA -- public API, no OpenSSL types
+// Broker HTTPS listen helper -- process-mode MITM beside PCAPNG drain
 //---------------------------------------------------------------------------
 
-#ifndef _MY_CAPTURE_CA_H
-#define _MY_CAPTURE_CA_H
+#ifndef _MY_CAPTURE_HTTPS_BROKER_H
+#define _MY_CAPTURE_HTTPS_BROKER_H
 
-#include <windows.h>
+#include "https_mitm.h"
+#include "capture_broker.h"
 
-#define CAPTURE_CA_OK               0
-#define CAPTURE_CA_ERROR            (-1)
+typedef struct _CAPTURE_HTTPS_OPTIONS {
 
-typedef struct _CAPTURE_CA CAPTURE_CA;
+    HANDLE har_file;
+    HANDLE ca_file;
+    BOOL test_preamble;
+    BOOL redact;
+    BOOL include_bodies;
+    HTTPS_REDIRECT_CONTEXT expected_context;
+
+} CAPTURE_HTTPS_OPTIONS;
+
+typedef struct _CAPTURE_HTTPS_RUNTIME CAPTURE_HTTPS_RUNTIME;
 
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-CAPTURE_CA *CaptureCa_Create(void);
-void CaptureCa_Free(CAPTURE_CA *ca);
+CAPTURE_HTTPS_RUNTIME *CaptureHttps_Start(
+    CAPTURE_BROKER_SECTION *section,
+    const CAPTURE_HTTPS_OPTIONS *options);
 
-int CaptureCa_ExportPublicPem(
-    const CAPTURE_CA *ca,
-    char *buffer,
-    ULONG capacity,
-    ULONG *length);
+USHORT CaptureHttps_ListenPort(const CAPTURE_HTTPS_RUNTIME *runtime);
 
-int CaptureCa_WritePublicPemPath(const CAPTURE_CA *ca, const WCHAR *path);
-int CaptureCa_WritePublicPemHandle(const CAPTURE_CA *ca, HANDLE file);
+void CaptureHttps_Stop(CAPTURE_HTTPS_RUNTIME *runtime);
 
 #ifdef __cplusplus
 }
 #endif
 
-#endif /* _MY_CAPTURE_CA_H */
+#endif /* _MY_CAPTURE_HTTPS_BROKER_H */
