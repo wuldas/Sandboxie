@@ -161,6 +161,7 @@
 #define MSGID_CAPTURE_SET_EXPORT                0x2007
 #define MSGID_CAPTURE_READ_PACKETS              0x2008
 #define MSGID_CAPTURE_READ_STREAMS              0x2009
+#define MSGID_CAPTURE_SET_HAR_EXPORT            0x200A
 #define MSGID_CAPTURE_NOTIFICATION              0x20FF
 
 //---------------------------------------------------------------------------

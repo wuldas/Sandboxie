@@ -74,8 +74,7 @@ static SB_RESULT(SSbieCaptureSession) CSbieAPI__CaptureSessionFromWire(
 		!Wire.mode ||
 		(Wire.mode & ~(CAPTURE_MODE_CONNECTIONS |
 		 CAPTURE_MODE_PACKETS | CAPTURE_MODE_HTTPS)) ||
-		(Wire.flags & ~(CAPTURE_FLAG_INCLUDE_FUTURE_PROCESSES |
-		 CAPTURE_FLAG_INCLUDE_LOOPBACK)) ||
+		(Wire.flags & ~CAPTURE_FLAG_ALL) ||
 		(Wire.scope == CAPTURE_SCOPE_BOX && Wire.target_pid) ||
 		(Wire.scope == CAPTURE_SCOPE_PROCESS &&
 		 (!Wire.target_pid || !Wire.target_process_create_time ||
@@ -3316,7 +3315,9 @@ SB_RESULT(SSbieCaptureSession) CSbieAPI::StartCapture(
 		Options.Mode != SSbieCaptureStart::ePackets)
 		return SB_ERR(STATUS_NOT_SUPPORTED);
 	if ((Options.Flags & ~(SSbieCaptureStart::eIncludeFutureProcesses |
-			SSbieCaptureStart::eIncludeLoopback)) != 0)
+			SSbieCaptureStart::eIncludeLoopback |
+			SSbieCaptureStart::eIncludeBodies |
+			SSbieCaptureStart::eDisableRedaction)) != 0)
 		return SB_ERR(STATUS_INVALID_PARAMETER);
 	if ((Options.Scope == SSbieCaptureStart::eProcess && !Options.ProcessId) ||
 		(Options.Scope == SSbieCaptureStart::eBox && Options.ProcessId))
@@ -3398,6 +3399,40 @@ SB_RESULT(SSbieCaptureSession) CSbieAPI::SetCaptureExport(
 	Status = CSbieAPI__ValidateCaptureReply(
 		rpl->wire_version, rpl->struct_size, rpl.Size(),
 		sizeof(CAPTURE_SET_EXPORT_RPL));
+	if (!Status)
+		return Status;
+
+	return CSbieAPI__CaptureSessionFromWire(rpl->session);
+}
+
+SB_RESULT(SSbieCaptureSession) CSbieAPI::SetCaptureHarExport(
+	const SSbieCaptureId& CaptureId, quint64 FileHandle)
+{
+	if (CaptureId.IsNull() || FileHandle == 0)
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+
+	CAPTURE_SET_HAR_EXPORT_REQ req = {};
+	req.v.h.length = sizeof(req);
+	req.v.h.msgid = MSGID_CAPTURE_SET_HAR_EXPORT;
+	req.v.wire_version = CAPTURE_WIRE_VERSION;
+	req.v.struct_size = sizeof(req);
+	req.capture_id.high = CaptureId.High;
+	req.capture_id.low = CaptureId.Low;
+	req.file_handle = FileHandle;
+
+	SScoped<CAPTURE_SET_HAR_EXPORT_RPL> rpl;
+	SB_STATUS Status = CallServer(&req.v.h, &rpl);
+	if (!Status || !rpl)
+		return Status;
+	if (rpl.Size() < sizeof(MSG_HEADER))
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	if (!NT_SUCCESS(rpl->h.status))
+		return SB_ERR(rpl->h.status);
+	if (rpl.Size() < offsetof(CAPTURE_SET_HAR_EXPORT_RPL, session))
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	Status = CSbieAPI__ValidateCaptureReply(
+		rpl->wire_version, rpl->struct_size, rpl.Size(),
+		sizeof(CAPTURE_SET_HAR_EXPORT_RPL));
 	if (!Status)
 		return Status;
 

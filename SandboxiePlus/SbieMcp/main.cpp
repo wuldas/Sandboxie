@@ -500,7 +500,10 @@ private:
                     {"maxFileBytes", QJsonObject{{"type", "integer"}, {"minimum", 0}, {"maximum", 4294967295.0}}},
                     {"maxSeconds", QJsonObject{{"type", "integer"}, {"minimum", 0}, {"maximum", 86400}}},
                     {"rotateCount", QJsonObject{{"type", "integer"}, {"minimum", 0}, {"maximum", 64}}},
-                    {"outputPath", QJsonObject{{"type", "string"}, {"minLength", 1}}}
+                    {"outputPath", QJsonObject{{"type", "string"}, {"minLength", 1}}},
+                    {"outputHarPath", QJsonObject{{"type", "string"}, {"minLength", 1}}},
+                    {"includeBodies", QJsonObject{{"type", "boolean"}}},
+                    {"disableRedaction", QJsonObject{{"type", "boolean"}}}
                 }},
                 {"required", QJsonArray{"box"}},
                 {"additionalProperties", false}
@@ -602,6 +605,8 @@ private:
             Value["connectionAudit"] = (Caps.Flags & 0x00000002) != 0;
             Value["packetCapture"] = (Caps.Flags & 0x00000004) != 0;
             Value["httpsInspection"] = (Caps.Flags & 0x00000008) != 0;
+            Value["pcapngExport"] = (Caps.Flags & 0x00000010) != 0;
+            Value["harExport"] = (Caps.Flags & 0x00000020) != 0;
             Value["maxSessionsPerOwner"] =
                 JsonUInt32(Caps.MaxSessionsPerOwner);
             Value["maxListEntries"] = JsonUInt32(Caps.MaxListEntries);
@@ -625,8 +630,9 @@ private:
     {
         const QSet<QString> Allowed{
             "box", "processId", "mode", "includeFutureProcesses",
-            "includeLoopback", "snapLength", "maxFileBytes", "maxSeconds",
-            "rotateCount", "outputPath"
+            "includeLoopback", "includeBodies", "disableRedaction",
+            "snapLength", "maxFileBytes", "maxSeconds",
+            "rotateCount", "outputPath", "outputHarPath"
         };
         if (!HasOnlyProperties(Arguments, Allowed) ||
                 !Arguments.value("box").isString() ||
@@ -659,22 +665,49 @@ private:
                                 "outputPath must be a non-empty string");
             OutputPath = Arguments.value("outputPath").toString();
         }
+        QString OutputHarPath;
+        if (Arguments.contains("outputHarPath")) {
+            if (!Arguments.value("outputHarPath").isString() ||
+                    Arguments.value("outputHarPath").toString().isEmpty())
+                return McpError(-32602,
+                                "outputHarPath must be a non-empty string");
+            OutputHarPath = Arguments.value("outputHarPath").toString();
+        }
         if (Mode == "packets" && OutputPath.isEmpty())
             return McpError(-32602,
                             "packet capture requires outputPath");
-        if (Mode != "packets" && !OutputPath.isEmpty())
+        if (Mode == "https" &&
+                (OutputPath.isEmpty() || OutputHarPath.isEmpty())) {
             return McpError(-32602,
-                            "outputPath is only valid for packet capture");
+                            "https capture requires outputPath and outputHarPath");
+        }
+        if (Mode == "connections" &&
+                (!OutputPath.isEmpty() || !OutputHarPath.isEmpty())) {
+            return McpError(-32602,
+                            "output paths are only valid for packet or https capture");
+        }
+        if (Mode == "packets" && !OutputHarPath.isEmpty())
+            return McpError(-32602,
+                            "outputHarPath is only valid for https capture");
 
         bool IncludeFutureProcesses = !HasProcessId;
         bool IncludeLoopback = false;
+        bool IncludeBodies = false;
+        bool DisableRedaction = false;
         if (!ReadOptionalBool(Arguments, "includeFutureProcesses",
                               IncludeFutureProcesses,
                               &IncludeFutureProcesses) ||
                 !ReadOptionalBool(Arguments, "includeLoopback", false,
-                                  &IncludeLoopback)) {
+                                  &IncludeLoopback) ||
+                !ReadOptionalBool(Arguments, "includeBodies", false,
+                                  &IncludeBodies) ||
+                !ReadOptionalBool(Arguments, "disableRedaction", false,
+                                  &DisableRedaction)) {
             return McpError(-32602, "Capture flags must be boolean");
         }
+        if (Mode != "https" && (IncludeBodies || DisableRedaction))
+            return McpError(-32602,
+                            "includeBodies and disableRedaction are only valid for https capture");
 
         quint32 SnapLength = 0;
         quint32 MaxFileBytes = 0;
@@ -728,6 +761,10 @@ private:
             Options.Flags |= SSbieCaptureStart::eIncludeFutureProcesses;
         if (IncludeLoopback)
             Options.Flags |= SSbieCaptureStart::eIncludeLoopback;
+        if (IncludeBodies)
+            Options.Flags |= SSbieCaptureStart::eIncludeBodies;
+        if (DisableRedaction)
+            Options.Flags |= SSbieCaptureStart::eDisableRedaction;
         Options.SnapLength = SnapLength;
         Options.MaxFileBytes = MaxFileBytes;
         Options.MaxSeconds = MaxSeconds;
@@ -738,7 +775,7 @@ private:
             return McpResult(TextToolResult(StatusError(Result), true));
 
         SSbieCaptureSession Session = Result.GetValue();
-        if (Mode == "packets") {
+        if (Mode == "packets" || Mode == "https") {
 #ifdef _WIN32
             const std::wstring Path = OutputPath.toStdWString();
             HANDLE File = CreateFileW(
@@ -767,6 +804,36 @@ private:
                     StatusError(ExportResult), true));
             }
             Session = ExportResult.GetValue();
+
+            if (Mode == "https") {
+                const std::wstring HarPath = OutputHarPath.toStdWString();
+                HANDLE HarFile = CreateFileW(
+                    HarPath.c_str(),
+                    GENERIC_READ | GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE,
+                    NULL,
+                    CREATE_ALWAYS,
+                    FILE_ATTRIBUTE_NORMAL,
+                    NULL);
+                if (HarFile == INVALID_HANDLE_VALUE) {
+                    const DWORD Error = GetLastError();
+                    m_Api.StopCapture(Session.Id);
+                    return McpResult(TextToolResult(QJsonObject{
+                        {"win32Error", JsonUInt32(Error)},
+                        {"message", "Failed to open outputHarPath"}
+                    }, true));
+                }
+
+                auto HarResult = m_Api.SetCaptureHarExport(
+                    Session.Id, (quint64)(ULONG_PTR)HarFile);
+                CloseHandle(HarFile);
+                if (HarResult.IsError()) {
+                    m_Api.StopCapture(Session.Id);
+                    return McpResult(TextToolResult(
+                        StatusError(HarResult), true));
+                }
+                Session = HarResult.GetValue();
+            }
 #endif
         }
 

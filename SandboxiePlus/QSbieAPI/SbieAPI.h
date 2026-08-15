@@ -156,6 +156,8 @@ public:
 	SB_RESULT(SSbieCaptureSession) StartCapture(const SSbieCaptureStart& Options);
 	SB_RESULT(SSbieCaptureSession) SetCaptureExport(
 		const SSbieCaptureId& CaptureId, quint64 FileHandle);
+	SB_RESULT(SSbieCaptureSession) SetCaptureHarExport(
+		const SSbieCaptureId& CaptureId, quint64 FileHandle);
 	SB_RESULT(SSbieCaptureSession) StopCapture(const SSbieCaptureId& CaptureId);
 	SB_RESULT(SSbieCaptureSession) GetCaptureStatus(const SSbieCaptureId& CaptureId);
 	SB_RESULT(SSbieCaptureList) ListCaptures(quint32 StartIndex = 0, quint32 MaxEntries = 0);

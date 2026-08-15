@@ -57,6 +57,13 @@
 
 #define CAPTURE_FLAG_INCLUDE_FUTURE_PROCESSES   0x00000001
 #define CAPTURE_FLAG_INCLUDE_LOOPBACK           0x00000002
+#define CAPTURE_FLAG_INCLUDE_BODIES             0x00000004
+#define CAPTURE_FLAG_DISABLE_REDACTION          0x00000008
+#define CAPTURE_FLAG_ALL \
+    (CAPTURE_FLAG_INCLUDE_FUTURE_PROCESSES | \
+     CAPTURE_FLAG_INCLUDE_LOOPBACK | \
+     CAPTURE_FLAG_INCLUDE_BODIES | \
+     CAPTURE_FLAG_DISABLE_REDACTION)
 
 #define CAPTURE_SNAP_LENGTH_MIN                64
 #define CAPTURE_SNAP_LENGTH_MAX                1514
@@ -405,6 +412,10 @@ typedef struct _CAPTURE_SET_EXPORT_RPL {
 } CAPTURE_SET_EXPORT_RPL;
 
 
+typedef CAPTURE_SET_EXPORT_REQ CAPTURE_SET_HAR_EXPORT_REQ;
+typedef CAPTURE_SET_EXPORT_RPL CAPTURE_SET_HAR_EXPORT_RPL;
+
+
 #pragma pack(pop)
 
 
@@ -427,6 +438,10 @@ static_assert(sizeof(CAPTURE_SET_EXPORT_REQ) == 48,
               "capture export request size changed");
 static_assert(sizeof(CAPTURE_SET_EXPORT_RPL) == 200,
               "capture export reply size changed");
+static_assert(sizeof(CAPTURE_SET_HAR_EXPORT_REQ) == 48,
+              "capture HAR export request size changed");
+static_assert(sizeof(CAPTURE_SET_HAR_EXPORT_RPL) == 200,
+              "capture HAR export reply size changed");
 static_assert(sizeof(CAPTURE_START_RPL) == 200,
               "capture start reply size changed");
 static_assert(sizeof(CAPTURE_SESSION_REQ) == 32,

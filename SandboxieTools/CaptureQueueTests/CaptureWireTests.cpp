@@ -121,7 +121,21 @@ int main()
                      "export request exceeds service request limit") ||
             !Require(sizeof(CAPTURE_SET_EXPORT_RPL) ==
                      sizeof(CAPTURE_STATUS_RPL),
-                     "export reply size diverged from status")) {
+                     "export reply size diverged from status") ||
+            !Require(MSGID_CAPTURE_SET_HAR_EXPORT == 0x200A,
+                     "HAR export msgid is not 0x200A") ||
+            !Require(CAPTURE_FLAG_INCLUDE_BODIES == 0x00000004,
+                     "include-bodies flag is not 0x4") ||
+            !Require(CAPTURE_FLAG_DISABLE_REDACTION == 0x00000008,
+                     "disable-redaction flag is not 0x8") ||
+            !Require(sizeof(CAPTURE_SET_HAR_EXPORT_REQ) ==
+                     sizeof(CAPTURE_SET_EXPORT_REQ),
+                     "HAR export request size diverged from PCAPNG export") ||
+            !Require(sizeof(CAPTURE_SET_HAR_EXPORT_RPL) ==
+                     sizeof(CAPTURE_SET_EXPORT_RPL),
+                     "HAR export reply size diverged from PCAPNG export") ||
+            !Require(sizeof(CAPTURE_START_REQ) == 132,
+                     "HTTPS flags must not resize start request")) {
         return 1;
     }
 

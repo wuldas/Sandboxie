@@ -45,6 +45,7 @@ protected:
     MSG_HEADER *ListHandler(MSG_HEADER *msg);
     MSG_HEADER *ReadEventsHandler(MSG_HEADER *msg);
     MSG_HEADER *SetExportHandler(MSG_HEADER *msg);
+    MSG_HEADER *SetHarExportHandler(MSG_HEADER *msg);
     void NotifyHandler(HANDLE idProcess, ULONG64 ownerCreateTime);
 
     struct _CAPTURE_SESSION_OBJ *FindSession(

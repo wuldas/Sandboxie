@@ -823,6 +823,8 @@ MSG_HEADER *CaptureServer::Handler(void *_this, MSG_HEADER *msg)
         return pThis->ReadEventsHandler(msg);
     if (msg->msgid == MSGID_CAPTURE_SET_EXPORT)
         return pThis->SetExportHandler(msg);
+    if (msg->msgid == MSGID_CAPTURE_SET_HAR_EXPORT)
+        return pThis->SetHarExportHandler(msg);
 
     return SHORT_REPLY(STATUS_INVALID_SYSTEM_SERVICE);
 }
@@ -896,8 +898,7 @@ MSG_HEADER *CaptureServer::StartHandler(MSG_HEADER *msg)
             req->mode != CAPTURE_MODE_PACKETS)
         return SHORT_REPLY(STATUS_NOT_SUPPORTED);
 
-    if ((req->flags & ~(CAPTURE_FLAG_INCLUDE_FUTURE_PROCESSES |
-                        CAPTURE_FLAG_INCLUDE_LOOPBACK)) != 0)
+    if ((req->flags & ~CAPTURE_FLAG_ALL) != 0)
         return SHORT_REPLY(STATUS_INVALID_PARAMETER);
 
     if (req->v.struct_size > CAPTURE_START_REQ_V1_SIZE &&
@@ -1798,6 +1799,27 @@ MSG_HEADER *CaptureServer::SetExportHandler(MSG_HEADER *msg)
 
     LeaveCriticalSection(&m_lock);
     return &rpl->h;
+}
+
+
+//---------------------------------------------------------------------------
+// SetHarExportHandler
+//---------------------------------------------------------------------------
+
+
+MSG_HEADER *CaptureServer::SetHarExportHandler(MSG_HEADER *msg)
+{
+    CAPTURE_SET_HAR_EXPORT_REQ *req = (CAPTURE_SET_HAR_EXPORT_REQ *)msg;
+    ULONG status = CaptureServer_ValidateVersion(
+        &req->v, sizeof(CAPTURE_SET_HAR_EXPORT_REQ));
+    if (! NT_SUCCESS(status))
+        return SHORT_REPLY(status);
+
+    if ((req->capture_id.high == 0 && req->capture_id.low == 0) ||
+            req->file_handle == 0 || req->reserved || req->reserved2)
+        return SHORT_REPLY(STATUS_INVALID_PARAMETER);
+
+    return SHORT_REPLY(STATUS_NOT_SUPPORTED);
 }
 
 

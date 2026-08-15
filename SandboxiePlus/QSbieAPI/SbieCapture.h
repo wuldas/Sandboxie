@@ -75,6 +75,8 @@ struct QSBIEAPI_EXPORT SSbieCaptureStart
     {
         eIncludeFutureProcesses = 0x00000001,
         eIncludeLoopback = 0x00000002,
+        eIncludeBodies = 0x00000004,
+        eDisableRedaction = 0x00000008,
     };
 
     quint32 Scope = eBox;
