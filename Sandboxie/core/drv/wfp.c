@@ -71,6 +71,8 @@ extern DEVICE_OBJECT *Api_DeviceObject;
 
 DEFINE_GUID(WFP_SUBLAYER_GUID,	// e1d364e9-cd84-4a48-aba4-608ce83e31ee
 	0xe1d364e9, 0xcd84, 0x4a48, 0xab, 0xa4, 0x60, 0x8c, 0xe8, 0x3e, 0x31, 0xee);
+DEFINE_GUID(WFP_PROVIDER_GUID,	// e1d364e9-cd84-4a48-aba4-608ce83e31ef
+	0xe1d364e9, 0xcd84, 0x4a48, 0xab, 0xa4, 0x60, 0x8c, 0xe8, 0x3e, 0x31, 0xef);
 
 #define WFP_CALLOUT_NAME		L"SbieCallout"
 #define WFP_CALLOUT_DESCRIPTION	L"A callout used by sandboxie to implement internet restrictions"
@@ -792,7 +794,7 @@ _FX BOOLEAN WFP_Install_Callbacks(void)
 
 	if (WFP_ResolveRedirectApis()) {
 		status = WFP_pRedirectHandleCreate(
-			&WFP_SUBLAYER_GUID, 0, &WFP_redirect_handle);
+			&WFP_PROVIDER_GUID, 0, &WFP_redirect_handle);
 		stage = 0x61; if (!NT_SUCCESS(status) || ! WFP_redirect_handle) goto Exit;
 		status = WFP_RegisterCalloutEx(
 			&WFP_REDIRECT_CALLOUT_GUID_V4,
@@ -923,6 +925,16 @@ _FX void WFP_Uninstall_Callbacks(void)
 NTSTATUS WFP_RegisterSubLayer()
 {
 	NTSTATUS status = STATUS_SUCCESS;
+	FWPM_PROVIDER provider = { 0 };
+
+	provider.providerKey = WFP_PROVIDER_GUID;
+	provider.displayData.name = L"SbieProvider";
+	provider.displayData.description = L"Sandboxie WFP provider";
+	status = FwpmProviderAdd(WFP_engine_handle, &provider, NULL);
+	if (status == STATUS_FWP_ALREADY_EXISTS)
+		status = STATUS_SUCCESS;
+	if (!NT_SUCCESS(status))
+		return status;
 
 	FWPM_SUBLAYER sublayer = { 0 };
 	sublayer.subLayerKey = WFP_SUBLAYER_GUID;
@@ -1342,7 +1354,7 @@ static void NTAPI WFP_https_redirect_classify(
 	ULONG64 generation = 0;
 	UINT64 classifyHandle = 0;
 	FWPS_CONNECT_REQUEST *request = NULL;
-	HTTPS_REDIRECT_CONTEXT context;
+	HTTPS_REDIRECT_CONTEXT *context = NULL;
 	NTSTATUS status;
 
 	UNREFERENCED_PARAMETER(layerData);
@@ -1352,6 +1364,7 @@ static void NTAPI WFP_https_redirect_classify(
 	if (! canWrite || ! WFP_IsHttpsRedirectAvailable() ||
 			! inFixedValues || ! inMetaValues || ! filter ||
 			! classifyContext) {
+		classifyOut->actionType = FWP_ACTION_PERMIT;
 		return;
 	}
 
@@ -1414,11 +1427,11 @@ static void NTAPI WFP_https_redirect_classify(
 	}
 
 	if (CaptureHttps_Decide(&flow) == CAPTURE_HTTPS_DECISION_REDIRECT) {
-		CaptureHttps_FillContext(
-			&context, captureIdHigh, captureIdLow, generation,
+		context = CaptureHttps_CreateContext(
+			captureIdHigh, captureIdLow, generation,
 			&identity, flow.address_family, remotePort,
 			flow.remote_address);
-
+		if (context) {
 		status = FwpsAcquireClassifyHandle0(
 			(void *)classifyContext, 0, &classifyHandle);
 		if (NT_SUCCESS(status)) {
@@ -1446,13 +1459,22 @@ static void NTAPI WFP_https_redirect_classify(
 					addr->sin6_port = RtlUshortByteSwap(listenPort);
 					((UCHAR *)&addr->sin6_addr)[15] = 1;
 				}
+#if (NTDDI_VERSION >= NTDDI_WIN8)
 				request->localRedirectHandle = WFP_redirect_handle;
-				request->localRedirectContext = &context;
-				request->localRedirectContextSize = sizeof(context);
-				FwpsApplyModifiedLayerData0(classifyHandle, request, 0);
+				request->localRedirectContext = context;
+				request->localRedirectContextSize = sizeof(*context);
+#endif
+				FwpsApplyModifiedLayerData0(
+					classifyHandle, request,
+					FWPS_CLASSIFY_FLAG_REAUTHORIZE_IF_MODIFIED_BY_OTHERS);
+				context = NULL;
+				classifyOut->rights &= ~FWPS_RIGHT_ACTION_WRITE;
 			}
 			FwpsReleaseClassifyHandle0(classifyHandle);
 		}
+		}
+		if (context)
+			CaptureHttps_ReleaseContext(context);
 	}
 
 	classifyOut->actionType = FWP_ACTION_PERMIT;

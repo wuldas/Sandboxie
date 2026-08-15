@@ -253,6 +253,37 @@ static int TestFillContext(void)
 }
 
 
+static int TestCreateContextIsHeapNotStack(void)
+{
+    CAPTURE_FILTER_IDENTITY identity;
+    HTTPS_REDIRECT_CONTEXT stack;
+    HTTPS_REDIRECT_CONTEXT *heap;
+    UCHAR address[16];
+
+    FillIdentity(&identity);
+    memset(address, 0, sizeof(address));
+    address[0] = 1;
+    address[3] = 1;
+    memset(&stack, 0xCC, sizeof(stack));
+    heap = CaptureHttps_CreateContext(
+        1, 2, 3, &identity, CAPTURE_HTTPS_AF_INET, 443, address);
+    if (! Require(heap != NULL, "create context allocates") ||
+            ! Require(heap != &stack, "context is not the stack dummy") ||
+            ! Require(heap->magic == HTTPS_REDIRECT_CONTEXT_MAGIC,
+                      "heap context magic") ||
+            ! Require(heap->original_port == 443, "heap context port")) {
+        CaptureHttps_ReleaseContext(heap);
+        return 0;
+    }
+    CaptureHttps_ReleaseContext(heap);
+    CaptureHttps_ReleaseContext(NULL);
+    return Require(
+        CaptureHttps_CreateContext(
+            1, 2, 3, NULL, CAPTURE_HTTPS_AF_INET, 443, address) == NULL,
+        "null identity does not allocate");
+}
+
+
 int main(void)
 {
     int ok = TestMatchingTcp443Redirects() &&
@@ -263,7 +294,8 @@ int main(void)
         TestSelfRedirectedContinues() &&
         TestListenerDestinationContinues() &&
         TestDifferentBoxContinues() &&
-        TestFillContext();
+        TestFillContext() &&
+        TestCreateContextIsHeapNotStack();
     if (! ok)
         return 1;
     printf("https redirect tests passed\n");

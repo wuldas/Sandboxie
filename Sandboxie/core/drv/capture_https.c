@@ -23,6 +23,7 @@
 
 #ifndef KERNEL_MODE
 #include <string.h>
+#include <stdlib.h>
 #endif
 
 
@@ -129,4 +130,44 @@ void CaptureHttps_FillContext(
     context->reserved = 0;
     for (index = 0; index < 16; ++index)
         context->original_address[index] = originalAddress[index];
+}
+
+
+HTTPS_REDIRECT_CONTEXT *CaptureHttps_CreateContext(
+    ULONG64 captureIdHigh,
+    ULONG64 captureIdLow,
+    ULONG64 generation,
+    const CAPTURE_FILTER_IDENTITY *identity,
+    ULONG addressFamily,
+    USHORT originalPort,
+    const UCHAR originalAddress[16])
+{
+    HTTPS_REDIRECT_CONTEXT *context;
+
+    if (! identity || ! originalAddress)
+        return NULL;
+#ifdef KERNEL_MODE
+    context = (HTTPS_REDIRECT_CONTEXT *)ExAllocatePool2(
+        POOL_FLAG_NON_PAGED, sizeof(*context), 'rdHS');
+#else
+    context = (HTTPS_REDIRECT_CONTEXT *)malloc(sizeof(*context));
+#endif
+    if (! context)
+        return NULL;
+    CaptureHttps_FillContext(
+        context, captureIdHigh, captureIdLow, generation, identity,
+        addressFamily, originalPort, originalAddress);
+    return context;
+}
+
+
+void CaptureHttps_ReleaseContext(HTTPS_REDIRECT_CONTEXT *context)
+{
+    if (! context)
+        return;
+#ifdef KERNEL_MODE
+    ExFreePoolWithTag(context, 'rdHS');
+#else
+    free(context);
+#endif
 }

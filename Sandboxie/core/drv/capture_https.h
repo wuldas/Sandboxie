@@ -99,6 +99,17 @@ void CaptureHttps_FillContext(
     USHORT originalPort,
     const UCHAR originalAddress[16]);
 
+HTTPS_REDIRECT_CONTEXT *CaptureHttps_CreateContext(
+    ULONG64 captureIdHigh,
+    ULONG64 captureIdLow,
+    ULONG64 generation,
+    const CAPTURE_FILTER_IDENTITY *identity,
+    ULONG addressFamily,
+    USHORT originalPort,
+    const UCHAR originalAddress[16]);
+
+void CaptureHttps_ReleaseContext(HTTPS_REDIRECT_CONTEXT *context);
+
 #ifdef __cplusplus
 }
 #endif
