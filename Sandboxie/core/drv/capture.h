@@ -48,6 +48,14 @@ UINT64 Capture_CreateFlowContext(
 
 void Capture_DeleteFlowContext(UINT64 flowContext);
 
+UINT64 Capture_LookupFlowContext(
+    UINT64 flowId,
+    UINT16 layerId,
+    UINT32 calloutId);
+
+void Capture_CountDroppedIdentity(
+    const CAPTURE_FILTER_IDENTITY *identity);
+
 void Capture_RecordPayloadByFlow(
     UINT64 flowContext,
     const UCHAR *data,

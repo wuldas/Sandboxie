@@ -39,6 +39,7 @@ public:
 	int							Open();
 	bool						Extract(QString Path = "");
 	bool						Extract(QMap<int, QIODevice*> *FileList, bool bDelete = true);
+	static QString				ExtractToCache(const QString& ArchivePath);
 	bool						Close();
 
 	bool						Update(QMap<int, QIODevice*> *FileList, bool bDelete = true, const SCompressParams* Params = NULL, QMap<int, quint32> *AttribList = NULL);

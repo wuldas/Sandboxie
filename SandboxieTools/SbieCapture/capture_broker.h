@@ -33,6 +33,8 @@
 #define CAPTURE_BROKER_SNAP_LENGTH_MAX    1514
 #define CAPTURE_BROKER_MAX_SECONDS        86400
 #define CAPTURE_BROKER_MAX_ROTATE_COUNT   64
+#define CAPTURE_BROKER_RAW_PACKET_MAX     \
+    (40 + CAPTURE_PACKET_SNAPLEN_MAX)
 
 
 typedef struct _CAPTURE_BROKER_OPTIONS {
@@ -44,6 +46,9 @@ typedef struct _CAPTURE_BROKER_OPTIONS {
     ULONG max_file_bytes;
     ULONG max_seconds;
     ULONG rotate_count;
+    ULONG64 expected_capture_id_high;
+    ULONG64 expected_capture_id_low;
+    ULONG64 expected_generation;
 
 } CAPTURE_BROKER_OPTIONS;
 
@@ -51,6 +56,13 @@ typedef struct _CAPTURE_BROKER_OPTIONS {
 int CaptureBroker_Run(
     CAPTURE_BROKER_SECTION *section,
     const CAPTURE_BROKER_OPTIONS *options);
+
+BOOL CaptureBroker_BuildRawPacket(
+    const CAPTURE_PACKET_RECORD *record,
+    UCHAR *buffer,
+    ULONG capacity,
+    ULONG *capturedLength,
+    ULONG *originalLength);
 
 
 #endif /* _MY_CAPTUREBROKER_H */

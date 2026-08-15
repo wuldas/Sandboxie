@@ -20,6 +20,10 @@
 
 #include <cmath>
 
+#ifdef _WIN32
+#include <windows.h>
+#endif
+
 #include "../QSbieAPI/SbieAPI.h"
 
 
@@ -175,6 +179,34 @@ static QJsonObject CaptureEventToJson(const SSbieCaptureEvent& Event)
         Event.RemoteAddress, Event.AddressFamily);
     Result["localPort"] = JsonUInt32(Event.LocalPort);
     Result["remotePort"] = JsonUInt32(Event.RemotePort);
+    return Result;
+}
+
+
+static QJsonObject CaptureRecordToJson(const SSbieCaptureRecord& Record)
+{
+    QJsonObject Result;
+    Result["sequence"] = QString::number(Record.Sequence);
+    Result["timestamp"] = QString::number(Record.Timestamp);
+    Result["processId"] = JsonUInt32(Record.ProcessId);
+    Result["processCreateTime"] = QString::number(Record.ProcessCreateTime);
+    Result["sessionId"] = JsonUInt32(Record.SessionId);
+    Result["addressFamily"] = JsonUInt32(Record.AddressFamily);
+    Result["protocol"] = JsonUInt32(Record.Protocol);
+    Result["direction"] = Record.Direction == 1 ? "outbound" : "inbound";
+    Result["layer"] = Record.Layer == SSbieCaptureRecord::eStream ?
+        "stream" : (Record.Layer == SSbieCaptureRecord::eDatagram ?
+            "datagram" : "transport");
+    Result["loopback"] = Record.Loopback;
+    Result["localAddress"] = CaptureAddressToString(
+        Record.LocalAddress, Record.AddressFamily);
+    Result["remoteAddress"] = CaptureAddressToString(
+        Record.RemoteAddress, Record.AddressFamily);
+    Result["localPort"] = JsonUInt32(Record.LocalPort);
+    Result["remotePort"] = JsonUInt32(Record.RemotePort);
+    Result["originalLength"] = JsonUInt32(Record.OriginalLength);
+    Result["capturedLength"] = JsonUInt32(Record.CapturedLength);
+    Result["dataHex"] = QString::fromLatin1(Record.Data.toHex());
     return Result;
 }
 
@@ -467,7 +499,8 @@ private:
                     {"snapLength", QJsonObject{{"type", "integer"}, {"minimum", 0}, {"maximum", 1514.0}}},
                     {"maxFileBytes", QJsonObject{{"type", "integer"}, {"minimum", 0}, {"maximum", 4294967295.0}}},
                     {"maxSeconds", QJsonObject{{"type", "integer"}, {"minimum", 0}, {"maximum", 86400}}},
-                    {"rotateCount", QJsonObject{{"type", "integer"}, {"minimum", 0}, {"maximum", 64}}}
+                    {"rotateCount", QJsonObject{{"type", "integer"}, {"minimum", 0}, {"maximum", 64}}},
+                    {"outputPath", QJsonObject{{"type", "string"}, {"minLength", 1}}}
                 }},
                 {"required", QJsonArray{"box"}},
                 {"additionalProperties", false}
@@ -593,7 +626,7 @@ private:
         const QSet<QString> Allowed{
             "box", "processId", "mode", "includeFutureProcesses",
             "includeLoopback", "snapLength", "maxFileBytes", "maxSeconds",
-            "rotateCount"
+            "rotateCount", "outputPath"
         };
         if (!HasOnlyProperties(Arguments, Allowed) ||
                 !Arguments.value("box").isString() ||
@@ -617,6 +650,21 @@ private:
             if (Mode != "connections" && Mode != "packets" && Mode != "https")
                 return McpError(-32602, "Unsupported capture mode");
         }
+
+        QString OutputPath;
+        if (Arguments.contains("outputPath")) {
+            if (!Arguments.value("outputPath").isString() ||
+                    Arguments.value("outputPath").toString().isEmpty())
+                return McpError(-32602,
+                                "outputPath must be a non-empty string");
+            OutputPath = Arguments.value("outputPath").toString();
+        }
+        if (Mode == "packets" && OutputPath.isEmpty())
+            return McpError(-32602,
+                            "packet capture requires outputPath");
+        if (Mode != "packets" && !OutputPath.isEmpty())
+            return McpError(-32602,
+                            "outputPath is only valid for packet capture");
 
         bool IncludeFutureProcesses = !HasProcessId;
         bool IncludeLoopback = false;
@@ -688,8 +736,41 @@ private:
         auto Result = m_Api.StartCapture(Options);
         if (Result.IsError())
             return McpResult(TextToolResult(StatusError(Result), true));
-        return McpResult(TextToolResult(
-            CaptureSessionToJson(Result.GetValue())));
+
+        SSbieCaptureSession Session = Result.GetValue();
+        if (Mode == "packets") {
+#ifdef _WIN32
+            const std::wstring Path = OutputPath.toStdWString();
+            HANDLE File = CreateFileW(
+                Path.c_str(),
+                GENERIC_READ | GENERIC_WRITE,
+                FILE_SHARE_READ | FILE_SHARE_WRITE,
+                NULL,
+                CREATE_ALWAYS,
+                FILE_ATTRIBUTE_NORMAL,
+                NULL);
+            if (File == INVALID_HANDLE_VALUE) {
+                const DWORD Error = GetLastError();
+                m_Api.StopCapture(Session.Id);
+                return McpResult(TextToolResult(QJsonObject{
+                    {"win32Error", JsonUInt32(Error)},
+                    {"message", "Failed to open outputPath"}
+                }, true));
+            }
+
+            auto ExportResult = m_Api.SetCaptureExport(
+                Session.Id, (quint64)(ULONG_PTR)File);
+            CloseHandle(File);
+            if (ExportResult.IsError()) {
+                m_Api.StopCapture(Session.Id);
+                return McpResult(TextToolResult(
+                    StatusError(ExportResult), true));
+            }
+            Session = ExportResult.GetValue();
+#endif
+        }
+
+        return McpResult(TextToolResult(CaptureSessionToJson(Session)));
     }
 
     SMcpResult CaptureById(
@@ -759,6 +840,56 @@ private:
         Value["events"] = Items;
         return McpResult(TextToolResult(Value));
     }
+
+#if 0
+    SMcpResult ReadCaptureRecords(
+        const QJsonObject& Arguments, bool Stream)
+    {
+        if (!HasOnlyProperties(
+                Arguments, QSet<QString>{"captureId", "maxRecords"}) ||
+                !Arguments.value("captureId").isString()) {
+            return McpError(-32602, "Invalid capture record arguments");
+        }
+
+        SSbieCaptureId Id;
+        if (!CaptureIdFromString(
+                Arguments.value("captureId").toString(), &Id)) {
+            return McpError(
+                -32602,
+                "captureId must contain 32 hexadecimal characters");
+        }
+
+        quint32 MaxRecords = 0;
+        bool HasMaxRecords = false;
+        if (!ReadOptionalUInt32(
+                Arguments, "maxRecords", &MaxRecords, &HasMaxRecords) ||
+                (HasMaxRecords && MaxRecords > 32)) {
+            return McpError(-32602,
+                            "maxRecords must be an integer from 1 to 32");
+        }
+
+        auto Result = Stream ? m_Api.ReadCaptureStreams(Id, MaxRecords) :
+                              m_Api.ReadCapturePackets(Id, MaxRecords);
+        if (Result.IsError())
+            return McpResult(TextToolResult(StatusError(Result), true));
+
+        const SSbieCaptureRecords Records = Result.GetValue();
+        QJsonArray Items;
+        for (const SSbieCaptureRecord& Record : Records.Records)
+            Items.append(CaptureRecordToJson(Record));
+
+        QJsonObject Value;
+        Value["captureId"] = CaptureIdToString(Records.Id);
+        Value["nextSequence"] = QString::number(Records.NextSequence);
+        Value["oldestSequence"] = QString::number(Records.OldestSequence);
+        Value["newestSequence"] = QString::number(Records.NewestSequence);
+        Value["droppedCount"] = QString::number(Records.DroppedCount);
+        Value["remainingRecords"] = JsonUInt32(Records.RemainingRecords);
+        Value["records"] = Items;
+        return McpResult(TextToolResult(Value));
+    }
+#endif
+
 
     QJsonObject ListResources() const
     {

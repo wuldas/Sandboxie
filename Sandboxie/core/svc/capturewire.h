@@ -24,6 +24,7 @@
 
 
 #include "../../common/defines.h"
+#include "../drv/capture_packet.h"
 #include "msgids.h"
 
 
@@ -36,6 +37,8 @@
 
 #define CAPTURE_MAX_REQUEST_SIZE                4096
 #define CAPTURE_MAX_EVENT_ENTRIES               32
+#define CAPTURE_MAX_PACKET_ENTRIES             32
+#define CAPTURE_MAX_STREAM_ENTRIES             32
 #define CAPTURE_MAX_REPLY_SIZE                  (64 * 1024)
 
 #define CAPTURE_CAP_CONTROL                     0x00000001
@@ -59,9 +62,6 @@
 #define CAPTURE_SNAP_LENGTH_MAX                1514
 #define CAPTURE_MAX_SECONDS                    86400
 #define CAPTURE_MAX_ROTATE_COUNT               64
-
-#define CAPTURE_ADDRESS_FAMILY_IPV4             2
-#define CAPTURE_ADDRESS_FAMILY_IPV6             23
 
 #define CAPTURE_STATE_STARTING                  1
 #define CAPTURE_STATE_WAITING_FOR_BACKEND       2
@@ -289,6 +289,97 @@ typedef struct _CAPTURE_READ_EVENTS_RPL {
 
 
 //---------------------------------------------------------------------------
+// Read bounded packet and stream records
+//---------------------------------------------------------------------------
+
+
+typedef struct _CAPTURE_PACKET_EVENT {
+
+    ULONG64 sequence;
+    ULONG64 timestamp;
+    ULONG64 process_create_time;
+    ULONG process_id;
+    ULONG session_id;
+    USHORT address_family;
+    UCHAR protocol;
+    UCHAR direction;
+    UCHAR layer;
+    UCHAR loopback;
+    USHORT local_port;
+    USHORT remote_port;
+    USHORT reserved1;
+    ULONG original_length;
+    ULONG captured_length;
+    UCHAR local_address[16];
+    UCHAR remote_address[16];
+    UCHAR data[1514];
+    UCHAR reserved2[2];
+
+} CAPTURE_PACKET_EVENT;
+
+
+typedef CAPTURE_PACKET_EVENT CAPTURE_STREAM_EVENT;
+
+
+typedef struct _CAPTURE_READ_PACKETS_REQ {
+
+    CAPTURE_VERSIONED_REQUEST v;
+    CAPTURE_SESSION_ID capture_id;
+    ULONG max_records;
+    ULONG reserved;
+
+} CAPTURE_READ_PACKETS_REQ;
+
+
+typedef struct _CAPTURE_READ_PACKETS_RPL {
+
+    MSG_HEADER h;
+    ULONG wire_version;
+    ULONG struct_size;
+    CAPTURE_SESSION_ID capture_id;
+    ULONG64 next_sequence;
+    ULONG64 oldest_sequence;
+    ULONG64 newest_sequence;
+    ULONG64 dropped_count;
+    ULONG returned_records;
+    ULONG remaining_records;
+    ULONG reserved1;
+    ULONG reserved2;
+    CAPTURE_PACKET_EVENT records[1];
+
+} CAPTURE_READ_PACKETS_RPL;
+
+
+typedef struct _CAPTURE_READ_STREAMS_REQ {
+
+    CAPTURE_VERSIONED_REQUEST v;
+    CAPTURE_SESSION_ID capture_id;
+    ULONG max_records;
+    ULONG reserved;
+
+} CAPTURE_READ_STREAMS_REQ;
+
+
+typedef struct _CAPTURE_READ_STREAMS_RPL {
+
+    MSG_HEADER h;
+    ULONG wire_version;
+    ULONG struct_size;
+    CAPTURE_SESSION_ID capture_id;
+    ULONG64 next_sequence;
+    ULONG64 oldest_sequence;
+    ULONG64 newest_sequence;
+    ULONG64 dropped_count;
+    ULONG returned_records;
+    ULONG remaining_records;
+    ULONG reserved1;
+    ULONG reserved2;
+    CAPTURE_STREAM_EVENT records[1];
+
+} CAPTURE_READ_STREAMS_RPL;
+
+
+//---------------------------------------------------------------------------
 // Set Export File Handle
 //---------------------------------------------------------------------------
 
@@ -352,6 +443,18 @@ static_assert(sizeof(CAPTURE_READ_EVENTS_REQ) == 40,
               "capture event request size changed");
 static_assert(FIELD_OFFSET(CAPTURE_READ_EVENTS_RPL, events) == 80,
               "capture event reply header size changed");
+static_assert(sizeof(CAPTURE_PACKET_EVENT) == 1600,
+              "capture packet event size changed");
+static_assert(sizeof(CAPTURE_STREAM_EVENT) == 1600,
+              "capture stream event size changed");
+static_assert(sizeof(CAPTURE_READ_PACKETS_REQ) == 40,
+              "capture packet request size changed");
+static_assert(sizeof(CAPTURE_READ_STREAMS_REQ) == 40,
+              "capture stream request size changed");
+static_assert(FIELD_OFFSET(CAPTURE_READ_PACKETS_RPL, records) == 80,
+              "capture packet reply header size changed");
+static_assert(FIELD_OFFSET(CAPTURE_READ_STREAMS_RPL, records) == 80,
+              "capture stream reply header size changed");
 #endif
 
 

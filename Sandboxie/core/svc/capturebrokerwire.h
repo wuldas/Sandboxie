@@ -25,8 +25,22 @@
 
 
 #define CAPTURE_BROKER_SECTION_MAGIC       0x53424350u
-#define CAPTURE_BROKER_SECTION_VERSION     1
+#define CAPTURE_BROKER_SECTION_VERSION     2
 #define CAPTURE_BROKER_MAX_RECORD_CAPACITY 4096
+
+/* 1 = advertise packet capture when NetworkEnablePacketCapture is on.
+ * 0 = hard-disable packet start and capability bits. */
+#define CAPTURE_PACKET_CAPTURE_RELEASE_GATE 1
+
+
+static ULONG64 CaptureBroker_CalculateGeneration(
+    ULONG64 captureIdHigh, ULONG64 captureIdLow)
+{
+    const ULONG64 rotatedLow = (captureIdLow << 17) |
+        (captureIdLow >> 47);
+    return (captureIdHigh * 0x9E3779B185EBCA87ull) ^
+        rotatedLow ^ 0xC4CEB9FE1A85EC53ull;
+}
 
 #define CAPTURE_BROKER_STATE_STARTING      1
 #define CAPTURE_BROKER_STATE_RUNNING       2
@@ -43,6 +57,9 @@ typedef struct _CAPTURE_BROKER_SECTION {
     ULONG version;
     ULONG size;
     ULONG record_capacity;
+    ULONG64 capture_id_high;
+    ULONG64 capture_id_low;
+    ULONG64 generation;
     volatile ULONG write_index;
     volatile ULONG read_index;
     volatile LONG stop_requested;
@@ -76,6 +93,10 @@ static_assert(sizeof(CAPTURE_PACKET_RECORD) == 1600,
               "broker packet record size changed");
 static_assert(CAPTURE_BROKER_SECTION_BASE_SIZE % 8 == 0,
               "broker section header alignment changed");
+static_assert(FIELD_OFFSET(CAPTURE_BROKER_SECTION, error_status) == 56,
+              "broker error_status offset changed");
+static_assert(FIELD_OFFSET(CAPTURE_BROKER_SECTION, dropped_count) == 80,
+              "broker dropped_count offset changed");
 #endif
 
 

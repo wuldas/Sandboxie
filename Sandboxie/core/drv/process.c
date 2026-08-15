@@ -1709,8 +1709,23 @@ _FX void Process_NotifyImage(
         // initialize the filtering components
         //
 
-        if (!fail && !WFP_InitProcess(proc))
+        if (!fail) {
+            BOOLEAN wfpInitialized = FALSE;
+            for (ULONG retry = 0; retry < 5; ++retry) {
+                if (WFP_InitProcess(proc)) {
+                    wfpInitialized = TRUE;
+                    break;
+                }
+                if (retry != 4) {
+                    LARGE_INTEGER interval;
+                    interval.QuadPart = -10 * 10000;
+                    KeDelayExecutionThread(
+                        KernelMode, FALSE, &interval);
+                }
+            }
+            if (!wfpInitialized)
 			fail = 0x0B;
+        }
 
         if (!fail && !File_InitProcess(proc))
 			fail = 0x04;
@@ -1738,7 +1753,8 @@ _FX void Process_NotifyImage(
     // terminate process if initialization failed
     //
 
-    if (!fail && !Ipc_IsRunRestricted(proc)) {
+    BOOLEAN runRestricted = Ipc_IsRunRestricted(proc);
+    if (!fail && !runRestricted) {
 
         proc->initialized = TRUE;
 

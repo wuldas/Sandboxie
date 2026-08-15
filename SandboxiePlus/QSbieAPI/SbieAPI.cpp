@@ -3312,7 +3312,8 @@ SB_RESULT(SSbieCaptureSession) CSbieAPI::StartCapture(
 			SSbieCaptureStart::ePackets | SSbieCaptureStart::eHttps)) != 0 ||
 		Options.Mode == 0)
 		return SB_ERR(STATUS_INVALID_PARAMETER);
-	if (Options.Mode != SSbieCaptureStart::eConnections)
+	if (Options.Mode != SSbieCaptureStart::eConnections &&
+		Options.Mode != SSbieCaptureStart::ePackets)
 		return SB_ERR(STATUS_NOT_SUPPORTED);
 	if ((Options.Flags & ~(SSbieCaptureStart::eIncludeFutureProcesses |
 			SSbieCaptureStart::eIncludeLoopback)) != 0)
@@ -3619,6 +3620,131 @@ SB_RESULT(SSbieCaptureEvents) CSbieAPI::ReadCaptureEvents(
 
 	return Result;
 }
+
+#if 0
+SB_RESULT(SSbieCaptureRecords) CSbieAPI::ReadCapturePayload(
+	const SSbieCaptureId& CaptureId, quint32 MaxRecords, bool Stream)
+{
+	const quint32 MaximumRecords = Stream ?
+		CAPTURE_MAX_STREAM_ENTRIES : CAPTURE_MAX_PACKET_ENTRIES;
+	if (CaptureId.IsNull() || MaxRecords > MaximumRecords)
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+
+	CAPTURE_READ_PACKETS_REQ req = {};
+	req.v.h.length = sizeof(req);
+	req.v.h.msgid = Stream ? MSGID_CAPTURE_READ_STREAMS : MSGID_CAPTURE_READ_PACKETS;
+	req.v.wire_version = CAPTURE_WIRE_VERSION;
+	req.v.struct_size = sizeof(req);
+	req.capture_id.high = CaptureId.High;
+	req.capture_id.low = CaptureId.Low;
+	req.max_records = MaxRecords;
+
+	SScoped<CAPTURE_READ_PACKETS_RPL> rpl;
+	SB_STATUS Status = CallServer(&req.v.h, &rpl);
+	if (!Status || !rpl)
+		return Status;
+	if (rpl.Size() < sizeof(MSG_HEADER))
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	if (!NT_SUCCESS(rpl->h.status))
+		return SB_ERR(rpl->h.status);
+
+	const size_t HeaderSize = offsetof(CAPTURE_READ_PACKETS_RPL, records);
+	if (rpl.Size() < HeaderSize)
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+	Status = CSbieAPI__ValidateCaptureReply(
+		rpl->wire_version, rpl->struct_size, rpl.Size(), HeaderSize);
+	if (!Status)
+		return Status;
+	if (rpl->struct_size != HeaderSize ||
+		rpl->capture_id.high != CaptureId.High ||
+		rpl->capture_id.low != CaptureId.Low)
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+
+	const quint32 EffectiveMax = MaxRecords ? MaxRecords : MaximumRecords;
+	if (rpl->returned_records > EffectiveMax ||
+		rpl->returned_records > (rpl.Size() - HeaderSize) /
+			sizeof(CAPTURE_PACKET_EVENT) ||
+		rpl->remaining_records > CAPTURE_DRIVER_QUEUE_CAPACITY)
+		return SB_ERR(STATUS_INFO_LENGTH_MISMATCH);
+
+	SSbieCaptureRecords Result;
+	Result.Id = CaptureId;
+	Result.NextSequence = rpl->next_sequence;
+	Result.OldestSequence = rpl->oldest_sequence;
+	Result.NewestSequence = rpl->newest_sequence;
+	Result.DroppedCount = rpl->dropped_count;
+	Result.RemainingRecords = rpl->remaining_records;
+
+	quint64 PreviousSequence = 0;
+	for (ULONG index = 0; index < rpl->returned_records; ++index) {
+		const CAPTURE_PACKET_EVENT& Wire = rpl->records[index];
+		const bool ValidLayer = Stream ?
+			Wire.layer == CAPTURE_PACKET_LAYER_STREAM :
+			(Wire.layer == CAPTURE_PACKET_LAYER_TRANSPORT ||
+			 Wire.layer == CAPTURE_PACKET_LAYER_DATAGRAM);
+		if (!Wire.sequence ||
+			(PreviousSequence && Wire.sequence <= PreviousSequence) ||
+			!ValidLayer ||
+			(Wire.address_family != CAPTURE_ADDRESS_FAMILY_IPV4 &&
+			 Wire.address_family != CAPTURE_ADDRESS_FAMILY_IPV6) ||
+			(Wire.direction != CAPTURE_PACKET_DIRECTION_OUTBOUND &&
+			 Wire.direction != CAPTURE_PACKET_DIRECTION_INBOUND) ||
+			Wire.loopback > 1 ||
+			Wire.captured_length > CAPTURE_PACKET_SNAPLEN_MAX ||
+			Wire.original_length < Wire.captured_length ||
+			Wire.reserved1 || Wire.reserved2) {
+			return SB_ERR(STATUS_INVALID_PARAMETER);
+		}
+
+		SSbieCaptureRecord Record;
+		Record.Sequence = Wire.sequence;
+		Record.Timestamp = Wire.timestamp;
+		Record.ProcessCreateTime = Wire.process_create_time;
+		Record.ProcessId = Wire.process_id;
+		Record.SessionId = Wire.session_id;
+		Record.AddressFamily = Wire.address_family;
+		Record.Protocol = Wire.protocol;
+		Record.Direction = Wire.direction;
+		Record.Layer = Wire.layer;
+		Record.Loopback = Wire.loopback != 0;
+		Record.LocalPort = Wire.local_port;
+		Record.RemotePort = Wire.remote_port;
+		Record.OriginalLength = Wire.original_length;
+		Record.CapturedLength = Wire.captured_length;
+		const int AddressSize = Wire.address_family ==
+			CAPTURE_ADDRESS_FAMILY_IPV4 ? 4 : 16;
+		Record.LocalAddress = QByteArray(
+			reinterpret_cast<const char *>(Wire.local_address), AddressSize);
+		Record.RemoteAddress = QByteArray(
+			reinterpret_cast<const char *>(Wire.remote_address), AddressSize);
+		Record.Data = QByteArray(
+			reinterpret_cast<const char *>(Wire.data), Wire.captured_length);
+		Result.Records.append(Record);
+		PreviousSequence = Wire.sequence;
+	}
+
+	if (rpl->returned_records &&
+		Result.NextSequence != Result.Records.constLast().Sequence)
+		return SB_ERR(STATUS_INVALID_PARAMETER);
+
+	return Result;
+}
+
+
+SB_RESULT(SSbieCapturePackets) CSbieAPI::ReadCapturePackets(
+	const SSbieCaptureId& CaptureId, quint32 MaxRecords)
+{
+	return ReadCapturePayload(CaptureId, MaxRecords, false);
+}
+
+
+SB_RESULT(SSbieCaptureStreams) CSbieAPI::ReadCaptureStreams(
+	const SSbieCaptureId& CaptureId, quint32 MaxRecords)
+{
+	return ReadCapturePayload(CaptureId, MaxRecords, true);
+}
+#endif
+
 
 const QVector<CTraceEntryPtr>& CSbieAPI::GetTrace()
 { 

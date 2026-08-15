@@ -6,37 +6,18 @@ This document defines the architecture and delivery plan for sandbox-scoped
 network capture, optional HTTPS inspection, and a Model Context Protocol (MCP)
 interface.
 
-The first two implementation slices establish the versioned control plane and
-a bounded WFP ALE connection-audit backend. They do not claim packet-capture
-support: connection-audit records describe authorization attempts and contain
-no packet payload, TCP stream, TLS plaintext, or HTTP data.
+The initial control-plane and connection-audit slices are implemented. They do not claim packet-capture support: connection-audit records describe authorization attempts and contain no packet payload, TCP stream, TLS plaintext, or HTTP data.
 
 Current implementation status:
 
-- Phase 1 control wire, owner-scoped service sessions, QSbieAPI wrappers, and
-  the MCP stdio executable are implemented.
-- Phase 2 adds fixed-size nonpaged per-session driver queues for WFP ALE connect
-  and receive/accept authorization metadata. SbieSvc is the only driver drain
-  consumer and applies owner, box, SID, Windows-session, PID, and process-
-  creation-time isolation before returning records.
-- The service advertises `CAPTURE_CAP_CONNECTION_AUDIT` only while the WFP
-  backend is ready. WFP must be enabled through `NetworkEnableWFP` before the
-  driver starts; otherwise start returns `STATUS_DEVICE_NOT_READY`.
-- QSbieAPI and the MCP `capture_read_events` tool destructively drain at most
-  32 fixed 80-byte records per request. Driver retention is capped at 256
-  records per active capture and overflow only increments a drop counter.
-- Packet and HTTPS start requests still return `STATUS_NOT_SUPPORTED`.
-  PCAPNG/HAR export, payload capture, and TLS interception remain future
-  phases.
-- SandMan now has a Connection Audit view, menu entry, sandbox context-menu
-  action, and process context-menu action. It records authorization-attempt
-  metadata only. The view drains driver events into a bounded UI queue,
-  paints them in time-budgeted batches, can filter the visible table, and
-  can export the currently visible rows as UTF-8 CSV.
-- Live-driver Box A / Box B / host isolation was verified on a personal
-  test system. Process-churn was verified on the same host: later children
-  are included, host traffic is excluded, and process-scoped sessions stay
-  bound to PID plus creation time. OS-level PID reuse was not observed.
+- Phase 1 control wire, owner-scoped service sessions, QSbieAPI wrappers, and the MCP stdio executable are implemented.
+- Phase 2 adds fixed-size nonpaged per-session driver queues for WFP ALE connect and receive/accept authorization metadata. SbieSvc is the only driver drain consumer and applies owner, box, SID, Windows-session, PID, and process-creation-time isolation before returning records.
+- Slice 1–8 packet-capture infrastructure is present. `CAPTURE_PACKET_CAPTURE_RELEASE_GATE` is `1`: when `NetworkEnablePacketCapture=y` and the payload callouts registered, MCP advertises `packetCapture`/`pcapngExport` and public packet start is allowed. Setting the gate to `0` hard-disables those bits and returns `STATUS_NOT_SUPPORTED`.
+- The shared section is versioned and bound to capture ID plus generation. The driver locks the mapped view with an MDL for `DISPATCH_LEVEL` writes. Driver-owned capacity/write state is kept outside the broker-writable header; ring overwrites increment `section->dropped_count`. SbieSvc copies that counter into the public session and must not replace it with the connection-audit drop count on packet stop. The broker remains the only payload consumer and PCAPNG writer.
+- x64 live evidence on this host accepted: Box A / Box B / host isolation; IPv4/IPv6 TCP and UDP; loopback/snaplen/size/rotate/time limits; process-scope excludes later children; box-scope includes later children; broker-stalled overflow reports `droppedCount=904` for 5000 datagrams on a 4096 ring; broker kill yields `state=5` / `0xC0000001`; cross-SID and cross-session process-scoped starts return `0xC0000022`.
+- SandMan can start with or without `translations.7z`. Language and troubleshooting archives are extracted through `CArchive::ExtractToCache` onto a real directory; SandMan no longer constructs `QAbstractFileEngineHandler`. HTTPS inspection remains out of scope.
+- Connection Audit remains an independent path and must be rerun after every driver swap.
+
 
 ## Goals
 

@@ -77,6 +77,12 @@ int main()
     const size_t maximumListReply =
         offsetof(CAPTURE_LIST_RPL, sessions) +
         64 * sizeof(CAPTURE_SESSION_INFO);
+    const size_t maximumPacketReply =
+        offsetof(CAPTURE_READ_PACKETS_RPL, records) +
+        CAPTURE_MAX_PACKET_ENTRIES * sizeof(CAPTURE_PACKET_EVENT);
+    const size_t maximumStreamReply =
+        offsetof(CAPTURE_READ_STREAMS_RPL, records) +
+        CAPTURE_MAX_STREAM_ENTRIES * sizeof(CAPTURE_STREAM_EVENT);
 
     if (!Require(sizeof(CAPTURE_READ_EVENTS_REQ) <= CAPTURE_MAX_REQUEST_SIZE,
                  "event request exceeds service request limit") ||
@@ -84,6 +90,18 @@ int main()
                      "event reply exceeds Capture reply limit") ||
             !Require(maximumListReply <= CAPTURE_MAX_REPLY_SIZE,
                      "list reply exceeds Capture reply limit") ||
+            !Require(maximumPacketReply <= CAPTURE_MAX_REPLY_SIZE,
+                     "packet reply exceeds Capture reply limit") ||
+            !Require(maximumStreamReply <= CAPTURE_MAX_REPLY_SIZE,
+                     "stream reply exceeds Capture reply limit") ||
+            !Require(sizeof(CAPTURE_PACKET_EVENT) == 1600,
+                     "packet event size changed") ||
+            !Require(sizeof(CAPTURE_STREAM_EVENT) == 1600,
+                     "stream event size changed") ||
+            !Require(MSGID_CAPTURE_READ_PACKETS == 0x2008,
+                     "packet read msgid is not 0x2008") ||
+            !Require(MSGID_CAPTURE_READ_STREAMS == 0x2009,
+                     "stream read msgid is not 0x2009") ||
             !Require(CAPTURE_DRIVER_MAX_READ_EVENTS ==
                      CAPTURE_MAX_EVENT_ENTRIES,
                      "driver and service event batch limits differ") ||

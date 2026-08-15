@@ -7,6 +7,7 @@
 #include "ArchiveUpdater.h"
 
 #include "SplitFile.h"
+#include <QStandardPaths>
 
 #ifdef USE_7Z
 
@@ -171,6 +172,42 @@ bool CArchive::Extract(QString Path)
 	}
 
 	return Extract(&Files);
+}
+
+QString CArchive::ExtractToCache(const QString& ArchivePath)
+{
+	QFileInfo info(ArchivePath);
+	if (!info.exists() || !info.isFile())
+		return QString();
+
+	QString cacheRoot = QStandardPaths::writableLocation(QStandardPaths::CacheLocation);
+	if (cacheRoot.isEmpty())
+		cacheRoot = QDir::tempPath() + "/Sandboxie-Plus";
+
+	const QString stamp = QString::number(info.size()) + QLatin1Char('-') +
+		QString::number(info.lastModified().toMSecsSinceEpoch());
+	QString dest = cacheRoot + QLatin1String("/archive-cache/") +
+		info.completeBaseName() + QLatin1Char('-') + stamp + QLatin1Char('/');
+	const QString ready = dest + QLatin1String(".extracted");
+	if (QFile::exists(ready))
+		return dest;
+
+	QDir(dest).removeRecursively();
+	if (!QDir().mkpath(dest))
+		return QString();
+
+	CArchive archive(ArchivePath);
+	if (archive.Open() != ERR_7Z_OK || !archive.Extract(dest)) {
+		QDir(dest).removeRecursively();
+		return QString();
+	}
+
+	QFile marker(ready);
+	if (!marker.open(QIODevice::WriteOnly)) {
+		QDir(dest).removeRecursively();
+		return QString();
+	}
+	return dest;
 }
 
 bool CArchive::Extract(QMap<int, QIODevice*> *FileList, bool bDelete)

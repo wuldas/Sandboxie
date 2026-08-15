@@ -169,3 +169,53 @@ struct QSBIEAPI_EXPORT SSbieCaptureEvents
     quint32 RemainingEvents = 0;
     QList<SSbieCaptureEvent> Events;
 };
+
+
+struct QSBIEAPI_EXPORT SSbieCaptureRecord
+{
+    enum EAddressFamily
+    {
+        eIPv4 = 2,
+        eIPv6 = 23,
+    };
+
+    enum ELayer
+    {
+        eTransport = 1,
+        eStream = 2,
+        eDatagram = 3,
+    };
+
+    quint64 Sequence = 0;
+    quint64 Timestamp = 0;
+    quint64 ProcessCreateTime = 0;
+    quint32 ProcessId = 0;
+    quint32 SessionId = 0;
+    quint16 AddressFamily = 0;
+    quint8 Protocol = 0;
+    quint8 Direction = 0;
+    quint8 Layer = 0;
+    bool Loopback = false;
+    quint16 LocalPort = 0;
+    quint16 RemotePort = 0;
+    quint32 OriginalLength = 0;
+    quint32 CapturedLength = 0;
+    QByteArray LocalAddress;
+    QByteArray RemoteAddress;
+    QByteArray Data;
+};
+
+
+struct QSBIEAPI_EXPORT SSbieCaptureRecords
+{
+    SSbieCaptureId Id;
+    quint64 NextSequence = 0;
+    quint64 OldestSequence = 0;
+    quint64 NewestSequence = 0;
+    quint64 DroppedCount = 0;
+    quint32 RemainingRecords = 0;
+    QList<SSbieCaptureRecord> Records;
+};
+
+using SSbieCapturePackets = SSbieCaptureRecords;
+using SSbieCaptureStreams = SSbieCaptureRecords;

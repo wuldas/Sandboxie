@@ -16,7 +16,7 @@ public:
 
 	QString Tr(const QString& Text) { return m_Translation.value(Text, Text).toString(); }
 
-	static QString GetIssueDir(class C7zFileEngineHandler& IssueFS, QDateTime* pDate = NULL);
+	static QString GetIssueDir(QDateTime* pDate = NULL);
 
 signals:
 	void IssuesUpdated();

@@ -10,8 +10,9 @@
 #include "../QSbieAPI/SbieUtils.h"
 #include "OptionsWindow.h"
 #include "../OnlineUpdater.h"
-#include "../MiscHelpers/Archive/ArchiveFS.h"
+#include "../MiscHelpers/Archive/Archive.h"
 #include <QJsonDocument>
+#include <QOperatingSystemVersion>
 #include "../Helpers/StorageInfo.h"
 #include "../Wizards/TemplateWizard.h"
 #include "../AddonManager.h"
@@ -308,9 +309,10 @@ CSettingsWindow::CSettingsWindow(QWidget* parent)
 		ui.uiLang->addItem("No Translation (English)", "native"); // do not translate
 
 		QString langDir;
-		C7zFileEngineHandler LangFS("lang", this);
-		if (LangFS.Open(QApplication::applicationDirPath() + "/translations.7z"))
-			langDir = LangFS.Prefix() + "/";
+		const QString extracted = CArchive::ExtractToCache(
+			QApplication::applicationDirPath() + "/translations.7z");
+		if (!extracted.isEmpty())
+			langDir = extracted;
 		else
 			langDir = QApplication::applicationDirPath() + "/translations/";
 

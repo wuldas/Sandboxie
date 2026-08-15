@@ -26,6 +26,7 @@ public:
 
     bool IsCapturing() const { return !m_CaptureId.IsNull(); }
     void SetPreferredBox(const QString& BoxName);
+    void SetPreferredProcess(const QString& BoxName, quint32 ProcessId);
 
 public slots:
     void RefreshBoxes();
@@ -45,6 +46,9 @@ private:
     bool PacketBackendReady() const;
     void UpdateControls();
     void UpdateStatus(const QString& Message = QString());
+    void RefreshPacketRows();
+    void AppendRecords(const QList<SSbieCaptureRecord>& Records);
+    void AppendRecord(const SSbieCaptureRecord& Record);
     void CloseOutputFile();
     QString PreferredBoxName() const;
 
@@ -56,6 +60,8 @@ private:
     quint64 m_PacketCount;
     quint64 m_ByteCount;
     quint64 m_DroppedCount;
+    quint32 m_TargetScope;
+    quint32 m_TargetProcessId;
 
     QComboBox* m_pBoxCombo;
     QLineEdit* m_pOutputPath;

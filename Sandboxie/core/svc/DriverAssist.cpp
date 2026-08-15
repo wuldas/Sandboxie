@@ -568,8 +568,8 @@ void DriverAssist::CancelProcess(void *_msg)
     if (msg->reason == 0)
         SbieApi_LogEx(msg->session_id, 2314, msg->process_name);
 	else if (msg->reason != -1) // in this case we have SBIE1308 and don't want any other messages
-		SbieApi_LogEx(msg->session_id, 2314, L"%S [%d / %d]", msg->process_name, msg->process_id, msg->reason);
-}
+	SbieApi_LogEx(msg->session_id, 2314, L"%S [%d / %d]", msg->process_name, msg->process_id, msg->reason);
+	}
 
 
 extern void RestartHostInjectedSvcs();

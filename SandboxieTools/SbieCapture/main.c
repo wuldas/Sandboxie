@@ -25,7 +25,7 @@
 #include <wchar.h>
 
 
-static BOOL ParseUInt64(const WCHAR *text, ULONG64 *value)
+static BOOL ParseUInt64(const WCHAR *text, int base, ULONG64 *value)
 {
     WCHAR *end = NULL;
     unsigned __int64 parsed;
@@ -33,7 +33,7 @@ static BOOL ParseUInt64(const WCHAR *text, ULONG64 *value)
     if (! text || ! text[0])
         return FALSE;
     errno = 0;
-    parsed = _wcstoui64(text, &end, 0);
+    parsed = _wcstoui64(text, &end, base);
     if (errno || end == text || ! end || *end != L'\0')
         return FALSE;
     *value = (ULONG64)parsed;
@@ -70,6 +70,7 @@ static void PrintUsage(void)
 {
     fwprintf(stderr,
         L"Usage: SbieCapture.exe --section HANDLE --file HANDLE "
+        L"--capture-high N --capture-low N --generation N "
         L"[--stop-event HANDLE] [--snaplen N] [--max-file-bytes N] "
         L"[--max-seconds N] [--rotate-count N]\n");
 }
@@ -80,9 +81,15 @@ int __cdecl wmain(int argc, WCHAR **argv)
     ULONG64 rawSection = 0;
     ULONG64 rawFile = 0;
     ULONG64 rawStopEvent = 0;
+    ULONG64 rawCaptureHigh = 0;
+    ULONG64 rawCaptureLow = 0;
+    ULONG64 rawGeneration = 0;
     ULONG64 value = 0;
     BOOL haveSection = FALSE;
     BOOL haveFile = FALSE;
+    BOOL haveCaptureHigh = FALSE;
+    BOOL haveCaptureLow = FALSE;
+    BOOL haveGeneration = FALSE;
     HANDLE sectionHandle = NULL;
     HANDLE outputFile = NULL;
     HANDLE stopEvent = NULL;
@@ -95,41 +102,62 @@ int __cdecl wmain(int argc, WCHAR **argv)
     for (index = 1; index < argc; ++index) {
         const WCHAR *text = NULL;
         if (ReadOption(argc, argv, &index, L"--section", &text)) {
-            if (haveSection || ! ParseUInt64(text, &rawSection) ||
+            if (haveSection || ! ParseUInt64(text, 16, &rawSection) ||
                     rawSection == 0)
                 goto InvalidArguments;
             haveSection = TRUE;
         }
         else if (ReadOption(argc, argv, &index, L"--file", &text)) {
-            if (haveFile || ! ParseUInt64(text, &rawFile) ||
+            if (haveFile || ! ParseUInt64(text, 16, &rawFile) ||
                     rawFile == 0)
                 goto InvalidArguments;
             haveFile = TRUE;
         }
+        else if (ReadOption(argc, argv, &index, L"--capture-high", &text)) {
+            if (haveCaptureHigh ||
+                    ! ParseUInt64(text, 16, &rawCaptureHigh) ||
+                    rawCaptureHigh == 0)
+                goto InvalidArguments;
+            haveCaptureHigh = TRUE;
+        }
+        else if (ReadOption(argc, argv, &index, L"--capture-low", &text)) {
+            if (haveCaptureLow ||
+                    ! ParseUInt64(text, 16, &rawCaptureLow) ||
+                    rawCaptureLow == 0)
+                goto InvalidArguments;
+            haveCaptureLow = TRUE;
+        }
+        else if (ReadOption(argc, argv, &index, L"--generation", &text)) {
+            if (haveGeneration ||
+                    ! ParseUInt64(text, 16, &rawGeneration) ||
+                    rawGeneration == 0)
+                goto InvalidArguments;
+            haveGeneration = TRUE;
+        }
         else if (ReadOption(argc, argv, &index, L"--stop-event", &text)) {
-            if (stopEvent || ! ParseUInt64(text, &rawStopEvent) ||
+            if (stopEvent || ! ParseUInt64(text, 16, &rawStopEvent) ||
                     rawStopEvent == 0)
                 goto InvalidArguments;
             stopEvent = (HANDLE)(ULONG_PTR)rawStopEvent;
         }
         else if (ReadOption(argc, argv, &index, L"--snaplen", &text)) {
-            if (! ParseUInt64(text, &value) || value > 0xFFFFFFFFull)
+            if (! ParseUInt64(text, 0, &value) || value > 0xFFFFFFFFull)
                 goto InvalidArguments;
             snapLength = (ULONG)value;
         }
         else if (ReadOption(
                      argc, argv, &index, L"--max-file-bytes", &text)) {
-            if (! ParseUInt64(text, &value) || value > 0xFFFFFFFFull)
+            if (! ParseUInt64(text, 0, &value) || value > 0xFFFFFFFFull)
                 goto InvalidArguments;
             maxFileBytes = (ULONG)value;
         }
         else if (ReadOption(argc, argv, &index, L"--max-seconds", &text)) {
-            if (! ParseUInt64(text, &value) || value > 0xFFFFFFFFull)
+            if (! ParseUInt64(text, 0, &value) || value > 0xFFFFFFFFull)
                 goto InvalidArguments;
             maxSeconds = (ULONG)value;
         }
         else if (ReadOption(argc, argv, &index, L"--rotate-count", &text)) {
-            if (! ParseUInt64(text, &value) || value > 0xFFFFFFFFull)
+            if (! ParseUInt64(text, 0, &value) || value > 0xFFFFFFFFull)
                 goto InvalidArguments;
             rotateCount = (ULONG)value;
         }
@@ -143,7 +171,8 @@ int __cdecl wmain(int argc, WCHAR **argv)
         }
     }
 
-    if (! haveSection || ! haveFile)
+    if (! haveSection || ! haveFile || !haveCaptureHigh ||
+            !haveCaptureLow || !haveGeneration)
         goto InvalidArguments;
 
     sectionHandle = (HANDLE)(ULONG_PTR)rawSection;
@@ -165,6 +194,9 @@ int __cdecl wmain(int argc, WCHAR **argv)
     options.max_file_bytes = maxFileBytes;
     options.max_seconds = maxSeconds;
     options.rotate_count = rotateCount;
+    options.expected_capture_id_high = rawCaptureHigh;
+    options.expected_capture_id_low = rawCaptureLow;
+    options.expected_generation = rawGeneration;
 
     int status = CaptureBroker_Run(
         (CAPTURE_BROKER_SECTION *)mapped, &options);

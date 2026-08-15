@@ -25,7 +25,7 @@ These are not open questions. Do not re-litigate them while implementing.
 9. **New SandMan view.** `CPacketCaptureView` / `CPacketCaptureWindow`. Do not reuse `CCaptureView` or `CTraceEntry`. Do not change Connection Audit behaviour, filters, CSV, or context menus except to add *separate* Packet Capture actions.
 10. **QSbieAPI stays non-virtual.** Append fields to `SSbieCaptureStart` / add new non-virtual methods. Do not insert virtuals on `CSbieAPI`.
 11. **Wire v1 trailing fields.** Do not bump `CAPTURE_WIRE_VERSION` unless a breaking change is unavoidable. Old `CAPTURE_START_REQ` (112 bytes) must still start connection-audit.
-12. **Personal host constraints:** no ARM64 full link, no official driver signing, no `git reset` / `git clean`, no `DefaultBox` config edits, keep `NetworkEnableWFP=y`, do not use installed `Start.exe`, do not load parsers/OpenSSL into `SbieDrv`/`SbieSvc`.
+12. **Personal host constraints:** no ARM64 full link, no official driver signing, no `git reset` / `git clean`, keep `NetworkEnableWFP=y`, do not use installed `Start.exe`, and do not load parsers/OpenSSL into `SbieDrv`/`SbieSvc`. The user has explicitly authorized x64 driver replacement, reboot, and controlled `DefaultBox` changes for Slice 8; every live change still requires a rollback path and post-reboot hash check.
 
 ---
 
@@ -355,9 +355,9 @@ Deploy `SandMan.exe` **and** `QSbieAPI.dll` **and** `SbieCapture.exe` together. 
 11. Broker kill: session `FAILED`, no direct-policy change, ALE audit still works.
 12. Cross-SID / cross-session start still denied.
 
-**After those pass:** set the two capability bits when the packet backend is healthy. MCP `packetCapture` becomes true. SandMan Start enables. `CHANGELOG.md` and the status section of `Docs/SandboxCaptureMcp.md` are updated.
+**Live evidence (2026-08-15, x64, this host):** items 1–2 and 4–12 passed. Item 3 passed for “later boxed children do not appear” (process-scope PCAP comments contained only the target PID+createTime). A recycled-PID collision was not observed; the later child used a different PID. `CAPTURE_PACKET_CAPTURE_RELEASE_GATE` stays `1` so a healthy backend can advertise `packetCapture`/`pcapngExport`. Do not set the gate to `0` — that compiles packet start back to `STATUS_NOT_SUPPORTED`.
 
-Until Slice 8 passes, do not tell the user “能抓包了”.
+Capability bits are on when the packet backend is healthy. MCP `packetCapture` is true. SandMan Start can enable. HTTPS remains out of scope. SandMan no longer constructs Qt's private `QAbstractFileEngineHandler`; archives extract to a cache directory.
 
 ---
 

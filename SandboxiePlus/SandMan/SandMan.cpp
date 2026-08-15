@@ -27,7 +27,6 @@
 #include "../MiscHelpers/Common/OtherFunctions.h"
 #include "Windows/SupportDialog.h"
 #include "../MiscHelpers/Archive/Archive.h"
-#include "../MiscHelpers/Archive/ArchiveFS.h"
 #include "Views/FileView.h"
 #include "OnlineUpdater.h"
 #include "../MiscHelpers/Common/NeonEffect.h"
@@ -1563,6 +1562,7 @@ void CSandMan::CreateView(int iViewMode)
 		m_pTraceView = NULL;
 		m_pCaptureView = NULL;
 		m_pPacketCaptureView = NULL;
+		m_pPacketCaptureWindow = NULL;
 		m_pRecoveryLog = NULL;
 
 		return;
@@ -1670,6 +1670,7 @@ void CSandMan::CreateView(int iViewMode)
 		m_pTraceView = NULL;
 		m_pCaptureView = NULL;
 		m_pPacketCaptureView = NULL;
+		m_pPacketCaptureWindow = NULL;
 		m_pRecoveryLog = NULL;
 	}
 }
@@ -4560,16 +4561,58 @@ void CSandMan::OnPacketCapture()
         return;
     }
 
-    static CPacketCaptureWindow* pPacketWindow = NULL;
-    if (!pPacketWindow) {
-        pPacketWindow = new CPacketCaptureWindow();
-        connect(this, SIGNAL(Closed()), pPacketWindow, SLOT(close()));
-        connect(pPacketWindow, &CPacketCaptureWindow::Closed, [&]() {
-            pPacketWindow = NULL;
-        });
-        SafeShow(pPacketWindow);
+    if (m_pPacketCaptureWindow) {
+        SafeShow(m_pPacketCaptureWindow);
+        return;
     }
+
+    m_pPacketCaptureWindow = new CPacketCaptureWindow();
+    connect(this, SIGNAL(Closed()), m_pPacketCaptureWindow, SLOT(close()));
+    connect(m_pPacketCaptureWindow, &CPacketCaptureWindow::Closed, this, [this]() {
+        m_pPacketCaptureWindow = NULL;
+    });
+    SafeShow(m_pPacketCaptureWindow);
 }
+
+void CSandMan::OnBoxPacketCapture()
+{
+    QString BoxName;
+    if (m_pBoxView) {
+        QList<CSandBoxPtr> Boxes = m_pBoxView->GetSelectedBoxes();
+        if (Boxes.count() == 1 && !Boxes.first().isNull())
+            BoxName = Boxes.first()->GetName();
+    }
+
+    OnPacketCapture();
+
+    CPacketCaptureView* pView = m_pPacketCaptureView;
+    if (!pView && m_pPacketCaptureWindow)
+        pView = m_pPacketCaptureWindow->findChild<CPacketCaptureView*>();
+    if (pView)
+        pView->SetPreferredBox(BoxName);
+}
+
+
+void CSandMan::OnProcessPacketCapture()
+{
+    if (!m_pBoxView)
+        return;
+
+    QList<CBoxedProcessPtr> Processes = m_pBoxView->GetSelectedProcesses();
+    if (Processes.count() != 1 || Processes.first().isNull())
+        return;
+
+    const CBoxedProcessPtr Process = Processes.first();
+    OnPacketCapture();
+
+    CPacketCaptureView* pView = m_pPacketCaptureView;
+    if (!pView && m_pPacketCaptureWindow)
+        pView = m_pPacketCaptureWindow->findChild<CPacketCaptureView*>();
+    if (pView)
+        pView->SetPreferredProcess(
+            Process->GetBoxName(), Process->GetProcessId());
+}
+
 
 void CSandMan::OnBoxConnectionAudit()
 {
@@ -5054,12 +5097,14 @@ void CSandMan::LoadLanguage(const QString& Lang, const QString& Module, int Inde
 	QString LangAux = Lang; // Short version as fallback
 	LangAux.truncate(LangAux.lastIndexOf('_'));
 
-	QString LangDir;
-	C7zFileEngineHandler LangFS("lang", this);
-	if (LangFS.Open(QApplication::applicationDirPath() + "/translations.7z"))
-		LangDir = LangFS.Prefix() + "/";
-	else
-		LangDir = QApplication::applicationDirPath() + "/translations/";
+	QString LangDir = QApplication::applicationDirPath() + "/translations/";
+	const QString LangArchive =
+		QApplication::applicationDirPath() + "/translations.7z";
+	if (QFileInfo::exists(LangArchive)) {
+		const QString extracted = CArchive::ExtractToCache(LangArchive);
+		if (!extracted.isEmpty())
+			LangDir = extracted;
+	}
 
 	QString LangPath = LangDir + Module + "_";
 	bool bAux = false;

@@ -6,8 +6,10 @@
 #include "../QSbieAPI/SbieAPI.h"
 
 #include <QComboBox>
+#include <QDateTime>
 #include <QFileDialog>
 #include <QGridLayout>
+#include <QHostAddress>
 #include <QHBoxLayout>
 #include <QLabel>
 #include <QLineEdit>
@@ -20,6 +22,50 @@
 static const int PACKET_CAPTURE_MAX_ROWS = 2000;
 
 
+static QString PacketCapture_FormatAddress(
+    quint16 AddressFamily, const QByteArray& Address)
+{
+    if (AddressFamily == SSbieCaptureRecord::eIPv4 && Address.size() >= 4) {
+        return QStringLiteral("%1.%2.%3.%4")
+            .arg((quint8)Address[0])
+            .arg((quint8)Address[1])
+            .arg((quint8)Address[2])
+            .arg((quint8)Address[3]);
+    }
+
+    if (AddressFamily == SSbieCaptureRecord::eIPv6 && Address.size() >= 16) {
+        Q_IPV6ADDR Value;
+        memcpy(Value.c, Address.constData(), sizeof(Value.c));
+        return QHostAddress(Value).toString();
+    }
+
+    return Address.toHex();
+}
+
+
+static QString PacketCapture_FormatEndpoint(
+    quint16 AddressFamily,
+    const QByteArray& Address,
+    quint16 Port)
+{
+    const QString Host = PacketCapture_FormatAddress(AddressFamily, Address);
+    if (AddressFamily == SSbieCaptureRecord::eIPv6)
+        return QStringLiteral("[%1]:%2").arg(Host).arg(Port);
+    return QStringLiteral("%1:%2").arg(Host).arg(Port);
+}
+
+
+static QString PacketCapture_FormatTime(quint64 Timestamp)
+{
+    static const quint64 UnixEpochFileTime = 116444736000000000ULL;
+    if (Timestamp < UnixEpochFileTime)
+        return QString::number(Timestamp);
+    return QDateTime::fromMSecsSinceEpoch(
+        (Timestamp - UnixEpochFileTime) / 10000ULL).toString(
+            Qt::ISODateWithMs);
+}
+
+
 CPacketCaptureView::CPacketCaptureView(bool bStandAlone, QWidget* parent)
     : QWidget(parent),
       m_uTimerID(0),
@@ -27,7 +73,9 @@ CPacketCaptureView::CPacketCaptureView(bool bStandAlone, QWidget* parent)
       m_OutputHandle(0),
       m_PacketCount(0),
       m_ByteCount(0),
-      m_DroppedCount(0)
+      m_DroppedCount(0),
+      m_TargetScope(SSbieCaptureStart::eBox),
+      m_TargetProcessId(0)
 {
     Q_UNUSED(bStandAlone);
 
@@ -139,11 +187,26 @@ CPacketCaptureView::~CPacketCaptureView()
 
 void CPacketCaptureView::SetPreferredBox(const QString& BoxName)
 {
+    m_TargetScope = SSbieCaptureStart::eBox;
+    m_TargetProcessId = 0;
     if (BoxName.isEmpty())
         return;
     int index = m_pBoxCombo->findText(BoxName, Qt::MatchFixedString);
     if (index >= 0)
         m_pBoxCombo->setCurrentIndex(index);
+}
+
+
+void CPacketCaptureView::SetPreferredProcess(
+    const QString& BoxName, quint32 ProcessId)
+{
+    m_TargetScope = SSbieCaptureStart::eProcess;
+    m_TargetProcessId = ProcessId;
+    if (!BoxName.isEmpty()) {
+        int index = m_pBoxCombo->findText(BoxName, Qt::MatchFixedString);
+        if (index >= 0)
+            m_pBoxCombo->setCurrentIndex(index);
+    }
 }
 
 
@@ -307,9 +370,11 @@ void CPacketCaptureView::OnStart()
 
     SSbieCaptureStart options;
     options.BoxName = m_pBoxCombo->currentText();
-    options.Scope = SSbieCaptureStart::eBox;
+    options.Scope = m_TargetScope;
+    options.ProcessId = m_TargetProcessId;
     options.Mode = SSbieCaptureStart::ePackets;
-    options.Flags = SSbieCaptureStart::eIncludeFutureProcesses;
+    options.Flags = m_TargetScope == SSbieCaptureStart::eBox ?
+        SSbieCaptureStart::eIncludeFutureProcesses : 0;
     if (m_pLoopback->isChecked())
         options.Flags |= SSbieCaptureStart::eIncludeLoopback;
     options.SnapLength = m_pSnapLength->value();
@@ -372,6 +437,55 @@ void CPacketCaptureView::OnClear()
 }
 
 
+void CPacketCaptureView::AppendRecord(const SSbieCaptureRecord& Record)
+{
+    const int Row = m_pPackets->rowCount();
+    m_pPackets->insertRow(Row);
+
+    QString ProcessName;
+    if (theAPI) {
+        CBoxedProcessPtr Process = theAPI->GetProcessById(Record.ProcessId);
+        if (Process)
+            ProcessName = Process->GetProcessName();
+    }
+
+    m_pPackets->setItem(Row, 0,
+        new QTableWidgetItem(PacketCapture_FormatTime(Record.Timestamp)));
+    m_pPackets->setItem(Row, 1,
+        new QTableWidgetItem(QString::number(Record.ProcessId)));
+    m_pPackets->setItem(Row, 2, new QTableWidgetItem(ProcessName));
+    m_pPackets->setItem(Row, 3,
+        new QTableWidgetItem(QString::number(Record.Protocol)));
+    m_pPackets->setItem(Row, 4, new QTableWidgetItem(
+        PacketCapture_FormatEndpoint(
+            Record.AddressFamily, Record.LocalAddress, Record.LocalPort)));
+    m_pPackets->setItem(Row, 5, new QTableWidgetItem(
+        PacketCapture_FormatEndpoint(
+            Record.AddressFamily, Record.RemoteAddress, Record.RemotePort)));
+    m_pPackets->setItem(Row, 6,
+        new QTableWidgetItem(QString::number(Record.OriginalLength)));
+    m_pPackets->setItem(Row, 7,
+        new QTableWidgetItem(QString::number(Record.CapturedLength)));
+
+    while (m_pPackets->rowCount() > PACKET_CAPTURE_MAX_ROWS)
+        m_pPackets->removeRow(0);
+}
+
+
+void CPacketCaptureView::AppendRecords(
+    const QList<SSbieCaptureRecord>& Records)
+{
+    for (const SSbieCaptureRecord& Record : Records)
+        AppendRecord(Record);
+}
+
+
+void CPacketCaptureView::RefreshPacketRows()
+{
+    /* Payload rows must not be drained through SbieSvc LPC. */
+}
+
+
 void CPacketCaptureView::timerEvent(QTimerEvent* pEvent)
 {
     if (pEvent->timerId() != m_uTimerID || m_CaptureId.IsNull())
@@ -404,6 +518,7 @@ void CPacketCaptureView::timerEvent(QTimerEvent* pEvent)
         UpdateControls();
         return;
     }
+    RefreshPacketRows();
     UpdateStatus();
 }
 

@@ -56,6 +56,7 @@ extern DEVICE_OBJECT *Api_DeviceObject;
 #include <initguid.h>			// Used to define GUID's
 #include <fwpmk.h>				// Functions used for managing IKE and AuthIP main mode (MM) policy and security associations
 #include <fwpvi.h>				// Mappings of OS specific function versions (i.e. fn's that end in 0 or 1)
+#include "../svc/capturebrokerwire.h"
 #include "devguid.h"
 
 
@@ -248,6 +249,7 @@ void GetNetwork5TupleIndexesForLayer(
 
 
 BOOLEAN WFP_Enabled = FALSE;
+static BOOLEAN WFP_PayloadRegistered = FALSE;
 static PERESOURCE WFP_InitLock = NULL;
 
 static HANDLE WFP_state_handle = NULL;
@@ -303,9 +305,19 @@ static void WFP_UnregisterCalloutId(UINT32 *calloutId)
 }
 
 
-static BOOLEAN WFP_PayloadInspectionEnabled(void)
+static BOOLEAN WFP_PayloadConfigEnabled(void)
 {
+#if CAPTURE_PACKET_CAPTURE_RELEASE_GATE
+    return Conf_Get_Boolean(NULL, L"NetworkEnablePacketCapture", 0, FALSE);
+#else
     return FALSE;
+#endif
+}
+
+
+BOOLEAN WFP_IsPayloadInspectionEnabled(void)
+{
+    return WFP_PayloadRegistered;
 }
 
 
@@ -498,6 +510,8 @@ _FX BOOLEAN WFP_Install_Callbacks(void)
 	if (WFP_engine_handle != NULL)
 		return TRUE; // already initialized
 
+    WFP_PayloadRegistered = FALSE;
+
 	NTSTATUS status = STATUS_SUCCESS;
 	DWORD stage = 0;
 
@@ -532,7 +546,7 @@ _FX BOOLEAN WFP_Install_Callbacks(void)
 	stage = 0x43; if (!NT_SUCCESS(status)) goto Exit;
 	status = WFP_RegisterCallout(&WPF_RECV_CALLOUT_GUID_V6, &FWPM_LAYER_ALE_AUTH_RECV_ACCEPT_V6, &WFP_recv_callout_id_v6, &WFP_recv_filter_id_v6);
 	stage = 0x44; if (!NT_SUCCESS(status)) goto Exit;
-	if (WFP_PayloadInspectionEnabled()) {
+	if (WFP_PayloadConfigEnabled()) {
 	status = WFP_RegisterCalloutEx(
 		&WFP_FLOW_CALLOUT_GUID_V4,
 		&FWPM_LAYER_ALE_FLOW_ESTABLISHED_V4,
@@ -622,6 +636,7 @@ _FX BOOLEAN WFP_Install_Callbacks(void)
 	status = FwpmTransactionCommit(WFP_engine_handle);
 	stage = 0x50; if (!NT_SUCCESS(status)) goto Exit;
 	in_transaction = FALSE;
+    WFP_PayloadRegistered = WFP_PayloadConfigEnabled();
 
 	// Cleanup and handle any errors
 Exit:
@@ -652,6 +667,7 @@ Exit:
 			FwpmEngineClose(WFP_engine_handle);
 			WFP_engine_handle = NULL;
 		}
+        WFP_PayloadRegistered = FALSE;
 
 		return FALSE;
 	}
@@ -668,6 +684,7 @@ Exit:
 
 _FX void WFP_Uninstall_Callbacks(void)
 {
+    WFP_PayloadRegistered = FALSE;
 	if (WFP_engine_handle == NULL)
 		return; // not initialized
 
@@ -875,10 +892,10 @@ BOOLEAN WFP_InitProcess(PROCESS* proc)
 		return TRUE; // nothing to do
 
 	if (WFP_engine_handle == NULL)
-		return FALSE; // WFP was not ready report failure, cancel process creation
+	    return FALSE; // WFP was not ready report failure, cancel process creation
 
 	BOOLEAN ok = TRUE;
-	KIRQL irql; 
+	KIRQL irql;
 
 	WFP_PROCESS* wfp_proc = WFP_Alloc(NULL, sizeof(WFP_PROCESS));
 	if (wfp_proc == NULL) {
@@ -909,10 +926,10 @@ BOOLEAN WFP_InitProcess(PROCESS* proc)
 #endif
 
 	if(map_get(&WFP_Processes, wfp_proc->ProcessId) != NULL)
-		ok = FALSE; // that would be a duplicate, should not happen, but in case
+	    ok = FALSE; // that would be a duplicate, should not happen, but in case
 	else if (!map_insert(&WFP_Processes, wfp_proc->ProcessId, wfp_proc, 0))
-		ok = FALSE;
-    
+	    ok = FALSE;
+
 	KeReleaseSpinLock(&WFP_MapLock, irql);
 
 finish:
@@ -1438,36 +1455,130 @@ static BOOLEAN WFP_BuildPacketRecord(
 }
 
 
-static ULONG WFP_CopyNetBufferList(
-    void *layerData,
+static BOOLEAN WFP_IsInboundTransportLayer(UINT16 layerId)
+{
+    return layerId == FWPS_LAYER_INBOUND_TRANSPORT_V4 ||
+        layerId == FWPS_LAYER_INBOUND_TRANSPORT_V6;
+}
+
+
+static ULONG WFP_CopyNetBuffer(
+    const FWPS_INCOMING_VALUES *fixedValues,
+    const FWPS_INCOMING_METADATA_VALUES *metadata,
+    NET_BUFFER *netBuffer,
     UCHAR *buffer,
     ULONG capacity,
     ULONG *originalLength)
 {
     if (originalLength)
         *originalLength = 0;
-    if (! layerData || ! buffer || ! capacity)
+    if (! fixedValues || ! netBuffer || ! buffer || ! capacity)
         return 0;
 
-    NET_BUFFER_LIST *list = (NET_BUFFER_LIST *)layerData;
-    NET_BUFFER *netBuffer = NET_BUFFER_LIST_FIRST_NB(list);
-    if (! netBuffer)
-        return 0;
+    BOOLEAN retreated = FALSE;
+    ULONG retreatSize = 0;
+    if (WFP_IsInboundTransportLayer(fixedValues->layerId)) {
+        if (! metadata || ! FWPS_IS_METADATA_FIELD_PRESENT(
+                metadata, FWPS_METADATA_FIELD_TRANSPORT_HEADER_SIZE) ||
+                ! metadata->transportHeaderSize) {
+            return 0;
+        }
+        retreatSize = metadata->transportHeaderSize;
+        if (NdisRetreatNetBufferDataStart(
+                netBuffer, retreatSize, 0, NULL) != NDIS_STATUS_SUCCESS) {
+            return 0;
+        }
+        retreated = TRUE;
+    }
 
+    ULONG capturedLength = 0;
     ULONG available = NET_BUFFER_DATA_LENGTH(netBuffer);
     if (originalLength)
         *originalLength = available;
     ULONG copyLength = available < capacity ? available : capacity;
-    if (! copyLength)
+    if (copyLength) {
+        PVOID source = NdisGetDataBuffer(
+            netBuffer, copyLength, buffer, 1, 0);
+        if (source) {
+            if (source != buffer)
+                RtlCopyMemory(buffer, source, copyLength);
+            capturedLength = copyLength;
+        }
+    }
+
+    if (retreated)
+        NdisAdvanceNetBufferDataStart(netBuffer, retreatSize, FALSE, NULL);
+    return capturedLength;
+}
+
+
+static void WFP_RecordNetBufferList(
+    const FWPS_INCOMING_VALUES *fixedValues,
+    const FWPS_INCOMING_METADATA_VALUES *metadata,
+    void *layerData,
+    UINT64 flowContext,
+    UCHAR layer)
+{
+    if (! fixedValues || ! layerData || ! flowContext)
+        return;
+
+    NET_BUFFER_LIST *list = (NET_BUFFER_LIST *)layerData;
+    while (list) {
+        NET_BUFFER *netBuffer = NET_BUFFER_LIST_FIRST_NB(list);
+        while (netBuffer) {
+            UCHAR buffer[CAPTURE_PACKET_SNAPLEN_MAX];
+            ULONG originalLength = 0;
+            ULONG capturedLength = WFP_CopyNetBuffer(
+                fixedValues,
+                metadata,
+                netBuffer,
+                buffer,
+                sizeof(buffer),
+                &originalLength);
+            if (capturedLength) {
+                Capture_RecordPayloadByFlow(
+                    flowContext,
+                    buffer,
+                    capturedLength,
+                    originalLength,
+                    layer);
+            }
+            netBuffer = NET_BUFFER_NEXT_NB(netBuffer);
+        }
+        list = NET_BUFFER_LIST_NEXT_NBL(list);
+    }
+}
+
+
+static UINT64 WFP_AssociateCaptureContext(
+    const CAPTURE_FILTER_IDENTITY *identity,
+    const CAPTURE_PACKET_RECORD *templateRecord,
+    UINT64 flowHandle,
+    UINT16 layerId,
+    UINT32 calloutId,
+    UCHAR direction)
+{
+    if (! identity || ! templateRecord || ! flowHandle || ! calloutId)
         return 0;
 
-    PVOID source = NdisGetDataBuffer(
-        netBuffer, copyLength, buffer, 1, 0);
-    if (! source)
+    CAPTURE_PACKET_RECORD record = *templateRecord;
+    record.direction = direction;
+    UINT64 context = Capture_CreateFlowContext(
+        identity, &record, flowHandle, layerId, calloutId);
+    if (! context)
+        return Capture_LookupFlowContext(flowHandle, layerId, calloutId);
+
+    NTSTATUS status = FwpsFlowAssociateContext(
+        flowHandle, layerId, calloutId, context);
+    if (status == STATUS_FWP_ALREADY_EXISTS) {
+        Capture_DeleteFlowContext(context);
+        return Capture_LookupFlowContext(flowHandle, layerId, calloutId);
+    }
+    if (! NT_SUCCESS(status)) {
+        Capture_DeleteFlowContext(context);
         return 0;
-    if (source != buffer)
-        RtlCopyMemory(buffer, source, copyLength);
-    return copyLength;
+    }
+    return context;
 }
 
 
@@ -1504,27 +1615,50 @@ static void NTAPI WFP_flow_classify(
         return;
     }
 
+    record.process_create_time = identity.process_create_time;
+    record.process_id = identity.process_id;
+    record.session_id = identity.session_id;
     identity.loopback = record.loopback;
 
-    UINT32 calloutId = inFixedValues->layerId ==
-            FWPS_LAYER_ALE_FLOW_ESTABLISHED_V4 ?
-        WFP_flow_callout_id_v4 : WFP_flow_callout_id_v6;
-    UINT64 context = Capture_CreateFlowContext(
+    const BOOLEAN v6 = inFixedValues->layerId ==
+        FWPS_LAYER_ALE_FLOW_ESTABLISHED_V6;
+    WFP_AssociateCaptureContext(
         &identity,
         &record,
         inMetaValues->flowHandle,
-        inFixedValues->layerId,
-        calloutId);
-    if (! context)
-        return;
-
-    NTSTATUS status = FwpsFlowAssociateContext(
+        v6 ? FWPS_LAYER_OUTBOUND_TRANSPORT_V6 :
+             FWPS_LAYER_OUTBOUND_TRANSPORT_V4,
+        v6 ? WFP_transport_out_callout_id_v6 :
+             WFP_transport_out_callout_id_v4,
+        CAPTURE_PACKET_DIRECTION_OUTBOUND);
+    WFP_AssociateCaptureContext(
+        &identity,
+        &record,
         inMetaValues->flowHandle,
-        inFixedValues->layerId,
-        calloutId,
-        context);
-    if (! NT_SUCCESS(status))
-        Capture_DeleteFlowContext(context);
+        v6 ? FWPS_LAYER_INBOUND_TRANSPORT_V6 :
+             FWPS_LAYER_INBOUND_TRANSPORT_V4,
+        v6 ? WFP_transport_in_callout_id_v6 :
+             WFP_transport_in_callout_id_v4,
+        CAPTURE_PACKET_DIRECTION_INBOUND);
+
+    if (record.protocol == IPPROTO_TCP) {
+        WFP_AssociateCaptureContext(
+            &identity,
+            &record,
+            inMetaValues->flowHandle,
+            v6 ? FWPS_LAYER_STREAM_V6 : FWPS_LAYER_STREAM_V4,
+            v6 ? WFP_stream_callout_id_v6 : WFP_stream_callout_id_v4,
+            record.direction);
+    }
+    else if (record.protocol == IPPROTO_UDP) {
+        WFP_AssociateCaptureContext(
+            &identity,
+            &record,
+            inMetaValues->flowHandle,
+            v6 ? FWPS_LAYER_DATAGRAM_DATA_V6 : FWPS_LAYER_DATAGRAM_DATA_V4,
+            v6 ? WFP_datagram_callout_id_v6 : WFP_datagram_callout_id_v4,
+            record.direction);
+    }
 }
 
 
@@ -1537,27 +1671,74 @@ static void NTAPI WFP_transport_classify(
     UINT64 flowContext,
     FWPS_CLASSIFY_OUT *classifyOut)
 {
-    UNREFERENCED_PARAMETER(inFixedValues);
-    UNREFERENCED_PARAMETER(inMetaValues);
     UNREFERENCED_PARAMETER(classifyContext);
     UNREFERENCED_PARAMETER(filter);
     UNREFERENCED_PARAMETER(classifyOut);
 
-    if (! flowContext)
-        return;
+    if (! flowContext && inFixedValues && inMetaValues &&
+            FWPS_IS_METADATA_FIELD_PRESENT(
+                inMetaValues, FWPS_METADATA_FIELD_FLOW_HANDLE)) {
+        UINT32 calloutId = 0;
+        UCHAR direction = CAPTURE_PACKET_DIRECTION_OUTBOUND;
 
-    UCHAR buffer[CAPTURE_PACKET_SNAPLEN_MAX];
-    ULONG originalLength;
-    ULONG capturedLength = WFP_CopyNetBufferList(
-        layerData, buffer, sizeof(buffer), &originalLength);
-    if (capturedLength) {
-        Capture_RecordPayloadByFlow(
-            flowContext,
-            buffer,
-            capturedLength,
-            originalLength,
-            CAPTURE_PACKET_LAYER_TRANSPORT);
+        if (inFixedValues->layerId == FWPS_LAYER_INBOUND_TRANSPORT_V4) {
+            calloutId = WFP_transport_in_callout_id_v4;
+            direction = CAPTURE_PACKET_DIRECTION_INBOUND;
+        }
+        else if (inFixedValues->layerId == FWPS_LAYER_INBOUND_TRANSPORT_V6) {
+            calloutId = WFP_transport_in_callout_id_v6;
+            direction = CAPTURE_PACKET_DIRECTION_INBOUND;
+        }
+        else if (inFixedValues->layerId == FWPS_LAYER_OUTBOUND_TRANSPORT_V4) {
+            calloutId = WFP_transport_out_callout_id_v4;
+        }
+        else if (inFixedValues->layerId == FWPS_LAYER_OUTBOUND_TRANSPORT_V6) {
+            calloutId = WFP_transport_out_callout_id_v6;
+        }
+
+        if (calloutId) {
+            flowContext = Capture_LookupFlowContext(
+                inMetaValues->flowHandle,
+                inFixedValues->layerId,
+                calloutId);
+        }
+
+        if (! flowContext && calloutId) {
+            CAPTURE_FILTER_IDENTITY identity;
+            CAPTURE_PACKET_RECORD record;
+            if (WFP_GetCaptureIdentity(inMetaValues, &identity) &&
+                    WFP_BuildPacketRecord(
+                        inFixedValues, direction,
+                        CAPTURE_PACKET_LAYER_TRANSPORT, &record)) {
+                record.process_create_time = identity.process_create_time;
+                record.process_id = identity.process_id;
+                record.session_id = identity.session_id;
+                identity.loopback = record.loopback;
+                flowContext = WFP_AssociateCaptureContext(
+                    &identity,
+                    &record,
+                    inMetaValues->flowHandle,
+                    inFixedValues->layerId,
+                    calloutId,
+                    direction);
+            }
+        }
     }
+
+    if (! flowContext) {
+        CAPTURE_FILTER_IDENTITY identity;
+        if (inMetaValues &&
+                WFP_GetCaptureIdentity(inMetaValues, &identity))
+            Capture_CountDroppedIdentity(&identity);
+        return;
+    }
+
+    WFP_RecordNetBufferList(
+        inFixedValues,
+        inMetaValues,
+        layerData,
+        flowContext,
+        CAPTURE_PACKET_LAYER_TRANSPORT);
 }
 
 
@@ -1622,18 +1803,12 @@ static void NTAPI WFP_datagram_classify(
     if (! flowContext)
         return;
 
-    UCHAR buffer[CAPTURE_PACKET_SNAPLEN_MAX];
-    ULONG originalLength;
-    ULONG capturedLength = WFP_CopyNetBufferList(
-        layerData, buffer, sizeof(buffer), &originalLength);
-    if (capturedLength) {
-        Capture_RecordPayloadByFlow(
-            flowContext,
-            buffer,
-            capturedLength,
-            originalLength,
-            CAPTURE_PACKET_LAYER_DATAGRAM);
-    }
+    WFP_RecordNetBufferList(
+        inFixedValues,
+        inMetaValues,
+        layerData,
+        flowContext,
+        CAPTURE_PACKET_LAYER_DATAGRAM);
 }
 
 

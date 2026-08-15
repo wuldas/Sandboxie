@@ -18,6 +18,10 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 - added a Connection Audit Save action that exports the currently visible rows as UTF-8 CSV metadata, not packet capture
 - added a bounded Connection Audit UI queue so high-rate connect floods (for example a sandboxed download client) drain from the driver without painting every row immediately
 - verified Connection Audit process-churn on a personal host: later boxed children appear in a box-scoped session, host traffic does not, and a process-scoped session stays bound to PID plus creation time after the target exits
+- added passive packet capture to PCAPNG through `SbieCapture.exe` when `NetworkEnablePacketCapture=y`; MCP advertises `packetCapture`/`pcapngExport`, and SandMan has a separate Packet Capture view
+- added driver-owned ring overwrite counting so a stalled broker reports public `droppedCount` instead of stopping at ring capacity
+- verified packet-capture isolation on a personal host: Box A / Box B / host traffic stay separate, process-scope excludes later children, box-scope includes them, broker kill fails the session, and cross-SID / cross-session starts are denied
+- changed SandMan language and troubleshooting archives to extract through `CArchive` into a cache directory instead of Qt's private `QAbstractFileEngineHandler`, which crashed on Qt 6.8.3
 
 ### Changed
 - changed SandMan's Auto Expand Tree to temporarily expand box groups, sandboxes, and process branches without overwriting their saved manual expansion states; set the SandMan UI configuration option `Options/LegacyAutoExpandTree=true` to retain the previous expand-all/collapse-all behaviour [#5491](https://github.com/sandboxie-plus/Sandboxie/pull/5491)

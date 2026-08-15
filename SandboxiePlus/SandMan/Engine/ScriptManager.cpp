@@ -11,7 +11,6 @@
 #include "../MiscHelpers/Common/OtherFunctions.h"
 
 #include "../MiscHelpers/Archive/Archive.h"
-#include "../MiscHelpers/Archive/ArchiveFS.h"
 
 #include "../Wizards/BoxAssistant.h"
 
@@ -44,8 +43,12 @@ CScriptManager::CScriptManager(QObject* parent)
 
 QString CScriptManager::GetScript(const QString& Name)
 {
-	C7zFileEngineHandler IssueFS("issue");
-	QString Root = GetIssueDir(IssueFS);
+	QString Root = theConf->GetConfigDir() + "/troubleshooting/";
+	if (!QFile::exists(Root)) {
+		Root = GetIssueDir();
+		if (!QFile::exists(Root))
+			return QString();
+	}
 
 	foreach(const QString &Path, ListDir(Root, QStringList() << "*.js")) {
 		if (Path.right(Name.length() + 3) == Name + ".js") {
@@ -61,8 +64,7 @@ void CScriptManager::LoadIssues()
     // Load Issues, when the user has an own troubleshooting folder, don't load the 7z or online
     //
 
-    C7zFileEngineHandler IssueFS("issue");
-    LoadIssues(GetIssueDir(IssueFS, &m_IssueDate));
+    LoadIssues(GetIssueDir(&m_IssueDate));
     if (m_IssueDate.isValid()) {
         if (theConf->GetInt("Options/CheckForIssues", 2) == 1) {
 
@@ -183,25 +185,35 @@ void CScriptManager::LoadIssues(const QString& IssueDir)
     }
 }
 
-QString CScriptManager::GetIssueDir(C7zFileEngineHandler& IssueFS, QDateTime* pDate)
+QString CScriptManager::GetIssueDir(QDateTime* pDate)
 {
     QString IssueDir = theConf->GetConfigDir() + "/troubleshooting/";
-    if (!QFile::exists(IssueDir)) {
+    if (QFile::exists(IssueDir))
+        return IssueDir;
 
-        QFileInfo Installed(QApplication::applicationDirPath() + "/troubleshooting.7z");
-        QFileInfo Latest(theConf->GetConfigDir() + "/troubleshooting.7z");
-        quint64 latest = Latest.lastModified().toSecsSinceEpoch();
-        quint64 installed = Installed.lastModified().toSecsSinceEpoch();
-        if (latest >= installed && IssueFS.Open(theConf->GetConfigDir() + "/troubleshooting.7z")) {
-            IssueDir = IssueFS.Prefix() + "/";
-            if(pDate) *pDate = Latest.lastModified();
-        }
-        else if (IssueFS.Open(QApplication::applicationDirPath() + "/troubleshooting.7z")) {
-            IssueDir = IssueFS.Prefix() + "/";
-            if(pDate) *pDate = Installed.lastModified();
-        }
+    QFileInfo Installed(QApplication::applicationDirPath() + "/troubleshooting.7z");
+    QFileInfo Latest(theConf->GetConfigDir() + "/troubleshooting.7z");
+    const quint64 latest = Latest.exists() ? Latest.lastModified().toSecsSinceEpoch() : 0;
+    const quint64 installed = Installed.exists() ? Installed.lastModified().toSecsSinceEpoch() : 0;
+    QString archive;
+    QDateTime date;
+    if (Latest.exists() && latest >= installed) {
+        archive = Latest.absoluteFilePath();
+        date = Latest.lastModified();
     }
-    return IssueDir;
+    else if (Installed.exists()) {
+        archive = Installed.absoluteFilePath();
+        date = Installed.lastModified();
+    }
+    if (archive.isEmpty())
+        return IssueDir;
+
+    const QString extracted = CArchive::ExtractToCache(archive);
+    if (extracted.isEmpty())
+        return IssueDir;
+    if (pDate)
+        *pDate = date;
+    return extracted;
 }
 
 void CScriptManager::OnUpdateData(const QVariantMap& Data, const QVariantMap& Params)
@@ -239,15 +251,14 @@ void CScriptManager::OnDownload(const QString& Path, const QVariantMap& Params)
     QFile::rename(Path, FinalPath);
 
 
-	QString IssueDir;
-    C7zFileEngineHandler IssueFS("issue");
-    if (!IssueFS.Open(FinalPath)) {
+	QString IssueDir = CArchive::ExtractToCache(FinalPath);
+    if (IssueDir.isEmpty()) {
         QMessageBox::critical(theGUI, "Sandboxie-Plus", tr("Downloaded troubleshooting instructions are corrupted!"));
         QFile::remove(Path);
         return;
     }
     
-    LoadIssues(IssueFS.Prefix() + "/");
+    LoadIssues(IssueDir);
 
     emit IssuesUpdated();
 }

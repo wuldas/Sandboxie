@@ -22,6 +22,7 @@ class CSbieTemplatesEx;
 class CTraceView;
 class CCaptureView;
 class CPacketCaptureView;
+class CPacketCaptureWindow;
 class CScriptManager;
 class CAddonManager;
 
@@ -220,6 +221,8 @@ public slots:
 	void				UpdateSettings(bool bRebuildUI);
 	void				OnBoxConnectionAudit();
 	void				OnProcessConnectionAudit();
+	void				OnBoxPacketCapture();
+	void				OnProcessPacketCapture();
 	void				RebuildUI();
 	void				OnIniReloaded();
 
@@ -383,6 +386,7 @@ private:
 	CTraceView*			m_pTraceView;
 	CCaptureView*		m_pCaptureView;
 	CPacketCaptureView*	m_pPacketCaptureView;
+	CPacketCaptureWindow*	m_pPacketCaptureWindow;
 	CPanelWidgetEx*		m_pRecoveryLog;
 	class CRecoveryLogWnd* m_pRecoveryLogWnd;
 

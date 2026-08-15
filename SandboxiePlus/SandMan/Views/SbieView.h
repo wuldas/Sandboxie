@@ -211,6 +211,7 @@ private:
 	QAction*				m_pMenuPresetsForce;
 	QAction*				m_pMenuOptions;
 	QAction*				m_pMenuCapture;
+	QAction*				m_pMenuPacketCapture;
 	QAction*				m_pMenuSnapshots;
 	QAction*				m_pMenuEmptyBox;
 	QMenu*					m_pMenuContent;
@@ -238,6 +239,7 @@ private:
 
 	QAction*				m_pMenuTerminate;
 	QAction*				m_pMenuProcCapture;
+	QAction*				m_pMenuProcPacketCapture;
 	QAction*				m_pMenuLinkTo;
 	QMenu*					m_pMenuPreset;
 	QAction*				m_pMenuBlackList;

@@ -27,6 +27,9 @@
 #include "wfp.h"
 #include "../svc/capturebrokerwire.h"
 
+NTSTATUS NTAPI FwpsFlowRemoveContext0(
+    UINT64 flowId, UINT16 layerId, UINT32 calloutId);
+
 
 #define CAPTURE_MAX_FLOW_CONTEXTS 4096
 
@@ -48,7 +51,10 @@ typedef struct _CAPTURE_SESSION {
     HANDLE section_kernel_handle;
     PVOID section_object;
     CAPTURE_BROKER_SECTION *section_system_address;
+    PMDL section_mdl;
     SIZE_T section_view_size;
+    ULONG shared_write_index;
+    ULONG64 shared_sequence;
     CAPTURE_FILTER_PROCESS_KEY initial_processes[1];
 
 } CAPTURE_SESSION;
@@ -57,10 +63,15 @@ typedef struct _CAPTURE_SESSION {
 typedef struct _CAPTURE_FLOW_CONTEXT {
 
     LIST_ENTRY link;
+    LIST_ENTRY retire_link;
     UINT64 flow_id;
     UINT16 layer_id;
     UINT32 callout_id;
+    BOOLEAN retiring;
+    CAPTURE_DRIVER_SESSION_ID capture_id;
     CAPTURE_FILTER_IDENTITY identity;
+    LONG retire_refs;
+    BOOLEAN wfp_deleted;
     CAPTURE_PACKET_RECORD template_record;
 
 } CAPTURE_FLOW_CONTEXT;
@@ -78,6 +89,10 @@ static LIST_ENTRY Capture_Sessions;
 static ULONG Capture_SessionCount = 0;
 static LIST_ENTRY Capture_Flows;
 static ULONG Capture_FlowCount = 0;
+
+
+static void Capture_RetireFlowsForSession(
+    const CAPTURE_DRIVER_SESSION_ID *captureId, BOOLEAN all);
 
 
 //---------------------------------------------------------------------------
@@ -217,6 +232,30 @@ static NTSTATUS Capture_CreateSharedSection(
         return NT_SUCCESS(status) ? STATUS_INVALID_BUFFER_SIZE : status;
     }
 
+    PMDL sectionMdl = IoAllocateMdl(
+        baseAddress, sectionSize, FALSE, FALSE, NULL);
+    if (! sectionMdl) {
+        MmUnmapViewInSystemSpace(baseAddress);
+        ObDereferenceObject(sectionObject);
+        ZwClose(sectionHandle);
+        return STATUS_INSUFFICIENT_RESOURCES;
+    }
+
+    __try {
+        MmProbeAndLockPages(sectionMdl, KernelMode, IoModifyAccess);
+        status = STATUS_SUCCESS;
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        status = GetExceptionCode();
+    }
+    if (! NT_SUCCESS(status)) {
+        IoFreeMdl(sectionMdl);
+        MmUnmapViewInSystemSpace(baseAddress);
+        ObDereferenceObject(sectionObject);
+        ZwClose(sectionHandle);
+        return status;
+    }
+
     CAPTURE_BROKER_SECTION *shared =
         (CAPTURE_BROKER_SECTION *)baseAddress;
     RtlZeroMemory(shared, viewSize);
@@ -224,6 +263,10 @@ static NTSTATUS Capture_CreateSharedSection(
     shared->version = CAPTURE_BROKER_SECTION_VERSION;
     shared->size = sectionSize;
     shared->record_capacity = CAPTURE_BROKER_MAX_RECORD_CAPACITY;
+    shared->capture_id_high = session->capture_id.high;
+    shared->capture_id_low = session->capture_id.low;
+    shared->generation = CaptureBroker_CalculateGeneration(
+        session->capture_id.high, session->capture_id.low);
     RtlCopyMemory(
         shared->box_name,
         session->target.box_name,
@@ -236,7 +279,10 @@ static NTSTATUS Capture_CreateSharedSection(
     session->section_kernel_handle = sectionHandle;
     session->section_object = sectionObject;
     session->section_system_address = shared;
+    session->section_mdl = sectionMdl;
     session->section_view_size = viewSize;
+    session->shared_write_index = 0;
+    session->shared_sequence = 0;
     return STATUS_SUCCESS;
 }
 
@@ -245,6 +291,11 @@ static void Capture_DestroySharedSection(CAPTURE_SESSION *session)
 {
     if (! session)
         return;
+    if (session->section_mdl) {
+        MmUnlockPages(session->section_mdl);
+        IoFreeMdl(session->section_mdl);
+        session->section_mdl = NULL;
+    }
     if (session->section_system_address) {
         MmUnmapViewInSystemSpace(session->section_system_address);
         session->section_system_address = NULL;
@@ -302,11 +353,13 @@ static void Capture_ReleaseAll(BOOLEAN unloading)
     }
     Capture_SessionCount = 0;
 
-    while (! IsListEmpty(&Capture_Flows)) {
-        PLIST_ENTRY entry = RemoveHeadList(&Capture_Flows);
-        InsertTailList(&staleFlows, entry);
+    if (unloading) {
+        while (! IsListEmpty(&Capture_Flows)) {
+            PLIST_ENTRY entry = RemoveHeadList(&Capture_Flows);
+            InsertTailList(&staleFlows, entry);
+        }
+        Capture_FlowCount = 0;
     }
-    Capture_FlowCount = 0;
 
     if (unloading)
         Capture_Initialized = FALSE;
@@ -389,6 +442,15 @@ static NTSTATUS Capture_Start(const CAPTURE_DRIVER_CONTROL *control)
     NTSTATUS status = Capture_ValidateStartControl(control);
     if (! NT_SUCCESS(status))
         return status;
+
+    if (control->flags & CAPTURE_DRIVER_FLAG_INCLUDE_PAYLOAD) {
+#if CAPTURE_PACKET_CAPTURE_RELEASE_GATE
+        if (! WFP_IsPayloadInspectionEnabled())
+            return STATUS_NOT_SUPPORTED;
+#else
+        return STATUS_NOT_SUPPORTED;
+#endif
+    }
 
     if (! WFP_IsReady())
         return STATUS_DEVICE_NOT_READY;
@@ -497,6 +559,7 @@ static NTSTATUS Capture_Stop(
     if (! session)
         return STATUS_NOT_FOUND;
 
+    Capture_RetireFlowsForSession(captureId, FALSE);
     Capture_FreeSession(session);
     return STATUS_SUCCESS;
 }
@@ -577,6 +640,8 @@ static NTSTATUS Capture_Api_Control(PROCESS *proc, ULONG64 *parms)
             control->flags =
                 CAPTURE_DRIVER_FLAG_INCLUDE_FUTURE |
                 CAPTURE_DRIVER_FLAG_INCLUDE_LOOPBACK;
+            if (WFP_IsPayloadInspectionEnabled())
+                control->flags |= CAPTURE_DRIVER_FLAG_INCLUDE_PAYLOAD;
             control->queue_capacity = CAPTURE_DRIVER_QUEUE_CAPACITY;
             control->initial_process_count = 0;
             control->reserved = 0;
@@ -618,14 +683,43 @@ static NTSTATUS Capture_OpenSharedSectionObjectHandle(
         return STATUS_INVALID_PARAMETER;
 
     *userHandle = NULL;
-    return ObOpenObjectByPointer(
+    const ACCESS_MASK desiredAccess =
+        SECTION_MAP_READ | SECTION_MAP_WRITE | SECTION_QUERY;
+    HANDLE sectionKernelHandle = NULL;
+    NTSTATUS status = ObOpenObjectByPointer(
         sectionObject,
-        0,
+        OBJ_KERNEL_HANDLE,
         NULL,
-        SECTION_MAP_READ | SECTION_MAP_WRITE | SECTION_QUERY,
+        desiredAccess,
+        *MmSectionObjectType,
+        KernelMode,
+        &sectionKernelHandle);
+    if (! NT_SUCCESS(status))
+        return status;
+
+    HANDLE systemProcessHandle = NULL;
+    status = ObOpenObjectByPointer(
+        PsInitialSystemProcess,
+        OBJ_KERNEL_HANDLE,
         NULL,
-        UserMode,
-        userHandle);
+        PROCESS_DUP_HANDLE,
+        *PsProcessType,
+        KernelMode,
+        &systemProcessHandle);
+    if (NT_SUCCESS(status)) {
+        status = ZwDuplicateObject(
+            systemProcessHandle,
+            sectionKernelHandle,
+            ZwCurrentProcess(),
+            userHandle,
+            desiredAccess,
+            0,
+            0);
+        ZwClose(systemProcessHandle);
+    }
+
+    ZwClose(sectionKernelHandle);
+    return status;
 }
 
 
@@ -679,6 +773,10 @@ static NTSTATUS Capture_Api_Map(PROCESS *proc, ULONG64 *parms)
         ObReferenceObject(referencedObject);
     }
     else {
+        temporary.capture_id = request.capture_id;
+        temporary.target.scope = CAPTURE_DRIVER_SCOPE_BOX;
+        temporary.target.flags = CAPTURE_DRIVER_FLAG_INCLUDE_PAYLOAD;
+        temporary.target.session_id = 0;
         RtlCopyMemory(
             temporary.target.box_name,
             session->target.box_name,
@@ -709,10 +807,14 @@ static NTSTATUS Capture_Api_Map(PROCESS *proc, ULONG64 *parms)
             session->section_object = temporary.section_object;
             session->section_system_address =
                 temporary.section_system_address;
+            session->section_mdl = temporary.section_mdl;
             session->section_view_size = temporary.section_view_size;
+            session->shared_write_index = temporary.shared_write_index;
+            session->shared_sequence = temporary.shared_sequence;
             temporary.section_kernel_handle = NULL;
             temporary.section_object = NULL;
             temporary.section_system_address = NULL;
+            temporary.section_mdl = NULL;
             temporary.section_view_size = 0;
         }
         referencedObject = session->section_object;
@@ -859,6 +961,156 @@ static NTSTATUS Capture_Api_Read(PROCESS *proc, ULONG64 *parms)
 }
 
 
+#if 0
+static NTSTATUS Capture_Api_ReadPayload(
+    PROCESS *proc, ULONG64 *parms, BOOLEAN stream)
+{
+    void *userRead = NULL;
+    ULONG readSize = 0;
+    if (stream) {
+        API_CAPTURE_STREAM_READ_ARGS *args =
+            (API_CAPTURE_STREAM_READ_ARGS *)parms;
+        userRead = args->read.val;
+        readSize = args->read_size.val;
+    }
+    else {
+        API_CAPTURE_PACKET_READ_ARGS *args =
+            (API_CAPTURE_PACKET_READ_ARGS *)parms;
+        userRead = args->read.val;
+        readSize = args->read_size.val;
+    }
+
+    if (proc || PsGetCurrentProcessId() != Api_ServiceProcessId)
+        return STATUS_ACCESS_DENIED;
+
+    const ULONG maxRecords = stream ?
+        CAPTURE_DRIVER_MAX_READ_STREAMS : CAPTURE_DRIVER_MAX_READ_PACKETS;
+    const ULONG maxReadSize = CAPTURE_DRIVER_PACKET_READ_BASE_SIZE +
+        maxRecords * sizeof(CAPTURE_PACKET_RECORD);
+    if (! userRead || readSize < CAPTURE_DRIVER_PACKET_READ_BASE_SIZE ||
+            readSize > maxReadSize) {
+        return STATUS_INFO_LENGTH_MISMATCH;
+    }
+
+    CAPTURE_DRIVER_PACKET_READ request;
+    RtlZeroMemory(&request, sizeof(request));
+    __try {
+        ProbeForRead(
+            userRead, CAPTURE_DRIVER_PACKET_READ_BASE_SIZE, sizeof(ULONG));
+        RtlCopyMemory(
+            &request, userRead, CAPTURE_DRIVER_PACKET_READ_BASE_SIZE);
+        ProbeForWrite(userRead, readSize, sizeof(ULONG));
+    }
+    __except (EXCEPTION_EXECUTE_HANDLER) {
+        return GetExceptionCode();
+    }
+
+    if (request.version != CAPTURE_DRIVER_VERSION)
+        return STATUS_REVISION_MISMATCH;
+    if (request.size != readSize || request.reserved ||
+            Capture_IdIsZero(&request.capture_id) ||
+            ! request.max_records || request.max_records > maxRecords ||
+            readSize != CAPTURE_DRIVER_PACKET_READ_BASE_SIZE +
+                request.max_records * sizeof(CAPTURE_PACKET_RECORD)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    SIZE_T recordBytes = (SIZE_T)request.max_records *
+        sizeof(CAPTURE_PACKET_RECORD);
+    CAPTURE_PACKET_RECORD *records =
+        (CAPTURE_PACKET_RECORD *)Capture_Alloc(recordBytes);
+    if (! records)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    ULONG64 nextSequence = 0;
+    ULONG64 oldestSequence = 0;
+    ULONG64 newestSequence = 0;
+    ULONG64 droppedCount = 0;
+    ULONG remainingRecords = 0;
+    ULONG returnedRecords = 0;
+    NTSTATUS status = STATUS_SUCCESS;
+
+    KIRQL irql;
+    KeAcquireSpinLock(&Capture_Lock, &irql);
+    CAPTURE_SESSION *session =
+        Capture_FindSessionLocked(&request.capture_id);
+    if (! session) {
+        status = STATUS_NOT_FOUND;
+    }
+    else if (! session->payload_enabled) {
+        status = STATUS_NOT_SUPPORTED;
+    }
+    else if (stream) {
+        returnedRecords = CaptureStreamQueue_Drain(
+            session->stream_queue,
+            (CAPTURE_STREAM_RECORD *)records,
+            request.max_records,
+            &nextSequence,
+            &oldestSequence,
+            &newestSequence,
+            &droppedCount,
+            &remainingRecords);
+    }
+    else {
+        returnedRecords = CapturePacketQueue_Drain(
+            session->packet_queue,
+            records,
+            request.max_records,
+            &nextSequence,
+            &oldestSequence,
+            &newestSequence,
+            &droppedCount,
+            &remainingRecords);
+    }
+    KeReleaseSpinLock(&Capture_Lock, irql);
+
+    if (NT_SUCCESS(status)) {
+        CAPTURE_DRIVER_PACKET_READ output;
+        RtlZeroMemory(&output, sizeof(output));
+        output.version = CAPTURE_DRIVER_VERSION;
+        output.size = readSize;
+        output.capture_id = request.capture_id;
+        output.next_sequence = nextSequence;
+        output.oldest_sequence = oldestSequence;
+        output.newest_sequence = newestSequence;
+        output.dropped_count = droppedCount;
+        output.max_records = request.max_records;
+        output.returned_records = returnedRecords;
+        output.remaining_records = remainingRecords;
+
+        __try {
+            RtlCopyMemory(
+                userRead, &output, CAPTURE_DRIVER_PACKET_READ_BASE_SIZE);
+            if (returnedRecords) {
+                RtlCopyMemory(
+                    (UCHAR *)userRead + CAPTURE_DRIVER_PACKET_READ_BASE_SIZE,
+                    records,
+                    returnedRecords * sizeof(CAPTURE_PACKET_RECORD));
+            }
+        }
+        __except (EXCEPTION_EXECUTE_HANDLER) {
+            status = GetExceptionCode();
+        }
+    }
+
+    Capture_Free(records);
+    return status;
+}
+
+
+static NTSTATUS Capture_Api_ReadPackets(PROCESS *proc, ULONG64 *parms)
+{
+    return Capture_Api_ReadPayload(proc, parms, FALSE);
+}
+
+
+static NTSTATUS Capture_Api_ReadStreams(PROCESS *proc, ULONG64 *parms)
+{
+    return Capture_Api_ReadPayload(proc, parms, TRUE);
+}
+#endif
+
+
 //---------------------------------------------------------------------------
 // Public functions
 //---------------------------------------------------------------------------
@@ -889,6 +1141,7 @@ void Capture_Unload(void)
 
 void Capture_Reset(void)
 {
+    Capture_RetireFlowsForSession(NULL, TRUE);
     Capture_ReleaseAll(FALSE);
 }
 
@@ -932,7 +1185,7 @@ static CAPTURE_FLOW_CONTEXT *Capture_FindFlowLocked(UINT64 flowContext)
 }
 
 
-static BOOLEAN Capture_HasPayloadSessionLocked(
+static CAPTURE_SESSION *Capture_FindPayloadSessionLocked(
     const CAPTURE_FILTER_IDENTITY *identity)
 {
     PLIST_ENTRY entry = Capture_Sessions.Flink;
@@ -941,11 +1194,11 @@ static BOOLEAN Capture_HasPayloadSessionLocked(
             entry, CAPTURE_SESSION, link);
         if (session->payload_enabled &&
                 CaptureFilter_Matches(&session->target, identity)) {
-            return TRUE;
+            return session;
         }
         entry = entry->Flink;
     }
-    return FALSE;
+    return NULL;
 }
 
 
@@ -960,6 +1213,24 @@ UINT64 Capture_CreateFlowContext(
             ! Capture_Initialized)
         return 0;
 
+    CAPTURE_DRIVER_SESSION_ID captureId;
+    RtlZeroMemory(&captureId, sizeof(captureId));
+    KIRQL irql;
+    KeAcquireSpinLock(&Capture_Lock, &irql);
+    CAPTURE_SESSION *session = Capture_FindPayloadSessionLocked(identity);
+    if (Capture_Unloading || ! session ||
+            Capture_FlowCount >= CAPTURE_MAX_FLOW_CONTEXTS) {
+        if (session && session->section_system_address &&
+                Capture_FlowCount >= CAPTURE_MAX_FLOW_CONTEXTS &&
+                session->section_system_address->dropped_count < (ULONG64)-1) {
+            ++session->section_system_address->dropped_count;
+        }
+        KeReleaseSpinLock(&Capture_Lock, irql);
+        return 0;
+    }
+    captureId = session->capture_id;
+    KeReleaseSpinLock(&Capture_Lock, irql);
+
     CAPTURE_FLOW_CONTEXT *flow =
         (CAPTURE_FLOW_CONTEXT *)Capture_Alloc(sizeof(*flow));
     if (! flow)
@@ -969,18 +1240,24 @@ UINT64 Capture_CreateFlowContext(
     flow->flow_id = flowId;
     flow->layer_id = layerId;
     flow->callout_id = calloutId;
+    flow->capture_id = captureId;
     flow->identity = *identity;
     flow->template_record = *templateRecord;
 
     BOOLEAN keep = FALSE;
-    KIRQL irql;
     KeAcquireSpinLock(&Capture_Lock, &irql);
-    if (! Capture_Unloading &&
+    session = Capture_FindPayloadSessionLocked(identity);
+    if (! Capture_Unloading && session &&
             Capture_FlowCount < CAPTURE_MAX_FLOW_CONTEXTS &&
-            Capture_HasPayloadSessionLocked(identity)) {
+            Capture_IdEquals(&session->capture_id, &flow->capture_id)) {
         InsertTailList(&Capture_Flows, &flow->link);
         ++Capture_FlowCount;
         keep = TRUE;
+    }
+    else if (session && session->section_system_address &&
+            Capture_FlowCount >= CAPTURE_MAX_FLOW_CONTEXTS &&
+            session->section_system_address->dropped_count < (ULONG64)-1) {
+        ++session->section_system_address->dropped_count;
     }
     KeReleaseSpinLock(&Capture_Lock, irql);
 
@@ -999,6 +1276,7 @@ void Capture_DeleteFlowContext(UINT64 flowContext)
         return;
 
     CAPTURE_FLOW_CONTEXT *flow = NULL;
+    BOOLEAN freeFlow = FALSE;
     KIRQL irql;
     KeAcquireSpinLock(&Capture_Lock, &irql);
 
@@ -1006,12 +1284,147 @@ void Capture_DeleteFlowContext(UINT64 flowContext)
     if (flow) {
         RemoveEntryList(&flow->link);
         --Capture_FlowCount;
+        flow->wfp_deleted = TRUE;
+        freeFlow = flow->retire_refs == 0;
     }
 
     KeReleaseSpinLock(&Capture_Lock, irql);
 
-    if (flow)
+    if (freeFlow)
         Capture_FreeFlow(flow);
+}
+
+
+UINT64 Capture_LookupFlowContext(
+    UINT64 flowId,
+    UINT16 layerId,
+    UINT32 calloutId)
+{
+    UINT64 context = 0;
+    KIRQL irql;
+
+    if (! flowId || ! calloutId || ! Capture_Initialized)
+        return 0;
+
+    KeAcquireSpinLock(&Capture_Lock, &irql);
+    {
+        PLIST_ENTRY entry = Capture_Flows.Flink;
+        while (entry != &Capture_Flows) {
+            CAPTURE_FLOW_CONTEXT *flow = CONTAINING_RECORD(
+                entry, CAPTURE_FLOW_CONTEXT, link);
+            if (! flow->retiring &&
+                    flow->flow_id == flowId &&
+                    flow->layer_id == layerId &&
+                    flow->callout_id == calloutId) {
+                context = (UINT64)(ULONG_PTR)flow;
+                break;
+            }
+            entry = entry->Flink;
+        }
+    }
+    KeReleaseSpinLock(&Capture_Lock, irql);
+    return context;
+}
+
+
+void Capture_CountDroppedIdentity(const CAPTURE_FILTER_IDENTITY *identity)
+{
+    if (! identity || ! Capture_Initialized)
+        return;
+
+    KIRQL irql;
+    KeAcquireSpinLock(&Capture_Lock, &irql);
+    {
+        PLIST_ENTRY entry = Capture_Sessions.Flink;
+        while (entry != &Capture_Sessions) {
+            CAPTURE_SESSION *session = CONTAINING_RECORD(
+                entry, CAPTURE_SESSION, link);
+            if (session->payload_enabled &&
+                    session->section_system_address &&
+                    CaptureFilter_Matches(&session->target, identity) &&
+                    session->section_system_address->dropped_count <
+                        (ULONG64)-1) {
+                ++session->section_system_address->dropped_count;
+            }
+            entry = entry->Flink;
+        }
+    }
+    KeReleaseSpinLock(&Capture_Lock, irql);
+}
+
+
+static void Capture_ReleaseRetireRef(CAPTURE_FLOW_CONTEXT *flow)
+{
+    BOOLEAN freeFlow = FALSE;
+    KIRQL irql;
+    KeAcquireSpinLock(&Capture_Lock, &irql);
+    if (flow->retire_refs > 0)
+        --flow->retire_refs;
+    freeFlow = flow->wfp_deleted && flow->retire_refs == 0;
+    KeReleaseSpinLock(&Capture_Lock, irql);
+
+    if (freeFlow)
+        Capture_FreeFlow(flow);
+}
+
+
+static void Capture_RetireFlowsForSession(
+    const CAPTURE_DRIVER_SESSION_ID *captureId, BOOLEAN all)
+{
+    LIST_ENTRY retiring;
+    InitializeListHead(&retiring);
+
+    KIRQL irql;
+    KeAcquireSpinLock(&Capture_Lock, &irql);
+    PLIST_ENTRY entry = Capture_Flows.Flink;
+    while (entry != &Capture_Flows) {
+        CAPTURE_FLOW_CONTEXT *flow = CONTAINING_RECORD(
+            entry, CAPTURE_FLOW_CONTEXT, link);
+        if (! flow->retiring &&
+                (all || (captureId && Capture_IdEquals(
+                    &flow->capture_id, captureId)))) {
+            flow->retiring = TRUE;
+            ++flow->retire_refs;
+            InitializeListHead(&flow->retire_link);
+            InsertTailList(&retiring, &flow->retire_link);
+        }
+        entry = entry->Flink;
+    }
+    KeReleaseSpinLock(&Capture_Lock, irql);
+
+    while (! IsListEmpty(&retiring)) {
+        PLIST_ENTRY link = RemoveHeadList(&retiring);
+        CAPTURE_FLOW_CONTEXT *flow = CONTAINING_RECORD(
+            link, CAPTURE_FLOW_CONTEXT, retire_link);
+        NTSTATUS status = FwpsFlowRemoveContext0(
+            flow->flow_id, flow->layer_id, flow->callout_id);
+        if (status == STATUS_NOT_FOUND)
+            Capture_DeleteFlowContext((UINT64)(ULONG_PTR)flow);
+        Capture_ReleaseRetireRef(flow);
+    }
+}
+
+
+static BOOLEAN Capture_SharedContractValidLocked(
+    const CAPTURE_SESSION *session,
+    const CAPTURE_BROKER_SECTION *shared)
+{
+    if (! session || ! shared ||
+            session->section_view_size <
+                CAPTURE_BROKER_SECTION_SIZE(
+                    CAPTURE_BROKER_MAX_RECORD_CAPACITY)) {
+        return FALSE;
+    }
+
+    return shared->magic == CAPTURE_BROKER_SECTION_MAGIC &&
+        shared->version == CAPTURE_BROKER_SECTION_VERSION &&
+        shared->size == CAPTURE_BROKER_SECTION_SIZE(
+            CAPTURE_BROKER_MAX_RECORD_CAPACITY) &&
+        shared->record_capacity == CAPTURE_BROKER_MAX_RECORD_CAPACITY &&
+        shared->capture_id_high == session->capture_id.high &&
+        shared->capture_id_low == session->capture_id.low &&
+        shared->generation == CaptureBroker_CalculateGeneration(
+            session->capture_id.high, session->capture_id.low);
 }
 
 
@@ -1019,21 +1432,35 @@ static void Capture_SharedPushLocked(
     CAPTURE_SESSION *session,
     const CAPTURE_PACKET_RECORD *record)
 {
-    CAPTURE_BROKER_SECTION *shared = session->section_system_address;
-    if (! shared || ! record || ! shared->record_capacity)
+    CAPTURE_BROKER_SECTION *shared =
+        session ? session->section_system_address : NULL;
+    if (! Capture_SharedContractValidLocked(session, shared) || ! record)
         return;
 
-    ULONG writeIndex = shared->write_index;
-    ULONG capacity = shared->record_capacity;
-
+    const ULONG writeIndex = session->shared_write_index;
+    const ULONG readIndex = shared->read_index;
+    if (writeIndex - readIndex >= CAPTURE_BROKER_MAX_RECORD_CAPACITY &&
+            shared->dropped_count < (ULONG64)-1) {
+        ++shared->dropped_count;
+    }
+    const ULONG64 sequence = ++session->shared_sequence;
+    CAPTURE_PACKET_RECORD *slot =
+        &shared->records[writeIndex % CAPTURE_BROKER_MAX_RECORD_CAPACITY];
     CAPTURE_PACKET_RECORD copy = *record;
-    copy.sequence = (ULONG64)writeIndex + 1;
-    RtlCopyMemory(
-        &shared->records[writeIndex % capacity],
-        &copy,
-        sizeof(copy));
+    copy.sequence = 0;
+
+    slot->sequence = 0;
     KeMemoryBarrier();
-    shared->write_index = writeIndex + 1;
+    RtlCopyMemory(
+        (UCHAR *)slot + sizeof(slot->sequence),
+        (const UCHAR *)&copy + sizeof(copy.sequence),
+        sizeof(copy) - sizeof(copy.sequence));
+    KeMemoryBarrier();
+    slot->sequence = sequence;
+    KeMemoryBarrier();
+
+    session->shared_write_index = writeIndex + 1;
+    shared->write_index = session->shared_write_index;
 }
 
 
@@ -1053,7 +1480,7 @@ static void Capture_RecordPayloadByFlowInternal(
     if (! Capture_Unloading) {
         CAPTURE_FLOW_CONTEXT *flow =
             Capture_FindFlowLocked(flowContext);
-        if (flow) {
+        if (flow && ! flow->retiring) {
             CAPTURE_PACKET_RECORD record = flow->template_record;
             record.timestamp = 0;
             record.layer = layer;
@@ -1074,6 +1501,8 @@ static void Capture_RecordPayloadByFlowInternal(
                 CAPTURE_SESSION *session = CONTAINING_RECORD(
                     entry, CAPTURE_SESSION, link);
                 if (session->payload_enabled &&
+                        Capture_IdEquals(
+                            &session->capture_id, &flow->capture_id) &&
                         CaptureFilter_Matches(
                             &session->target, &flow->identity)) {
                     if (layer == CAPTURE_PACKET_LAYER_STREAM &&
@@ -1087,7 +1516,7 @@ static void Capture_RecordPayloadByFlowInternal(
                                 session->section_system_address) {
                             Capture_SharedPushLocked(session, &record);
                         }
-                        else if (session->packet_queue) {
+                        if (session->packet_queue) {
                             CapturePacketQueue_Push(
                                 session->packet_queue, &record);
                         }

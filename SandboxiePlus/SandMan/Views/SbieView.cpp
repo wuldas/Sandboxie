@@ -235,6 +235,7 @@ void CSbieView::CreateMenu()
 	m_pMenuSnapshots = m_pMenuBox->addAction(CSandMan::GetIcon("Snapshots"), tr("Snapshots Manager"), this, SLOT(OnSandBoxAction()));
 	m_pMenuBox->addSeparator();
 	m_pMenuCapture = m_pMenuBox->addAction(CSandMan::GetIcon("Connect"), tr("Connection Audit"), this, SLOT(OnSandBoxAction()));
+	m_pMenuPacketCapture = m_pMenuBox->addAction(CSandMan::GetIcon("Connect"), tr("Packet Capture"), this, SLOT(OnSandBoxAction()));
 	m_pMenuOptions = m_pMenuBox->addAction(CSandMan::GetIcon("Options"), tr("Sandbox Options"), this, SLOT(OnSandBoxAction()));
 	QFont f = m_pMenuOptions->font();
 	f.setBold(true);
@@ -295,6 +296,7 @@ void CSbieView::CreateMenu()
 	m_pMenuTerminate = m_pMenuProcess->addAction(CSandMan::GetIcon("Remove"), tr("Terminate"), this, SLOT(OnProcessAction()));
 	this->addAction(m_pMenuTerminate);
 	m_pMenuProcCapture = m_pMenuProcess->addAction(CSandMan::GetIcon("Connect"), tr("Connection Audit"), this, SLOT(OnProcessAction()));
+	m_pMenuProcPacketCapture = m_pMenuProcess->addAction(CSandMan::GetIcon("Connect"), tr("Packet Capture"), this, SLOT(OnProcessAction()));
 	m_pMenuLinkTo = m_pMenuProcess->addAction(CSandMan::GetIcon("MkLink"), tr("Create Shortcut"), this, SLOT(OnProcessAction()));
 	m_pMenuPreset = m_pMenuProcess->addMenu(CSandMan::GetIcon("Presets"), tr("Preset"));
 		m_pMenuPinToRun = m_pMenuPreset->addAction(tr("Pin to Run Menu"), this, SLOT(OnProcessAction()));
@@ -397,6 +399,7 @@ void CSbieView::CreateOldMenu()
 
 	m_pMenuBox->addSeparator();
 	m_pMenuCapture = m_pMenuBox->addAction(CSandMan::GetIcon("Connect"), tr("Connection Audit"), this, SLOT(OnSandBoxAction()));
+	m_pMenuPacketCapture = m_pMenuBox->addAction(CSandMan::GetIcon("Connect"), tr("Packet Capture"), this, SLOT(OnSandBoxAction()));
 	m_pMenuOptions = m_pMenuBox->addAction(CSandMan::GetIcon("Options"), tr("Sandbox Settings"), this, SLOT(OnSandBoxAction()));
 
 	m_pMenuTools = m_pMenuBox->addMenu(CSandMan::GetIcon("Maintenance"), tr("Sandbox Tools"));
@@ -455,6 +458,7 @@ void CSbieView::CreateOldMenu()
 	m_pMenuTerminate = m_pMenuProcess->addAction(CSandMan::GetIcon("Remove"), tr("Terminate"), this, SLOT(OnProcessAction()));
 	this->addAction(m_pMenuTerminate);
 	m_pMenuProcCapture = m_pMenuProcess->addAction(CSandMan::GetIcon("Connect"), tr("Connection Audit"), this, SLOT(OnProcessAction()));
+	m_pMenuProcPacketCapture = m_pMenuProcess->addAction(CSandMan::GetIcon("Connect"), tr("Packet Capture"), this, SLOT(OnProcessAction()));
 	m_pMenuLinkTo = m_pMenuProcess->addAction(CSandMan::GetIcon("MkLink"), tr("Create Shortcut"), this, SLOT(OnProcessAction()));
 	m_pMenuPreset = NULL;
 		m_pMenuPinToRun = NULL;
@@ -725,6 +729,8 @@ bool CSbieView::UpdateMenu(bool bAdvanced, const CSandBoxPtr &pBox, int iSandBox
 	m_pMenuOptions->setEnabled(iSandBoxeCount == 1);
 	if (m_pMenuCapture)
 		m_pMenuCapture->setEnabled(iSandBoxeCount == 1 && theAPI && theAPI->IsConnected());
+	if (m_pMenuPacketCapture)
+		m_pMenuPacketCapture->setEnabled(iSandBoxeCount == 1 && theAPI && theAPI->IsConnected());
 
 	if (m_pMenuPresets) {
 		m_pMenuPresets->setEnabled(iSandBoxeCount == 1);
@@ -772,6 +778,8 @@ void CSbieView::UpdateProcMenu(const CBoxedProcessPtr& pProcess, int iProcessCou
 	m_pMenuLinkTo->setEnabled(iProcessCount == 1);
 	if (m_pMenuProcCapture)
 		m_pMenuProcCapture->setEnabled(iProcessCount == 1 && theAPI && theAPI->IsConnected());
+	if (m_pMenuProcPacketCapture)
+		m_pMenuProcPacketCapture->setEnabled(iProcessCount == 1 && theAPI && theAPI->IsConnected());
 
 	CSandBoxPlus* pBoxPlus = pProcess.objectCast<CSbieProcess>()->GetBox();
 	QStringList RunOptions = pBoxPlus->GetTextList("RunCommand", true);
@@ -1562,6 +1570,8 @@ void CSbieView::OnSandBoxAction(QAction* Action, const QList<CSandBoxPtr>& SandB
 		ShowOptions(SandBoxes.first());
 	else if (Action == m_pMenuCapture)
 		theGUI->OnBoxConnectionAudit();
+	else if (Action == m_pMenuPacketCapture)
+		theGUI->OnBoxPacketCapture();
 	else if (Action == m_pMenuBrowse)
 		ShowBrowse(SandBoxes.first());
 	else if (Action == m_pMenuBrowseNT)
@@ -2014,6 +2024,10 @@ void CSbieView::OnProcessAction(QAction* Action, const QList<CBoxedProcessPtr>& 
 {
 	if (Action == m_pMenuProcCapture) {
 		theGUI->OnProcessConnectionAudit();
+		return;
+	}
+	if (Action == m_pMenuProcPacketCapture) {
+		theGUI->OnProcessPacketCapture();
 		return;
 	}
 

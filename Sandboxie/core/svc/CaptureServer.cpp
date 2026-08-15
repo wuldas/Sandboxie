@@ -23,6 +23,7 @@
 
 #include "CaptureServer.h"
 #include "capturewire.h"
+#include "capturebrokerwire.h"
 #include "core/dll/sbieapi.h"
 #include "core/drv/api_defs.h"
 #include "core/drv/api_flags.h"
@@ -66,6 +67,7 @@ typedef struct _CAPTURE_SESSION_OBJ {
     ULONG max_file_bytes;
     ULONG max_seconds;
     ULONG rotate_count;
+    ULONG64 waiting_deadline;
     ULONG stopped_event_head;
     ULONG stopped_event_count;
     CAPTURE_CONNECTION_EVENT *stopped_events;
@@ -78,6 +80,11 @@ static_assert(sizeof(CAPTURE_DRIVER_SESSION_ID) == sizeof(CAPTURE_SESSION_ID),
               "driver and service capture identifiers differ");
 static_assert(sizeof(CAPTURE_DRIVER_EVENT) == sizeof(CAPTURE_CONNECTION_EVENT),
               "driver and service capture events differ");
+static_assert(sizeof(CAPTURE_DRIVER_PACKET_READ) ==
+              CAPTURE_DRIVER_PACKET_READ_BASE_SIZE + sizeof(CAPTURE_PACKET_RECORD),
+              "driver packet read ABI differs");
+static_assert(sizeof(CAPTURE_PACKET_EVENT) == sizeof(CAPTURE_PACKET_RECORD),
+              "service packet event ABI differs");
 static_assert(FIELD_OFFSET(CAPTURE_DRIVER_EVENT, local_address) ==
               FIELD_OFFSET(CAPTURE_CONNECTION_EVENT, local_address),
               "driver and service capture event layout differs");
@@ -114,6 +121,26 @@ static BOOLEAN CaptureServer_QueryTokenIdentity(
     }
 
     return TRUE;
+}
+
+
+static BOOLEAN CaptureServer_TokenMatchesOwner(
+    HANDLE token, ULONG expectedSessionId, const WCHAR *expectedSid)
+{
+    ULONG sessionId = 0;
+    TOKEN_USER *user = NULL;
+    LPWSTR sidString = NULL;
+    BOOLEAN matched = FALSE;
+    if (CaptureServer_QueryTokenIdentity(token, &sessionId, &user) &&
+            ConvertSidToStringSidW(user->User.Sid, &sidString)) {
+        matched = sessionId == expectedSessionId &&
+            _wcsicmp(sidString, expectedSid) == 0;
+    }
+    if (sidString)
+        LocalFree(sidString);
+    if (user)
+        HeapFree(GetProcessHeap(), 0, user);
+    return matched;
 }
 
 
@@ -319,17 +346,49 @@ static BOOLEAN CaptureServer_IdEquals(
 }
 
 
+static ULONG CaptureServer_GetProcessCreateTime(
+    HANDLE process, ULONG64 *createTime)
+{
+    FILETIME creation = { 0 };
+    FILETIME exitTime = { 0 };
+    FILETIME kernelTime = { 0 };
+    FILETIME userTime = { 0 };
+    if (! process || ! createTime ||
+            ! GetProcessTimes(
+                process, &creation, &exitTime, &kernelTime, &userTime)) {
+        return STATUS_INVALID_CID;
+    }
+
+    *createTime = ((ULONG64)creation.dwHighDateTime << 32) |
+        creation.dwLowDateTime;
+    return *createTime ? STATUS_SUCCESS : STATUS_INVALID_CID;
+}
+
+
 static ULONG CaptureServer_DuplicateWritableFile(
-    ULONG callerPid, ULONG64 rawHandle, HANDLE *fileHandle)
+    ULONG callerPid,
+    ULONG64 expectedCreateTime,
+    ULONG64 rawHandle,
+    HANDLE *fileHandle)
 {
     if (! callerPid || ! rawHandle || ! fileHandle)
         return STATUS_INVALID_PARAMETER;
 
     *fileHandle = NULL;
     HANDLE callerProcess = OpenProcess(
-        PROCESS_DUP_HANDLE, FALSE, callerPid);
+        PROCESS_DUP_HANDLE | PROCESS_QUERY_LIMITED_INFORMATION,
+        FALSE, callerPid);
     if (! callerProcess)
         return STATUS_INVALID_CID;
+
+    ULONG64 liveCreateTime = 0;
+    ULONG identityStatus = CaptureServer_GetProcessCreateTime(
+        callerProcess, &liveCreateTime);
+    if (! NT_SUCCESS(identityStatus) ||
+            liveCreateTime != expectedCreateTime) {
+        CloseHandle(callerProcess);
+        return STATUS_REVISION_MISMATCH;
+    }
 
     HANDLE duplicate = NULL;
     BOOL ok = DuplicateHandle(
@@ -378,6 +437,7 @@ static BOOLEAN CaptureServer_IsWaitingForBackend(
 static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session);
 static ULONG CaptureServer_StopBroker(CAPTURE_SESSION_OBJ *session);
 static void CaptureServer_PollBroker(CAPTURE_SESSION_OBJ *session);
+static void CaptureServer_UpdateBrokerCounters(CAPTURE_SESSION_OBJ *session);
 
 
 #define SBIE_PROC_THREAD_ATTRIBUTE_HANDLE_LIST 0x00020002
@@ -394,7 +454,7 @@ typedef BOOL (WINAPI *SBIE_UPDATE_ATTRIBUTE)(
 typedef void (WINAPI *SBIE_DELETE_ATTRIBUTE_LIST)(PVOID);
 
 
-static ULONG CaptureServer_QueryDriver(void)
+static ULONG CaptureServer_QueryDriver(ULONG *driverFlags)
 {
     UCHAR buffer[CAPTURE_DRIVER_CONTROL_BASE_SIZE];
     memzero(buffer, sizeof(buffer));
@@ -412,6 +472,9 @@ static ULONG CaptureServer_QueryDriver(void)
             control->queue_capacity != CAPTURE_DRIVER_QUEUE_CAPACITY) {
         return STATUS_INVALID_NETWORK_RESPONSE;
     }
+
+    if (driverFlags)
+        *driverFlags = control->flags;
 
     return STATUS_SUCCESS;
 }
@@ -589,6 +652,107 @@ static ULONG CaptureServer_ValidateVersion(
 }
 
 
+#if 0
+static ULONG CaptureServer_ReadDriverPayload(
+    CAPTURE_SESSION_OBJ *session,
+    BOOLEAN stream,
+    CAPTURE_PACKET_EVENT *records,
+    ULONG maxRecords,
+    ULONG *returnedRecords,
+    ULONG *remainingRecords,
+    ULONG64 *nextSequence,
+    ULONG64 *oldestSequence,
+    ULONG64 *newestSequence,
+    ULONG64 *droppedCount)
+{
+    const ULONG maximumRecords = stream ?
+        CAPTURE_MAX_STREAM_ENTRIES : CAPTURE_MAX_PACKET_ENTRIES;
+    if (! session || ! records || ! returnedRecords || ! remainingRecords ||
+            ! nextSequence || ! oldestSequence || ! newestSequence ||
+            ! droppedCount || ! maxRecords || maxRecords > maximumRecords) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    ULONG readSize = CAPTURE_DRIVER_PACKET_READ_BASE_SIZE +
+        maxRecords * sizeof(CAPTURE_PACKET_RECORD);
+    CAPTURE_DRIVER_PACKET_READ *read =
+        (CAPTURE_DRIVER_PACKET_READ *)HeapAlloc(
+            GetProcessHeap(), HEAP_ZERO_MEMORY, readSize);
+    if (! read)
+        return STATUS_INSUFFICIENT_RESOURCES;
+
+    read->version = CAPTURE_DRIVER_VERSION;
+    read->size = readSize;
+    read->capture_id.high = session->info.capture_id.high;
+    read->capture_id.low = session->info.capture_id.low;
+    read->max_records = maxRecords;
+
+    ULONG status = SbieApi_Call(
+        stream ? API_CAPTURE_READ_STREAMS : API_CAPTURE_READ_PACKETS,
+        2, (ULONG_PTR)read, (ULONG_PTR)readSize);
+    if (NT_SUCCESS(status)) {
+        if (read->version != CAPTURE_DRIVER_VERSION ||
+                read->size != readSize ||
+                read->capture_id.high != session->info.capture_id.high ||
+                read->capture_id.low != session->info.capture_id.low ||
+                read->max_records != maxRecords ||
+                read->returned_records > maxRecords ||
+                read->remaining_records > CAPTURE_DRIVER_QUEUE_CAPACITY ||
+                read->reserved) {
+            status = STATUS_INVALID_NETWORK_RESPONSE;
+        }
+    }
+
+    if (NT_SUCCESS(status)) {
+        for (ULONG index = 0; index < read->returned_records; ++index) {
+            const CAPTURE_PACKET_RECORD *record = &read->records[index];
+            const BOOLEAN validLayer = stream ?
+                record->layer == CAPTURE_PACKET_LAYER_STREAM :
+                (record->layer == CAPTURE_PACKET_LAYER_TRANSPORT ||
+                 record->layer == CAPTURE_PACKET_LAYER_DATAGRAM);
+            if (! validLayer ||
+                    (record->direction !=
+                        CAPTURE_PACKET_DIRECTION_OUTBOUND &&
+                     record->direction != CAPTURE_PACKET_DIRECTION_INBOUND) ||
+                    (record->address_family != CAPTURE_ADDRESS_FAMILY_IPV4 &&
+                     record->address_family != CAPTURE_ADDRESS_FAMILY_IPV6) ||
+                    record->captured_length > CAPTURE_PACKET_SNAPLEN_MAX ||
+                    record->original_length < record->captured_length ||
+                    record->reserved1 || record->reserved2 ||
+                    record->session_id != session->info.target_session_id) {
+                status = STATUS_INVALID_NETWORK_RESPONSE;
+                break;
+            }
+
+            if (session->info.scope == CAPTURE_SCOPE_PROCESS &&
+                    (record->process_id != session->info.target_pid ||
+                     record->process_create_time !=
+                        session->info.target_process_create_time)) {
+                status = STATUS_INVALID_NETWORK_RESPONSE;
+                break;
+            }
+        }
+    }
+
+    if (NT_SUCCESS(status)) {
+        if (read->returned_records) {
+            memcpy(records, read->records,
+                   read->returned_records * sizeof(CAPTURE_PACKET_EVENT));
+        }
+        *returnedRecords = read->returned_records;
+        *remainingRecords = read->remaining_records;
+        *nextSequence = read->next_sequence;
+        *oldestSequence = read->oldest_sequence;
+        *newestSequence = read->newest_sequence;
+        *droppedCount = read->dropped_count;
+    }
+
+    HeapFree(GetProcessHeap(), 0, read);
+    return status;
+}
+#endif
+
+
 //---------------------------------------------------------------------------
 // Constructor and Destructor
 //---------------------------------------------------------------------------
@@ -690,8 +854,15 @@ MSG_HEADER *CaptureServer::QueryCapsHandler(MSG_HEADER *msg)
     rpl->min_wire_version = CAPTURE_WIRE_VERSION;
     rpl->max_wire_version = CAPTURE_WIRE_VERSION;
     rpl->capabilities = CAPTURE_CAP_CONTROL;
-    if (NT_SUCCESS(CaptureServer_QueryDriver()))
+    ULONG driverFlags = 0;
+    if (NT_SUCCESS(CaptureServer_QueryDriver(&driverFlags))) {
         rpl->capabilities |= CAPTURE_CAP_CONNECTION_AUDIT;
+#if CAPTURE_PACKET_CAPTURE_RELEASE_GATE
+        if (driverFlags & CAPTURE_DRIVER_FLAG_INCLUDE_PAYLOAD)
+            rpl->capabilities |= CAPTURE_CAP_PACKET_CAPTURE |
+                CAPTURE_CAP_PCAPNG_EXPORT;
+#endif
+    }
     rpl->max_sessions_per_owner = CAPTURE_MAX_SESSIONS_PER_OWNER;
     rpl->max_list_entries = CAPTURE_MAX_LIST_ENTRIES;
     rpl->max_event_entries = CAPTURE_MAX_EVENT_ENTRIES;
@@ -721,7 +892,8 @@ MSG_HEADER *CaptureServer::StartHandler(MSG_HEADER *msg)
                        CAPTURE_MODE_HTTPS)) != 0 || req->mode == 0)
         return SHORT_REPLY(STATUS_INVALID_PARAMETER);
 
-    if ((req->mode & ~CAPTURE_MODE_CONNECTIONS) != 0)
+    if (req->mode != CAPTURE_MODE_CONNECTIONS &&
+            req->mode != CAPTURE_MODE_PACKETS)
         return SHORT_REPLY(STATUS_NOT_SUPPORTED);
 
     if ((req->flags & ~(CAPTURE_FLAG_INCLUDE_FUTURE_PROCESSES |
@@ -745,6 +917,17 @@ MSG_HEADER *CaptureServer::StartHandler(MSG_HEADER *msg)
             return SHORT_REPLY(STATUS_INVALID_PARAMETER);
     }
 
+    ULONG snapLength = CAPTURE_DEFAULT_SNAP_LENGTH;
+    ULONG maxFileBytes = CAPTURE_DEFAULT_MAX_FILE_BYTES;
+    ULONG maxSeconds = CAPTURE_DEFAULT_MAX_SECONDS;
+    ULONG rotateCount = 0;
+    if (req->v.struct_size >= sizeof(CAPTURE_START_REQ)) {
+        snapLength = req->snap_length;
+        maxFileBytes = req->max_file_bytes;
+        maxSeconds = req->max_seconds;
+        rotateCount = req->rotate_count;
+    }
+
     if (! CaptureServer_IsValidBoxName(req->box_name))
         return SHORT_REPLY(STATUS_INVALID_PARAMETER);
 
@@ -762,9 +945,18 @@ MSG_HEADER *CaptureServer::StartHandler(MSG_HEADER *msg)
         return SHORT_REPLY(STATUS_NOT_SUPPORTED);
     }
 
-    status = CaptureServer_QueryDriver();
+    ULONG driverFlags = 0;
+    status = CaptureServer_QueryDriver(&driverFlags);
     if (! NT_SUCCESS(status))
         return SHORT_REPLY(status);
+    if (req->mode == CAPTURE_MODE_PACKETS) {
+#if CAPTURE_PACKET_CAPTURE_RELEASE_GATE
+        if (!(driverFlags & CAPTURE_DRIVER_FLAG_INCLUDE_PAYLOAD))
+            return SHORT_REPLY(STATUS_NOT_SUPPORTED);
+#else
+        return SHORT_REPLY(STATUS_NOT_SUPPORTED);
+#endif
+    }
 
     ULONG ownerPid;
     ULONG ownerSessionId;
@@ -920,13 +1112,13 @@ MSG_HEADER *CaptureServer::StartHandler(MSG_HEADER *msg)
     session->info.target_process_create_time = targetCreateTime;
     session->info.started_time = CaptureServer_GetSystemTime();
     session->info.backend_status = STATUS_PENDING;
-    session->snap_length = req->snap_length ?
-        req->snap_length : CAPTURE_DEFAULT_SNAP_LENGTH;
-    session->max_file_bytes = req->max_file_bytes ?
-        req->max_file_bytes : CAPTURE_DEFAULT_MAX_FILE_BYTES;
-    session->max_seconds = req->max_seconds ?
-        req->max_seconds : CAPTURE_DEFAULT_MAX_SECONDS;
-    session->rotate_count = req->rotate_count;
+    session->snap_length = snapLength ?
+        snapLength : CAPTURE_DEFAULT_SNAP_LENGTH;
+    session->max_file_bytes = maxFileBytes ?
+        maxFileBytes : CAPTURE_DEFAULT_MAX_FILE_BYTES;
+    session->max_seconds = maxSeconds ?
+        maxSeconds : CAPTURE_DEFAULT_MAX_SECONDS;
+    session->rotate_count = rotateCount;
     wcscpy_s(session->info.box_name, ARRAYSIZE(session->info.box_name),
              req->box_name);
 
@@ -961,6 +1153,7 @@ MSG_HEADER *CaptureServer::StartHandler(MSG_HEADER *msg)
             return SHORT_REPLY(status);
         }
         session->info.state = CAPTURE_STATE_WAITING_FOR_BACKEND;
+        session->waiting_deadline = session->info.started_time + 50000000ull;
     }
 
     session->backend_active = TRUE;
@@ -1088,7 +1281,17 @@ MSG_HEADER *CaptureServer::GetStatusHandler(MSG_HEADER *msg)
         return SHORT_REPLY(STATUS_ACCESS_DENIED);
     }
 
+    if (session->info.state == CAPTURE_STATE_WAITING_FOR_BACKEND &&
+            session->waiting_deadline &&
+            CaptureServer_GetSystemTime() >= session->waiting_deadline) {
+        ULONG teardownStatus = StopBackend(session, FALSE);
+        session->info.state = CAPTURE_STATE_FAILED;
+        session->info.backend_status = NT_SUCCESS(teardownStatus) ?
+            STATUS_TIMEOUT : teardownStatus;
+    }
+
     CaptureServer_PollBroker(session);
+    CaptureServer_UpdateBrokerCounters(session);
 
     CAPTURE_STATUS_RPL *rpl = (CAPTURE_STATUS_RPL *)
         LONG_REPLY(sizeof(CAPTURE_STATUS_RPL));
@@ -1279,7 +1482,8 @@ MSG_HEADER *CaptureServer::ReadEventsHandler(MSG_HEADER *msg)
             &droppedCount);
         if (NT_SUCCESS(status)) {
             session->info.event_count += returnedEvents;
-            session->info.dropped_count = droppedCount;
+            if (session->info.mode != CAPTURE_MODE_PACKETS)
+                session->info.dropped_count = droppedCount;
         }
         else if (status == STATUS_NOT_FOUND) {
             session->backend_active = FALSE;
@@ -1335,6 +1539,169 @@ MSG_HEADER *CaptureServer::ReadEventsHandler(MSG_HEADER *msg)
 }
 
 
+#if 0
+MSG_HEADER *CaptureServer::ReadPayloadHandler(MSG_HEADER *msg, BOOLEAN stream)
+{
+    UNREFERENCED_PARAMETER(msg);
+    UNREFERENCED_PARAMETER(stream);
+    return SHORT_REPLY(STATUS_NOT_SUPPORTED);
+#if 0
+    const ULONG requestSize = stream ?
+        sizeof(CAPTURE_READ_STREAMS_REQ) : sizeof(CAPTURE_READ_PACKETS_REQ);
+    CAPTURE_VERSIONED_REQUEST *versioned =
+        (CAPTURE_VERSIONED_REQUEST *)msg;
+    ULONG status = CaptureServer_ValidateVersion(versioned, requestSize);
+    if (! NT_SUCCESS(status))
+        return SHORT_REPLY(status);
+
+    CAPTURE_SESSION_ID captureId;
+    ULONG maxRecords;
+    ULONG reserved;
+    if (stream) {
+        CAPTURE_READ_STREAMS_REQ *req =
+            (CAPTURE_READ_STREAMS_REQ *)msg;
+        if (req->v.struct_size != sizeof(*req) ||
+                req->v.h.length != sizeof(*req)) {
+            return SHORT_REPLY(STATUS_INVALID_PARAMETER);
+        }
+        captureId = req->capture_id;
+        maxRecords = req->max_records;
+        reserved = req->reserved;
+    }
+    else {
+        CAPTURE_READ_PACKETS_REQ *req =
+            (CAPTURE_READ_PACKETS_REQ *)msg;
+        if (req->v.struct_size != sizeof(*req) ||
+                req->v.h.length != sizeof(*req)) {
+            return SHORT_REPLY(STATUS_INVALID_PARAMETER);
+        }
+        captureId = req->capture_id;
+        maxRecords = req->max_records;
+        reserved = req->reserved;
+    }
+
+    if (reserved)
+        return SHORT_REPLY(STATUS_INVALID_PARAMETER);
+
+    const ULONG maximumRecords = stream ?
+        CAPTURE_MAX_STREAM_ENTRIES : CAPTURE_MAX_PACKET_ENTRIES;
+    if (! maxRecords)
+        maxRecords = maximumRecords;
+    if (maxRecords > maximumRecords)
+        return SHORT_REPLY(STATUS_INVALID_PARAMETER);
+
+    ULONG replySize = FIELD_OFFSET(CAPTURE_READ_PACKETS_RPL, records) +
+        maxRecords * sizeof(CAPTURE_PACKET_EVENT);
+    CAPTURE_READ_PACKETS_RPL *rpl =
+        (CAPTURE_READ_PACKETS_RPL *)LONG_REPLY(replySize);
+    if (! rpl)
+        return SHORT_REPLY(STATUS_INSUFFICIENT_RESOURCES);
+
+    memzero(rpl, replySize);
+    rpl->h.length = replySize;
+
+    ULONG ownerPid;
+    ULONG ownerSessionId;
+    ULONG64 ownerCreateTime;
+    WCHAR ownerSid[96];
+    status = CaptureServer_GetCallerIdentity(
+        &ownerPid, &ownerSessionId, &ownerCreateTime, ownerSid);
+    if (! NT_SUCCESS(status)) {
+        PipeServer::GetPipeServer()->FreeMsg(&rpl->h);
+        return SHORT_REPLY(status);
+    }
+
+    EnterCriticalSection(&m_lock);
+
+    CAPTURE_SESSION_OBJ *session = FindSession(
+        &captureId, ownerPid, ownerCreateTime, ownerSid);
+    if (! session) {
+        LeaveCriticalSection(&m_lock);
+        PipeServer::GetPipeServer()->FreeMsg(&rpl->h);
+        return SHORT_REPLY(STATUS_OBJECT_NAME_NOT_FOUND);
+    }
+
+    if (session->owner_session_id != ownerSessionId) {
+        LeaveCriticalSection(&m_lock);
+        PipeServer::GetPipeServer()->FreeMsg(&rpl->h);
+        return SHORT_REPLY(STATUS_ACCESS_DENIED);
+    }
+
+    if (session->info.mode != CAPTURE_MODE_PACKETS) {
+        LeaveCriticalSection(&m_lock);
+        PipeServer::GetPipeServer()->FreeMsg(&rpl->h);
+        return SHORT_REPLY(STATUS_NOT_SUPPORTED);
+    }
+
+    CaptureServer_PollBroker(session);
+
+    ULONG returnedRecords = 0;
+    ULONG remainingRecords = 0;
+    ULONG64 nextSequence = 0;
+    ULONG64 oldestSequence = 0;
+    ULONG64 newestSequence = 0;
+    ULONG64 droppedCount = session->info.dropped_count;
+
+    if (session->backend_active) {
+        status = CaptureServer_ReadDriverPayload(
+            session,
+            stream,
+            rpl->records,
+            maxRecords,
+            &returnedRecords,
+            &remainingRecords,
+            &nextSequence,
+            &oldestSequence,
+            &newestSequence,
+            &droppedCount);
+        if (status == STATUS_NOT_FOUND ||
+                status == STATUS_INVALID_NETWORK_RESPONSE) {
+            session->backend_active = FALSE;
+            session->info.state = CAPTURE_STATE_FAILED;
+            session->info.backend_status = status;
+        }
+    }
+    else {
+        status = STATUS_SUCCESS;
+    }
+
+    if (! NT_SUCCESS(status)) {
+        LeaveCriticalSection(&m_lock);
+        PipeServer::GetPipeServer()->FreeMsg(&rpl->h);
+        return SHORT_REPLY(status);
+    }
+
+    rpl->h.length = replySize;
+    rpl->h.status = STATUS_SUCCESS;
+    rpl->wire_version = CAPTURE_WIRE_VERSION;
+    rpl->struct_size = FIELD_OFFSET(CAPTURE_READ_PACKETS_RPL, records);
+    rpl->capture_id = captureId;
+    rpl->next_sequence = nextSequence;
+    rpl->oldest_sequence = oldestSequence;
+    rpl->newest_sequence = newestSequence;
+    rpl->dropped_count = droppedCount;
+    rpl->returned_records = returnedRecords;
+    rpl->remaining_records = remainingRecords;
+
+    LeaveCriticalSection(&m_lock);
+    return &rpl->h;
+#endif
+}
+
+
+MSG_HEADER *CaptureServer::ReadPacketsHandler(MSG_HEADER *msg)
+{
+    return ReadPayloadHandler(msg, FALSE);
+}
+
+
+MSG_HEADER *CaptureServer::ReadStreamsHandler(MSG_HEADER *msg)
+{
+    return ReadPayloadHandler(msg, TRUE);
+}
+#endif
+
+
 //---------------------------------------------------------------------------
 // SetExportHandler
 //---------------------------------------------------------------------------
@@ -1363,7 +1730,7 @@ MSG_HEADER *CaptureServer::SetExportHandler(MSG_HEADER *msg)
 
     HANDLE duplicateFile = NULL;
     status = CaptureServer_DuplicateWritableFile(
-        ownerPid, req->file_handle, &duplicateFile);
+        ownerPid, ownerCreateTime, req->file_handle, &duplicateFile);
     if (! NT_SUCCESS(status))
         return SHORT_REPLY(status);
 
@@ -1411,13 +1778,14 @@ MSG_HEADER *CaptureServer::SetExportHandler(MSG_HEADER *msg)
     if (session->section_handle) {
         status = CaptureServer_StartBroker(session);
         if (! NT_SUCCESS(status)) {
-            CloseHandle(session->export_file);
-            session->export_file = NULL;
+            ULONG teardownStatus = StopBackend(session, FALSE);
+            if (NT_SUCCESS(teardownStatus) && !NT_SUCCESS(status))
+                teardownStatus = status;
             session->info.state = CAPTURE_STATE_FAILED;
-            session->info.backend_status = status;
+            session->info.backend_status = teardownStatus;
             PipeServer::GetPipeServer()->FreeMsg(&rpl->h);
             LeaveCriticalSection(&m_lock);
-            return SHORT_REPLY(status);
+            return SHORT_REPLY(teardownStatus);
         }
     }
 
@@ -1444,6 +1812,93 @@ static BOOLEAN CaptureServer_DuplicateInheritable(
         0,
         TRUE,
         DUPLICATE_SAME_ACCESS) != FALSE;
+}
+
+
+static ULONG CaptureServer_WaitBrokerReady(
+    HANDLE sectionHandle,
+    const CAPTURE_SESSION_ID *captureId)
+{
+    if (! sectionHandle || ! captureId ||
+            (captureId->high == 0 && captureId->low == 0)) {
+        return STATUS_INVALID_PARAMETER;
+    }
+
+    CAPTURE_BROKER_SECTION *section =
+        (CAPTURE_BROKER_SECTION *)MapViewOfFile(
+            sectionHandle, FILE_MAP_READ | FILE_MAP_WRITE, 0, 0, 0);
+    if (! section)
+        return STATUS_INVALID_HANDLE;
+
+    const ULONG64 generation = CaptureBroker_CalculateGeneration(
+        captureId->high, captureId->low);
+    const DWORD startTick = GetTickCount();
+    ULONG status = STATUS_TIMEOUT;
+
+    for (;;) {
+        MemoryBarrier();
+        if (section->magic != CAPTURE_BROKER_SECTION_MAGIC ||
+                section->version != CAPTURE_BROKER_SECTION_VERSION ||
+                section->capture_id_high != captureId->high ||
+                section->capture_id_low != captureId->low ||
+                section->generation != generation) {
+            status = STATUS_INVALID_NETWORK_RESPONSE;
+            break;
+        }
+
+        const LONG brokerState = section->broker_status;
+        if (brokerState == CAPTURE_BROKER_STATE_RUNNING) {
+            status = STATUS_SUCCESS;
+            break;
+        }
+        if (brokerState == CAPTURE_BROKER_STATE_FAILED ||
+                brokerState == CAPTURE_BROKER_STATE_STOPPED) {
+            status = STATUS_DEVICE_NOT_READY;
+            break;
+        }
+        if (GetTickCount() - startTick >= 5000)
+            break;
+        Sleep(10);
+    }
+
+    UnmapViewOfFile(section);
+    return status;
+}
+
+
+static void CaptureServer_UpdateBrokerCounters(CAPTURE_SESSION_OBJ *session)
+{
+    if (! session || ! session->section_handle)
+        return;
+
+    CAPTURE_BROKER_SECTION *section =
+        (CAPTURE_BROKER_SECTION *)MapViewOfFile(
+            session->section_handle,
+            FILE_MAP_READ,
+            0,
+            0,
+            0);
+    if (! section)
+        return;
+
+    const ULONG64 generation = CaptureBroker_CalculateGeneration(
+        session->info.capture_id.high,
+        session->info.capture_id.low);
+    MemoryBarrier();
+    if (section->magic == CAPTURE_BROKER_SECTION_MAGIC &&
+            section->version == CAPTURE_BROKER_SECTION_VERSION &&
+            section->size == CAPTURE_BROKER_SECTION_SIZE(
+                CAPTURE_BROKER_MAX_RECORD_CAPACITY) &&
+            section->record_capacity == CAPTURE_BROKER_MAX_RECORD_CAPACITY &&
+            section->capture_id_high == session->info.capture_id.high &&
+            section->capture_id_low == session->info.capture_id.low &&
+            section->generation == generation) {
+        session->info.packet_count = section->packet_count;
+        session->info.byte_count = section->byte_count;
+        session->info.dropped_count = section->dropped_count;
+    }
+
+    UnmapViewOfFile(section);
 }
 
 
@@ -1484,10 +1939,20 @@ static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session)
         PROCESS_QUERY_INFORMATION, FALSE, session->owner_pid);
     if (! ownerProcess)
         goto cleanup;
+    ULONG64 liveOwnerCreateTime = 0;
+    if (! NT_SUCCESS(CaptureServer_GetProcessCreateTime(
+            ownerProcess, &liveOwnerCreateTime)) ||
+            liveOwnerCreateTime != session->owner_create_time) {
+        goto cleanup;
+    }
     if (! OpenProcessToken(
             ownerProcess,
             TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY,
             &ownerToken)) {
+        goto cleanup;
+    }
+    if (! CaptureServer_TokenMatchesOwner(
+            ownerToken, session->owner_session_id, session->owner_sid)) {
         goto cleanup;
     }
     if (! DuplicateTokenEx(
@@ -1540,12 +2005,18 @@ static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session)
             commandLine,
             ARRAYSIZE(commandLine),
             L"\"%s\" --section %p --file %p --stop-event %p "
-            L"--snaplen %lu --max-file-bytes %lu --max-seconds %lu "
-            L"--rotate-count %lu",
+            L"--capture-high %I64X --capture-low %I64X "
+            L"--generation %I64X --snaplen %lu --max-file-bytes %lu "
+            L"--max-seconds %lu --rotate-count %lu",
             executablePath,
             childSection,
             childFile,
             childStopEvent,
+            session->info.capture_id.high,
+            session->info.capture_id.low,
+            CaptureBroker_CalculateGeneration(
+                session->info.capture_id.high,
+                session->info.capture_id.low),
             session->snap_length,
             session->max_file_bytes,
             session->max_seconds,
@@ -1611,6 +2082,11 @@ static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session)
             exitCode != STILL_ACTIVE) {
         goto cleanup;
     }
+
+    status = CaptureServer_WaitBrokerReady(
+        session->section_handle, &session->info.capture_id);
+    if (! NT_SUCCESS(status))
+        goto cleanup;
 
     session->broker_job = job;
     job = NULL;
@@ -1712,6 +2188,7 @@ static void CaptureServer_PollBroker(CAPTURE_SESSION_OBJ *session)
         return;
     }
 
+    CaptureServer_UpdateBrokerCounters(session);
     ULONG brokerStatus = CaptureServer_StopBroker(session);
     ULONG driverStatus = STATUS_SUCCESS;
     if (session->backend_active) {
@@ -1795,6 +2272,7 @@ ULONG CaptureServer::StopBackend(
         return STATUS_INVALID_PARAMETER;
 
     ULONG brokerStatus = CaptureServer_StopBroker(session);
+    CaptureServer_UpdateBrokerCounters(session);
     if (! session->backend_active) {
         if (session->export_file) {
             CloseHandle(session->export_file);
@@ -1840,7 +2318,8 @@ ULONG CaptureServer::StopBackend(
 
             session->stopped_event_count += returnedEvents;
             session->info.event_count += returnedEvents;
-            session->info.dropped_count = droppedCount;
+            if (session->info.mode != CAPTURE_MODE_PACKETS)
+                session->info.dropped_count = droppedCount;
 
             if (! remainingEvents || ! returnedEvents)
                 break;
