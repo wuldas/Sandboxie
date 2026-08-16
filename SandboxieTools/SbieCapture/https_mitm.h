@@ -59,6 +59,13 @@ USHORT HttpsMitm_ListenPort(const HTTPS_MITM *mitm);
 SOCKET HttpsMitm_Accept(HTTPS_MITM *mitm);
 SOCKET HttpsMitm_TryAccept(HTTPS_MITM *mitm, ULONG timeoutMs);
 int HttpsMitm_RecvContext(SOCKET client, HTTPS_REDIRECT_CONTEXT *context);
+int HttpsMitm_QueryRedirectContext(
+    SOCKET client,
+    HTTPS_REDIRECT_CONTEXT *context);
+int HttpsMitm_QueryRedirectContextEx(
+    SOCKET client,
+    HTTPS_REDIRECT_CONTEXT *context,
+    ULONG *wsaError);
 int HttpsMitm_ServeOnce(
     HTTPS_MITM *mitm,
     SOCKET client,

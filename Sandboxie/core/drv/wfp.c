@@ -1349,6 +1349,7 @@ static void NTAPI WFP_https_redirect_classify(
 	CAPTURE_FILTER_IDENTITY identity;
 	CAPTURE_HTTPS_FLOW flow;
 	USHORT listenPort = 0;
+	ULONG brokerPid = 0;
 	ULONG64 captureIdHigh = 0;
 	ULONG64 captureIdLow = 0;
 	ULONG64 generation = 0;
@@ -1419,7 +1420,7 @@ static void NTAPI WFP_https_redirect_classify(
 				(connectionFlags & FWP_CONDITION_FLAG_IS_LOOPBACK) != 0,
 				&identity)) {
 		if (Capture_LookupHttpsRedirect(
-				&identity, &listenPort, &captureIdHigh, &captureIdLow,
+				&identity, &listenPort, &brokerPid, &captureIdHigh, &captureIdLow,
 				&generation)) {
 			flow.identity = &identity;
 			flow.listen_port = listenPort;
@@ -1464,6 +1465,7 @@ static void NTAPI WFP_https_redirect_classify(
 				request->localRedirectContext = context;
 				request->localRedirectContextSize = sizeof(*context);
 #endif
+				request->localRedirectTargetPID = brokerPid;
 				FwpsApplyModifiedLayerData0(
 					classifyHandle, request,
 					FWPS_CLASSIFY_FLAG_REAUTHORIZE_IF_MODIFIED_BY_OTHERS);

@@ -25,7 +25,7 @@ These are not open questions. Do not re-litigate them while implementing.
 9. **`CAPTURE_MODE_HTTPS` also starts the existing packet backend.** Pinning / MITM failure must retain ciphertext PCAPNG. HTTPS is not a replacement for packet capture.
 10. **Two caller-opened export files.** `SET_EXPORT` remains PCAPNG. New `MSGID_CAPTURE_SET_HAR_EXPORT` (`0x200A`) is the HAR file. LocalSystem never creates or overwrites a client-supplied path. HTTPS start cannot leave `WAITING_FOR_BACKEND` until both handles are set.
 11. **Bodies are opt-in. Redaction is on by default.** `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, and common API-key headers are replaced with `[REDACTED]` unless an explicit flag disables redaction. Body bytes are omitted unless `CAPTURE_FLAG_INCLUDE_BODIES` is set, and then only up to a per-body cap.
-12. **One CA per capture session.** Private key stays in broker memory (and a caller-protected temp file outside every sandbox if a restart helper needs it). Only the CA *public* certificate is imported into the selected sandbox’s virtual current-user Root store. Host stores and other boxes must hash-compare unchanged.
+12. **Persistent session CA.** A single SbieCapture CA (10-year validity) is generated on first use and stored under the owner's `%LOCALAPPDATA%\SbieCapture\` (`ca.crt` + `ca.key`), then reused across capture sessions. Only the CA *public* certificate is imported into the host user's Root store (via the SYSTEM store provider); the first import raises the Windows root-install prompt, later sessions are idempotent and do not re-prompt. The box's virtual Root store is not modified. The private key lives on disk in the owner's profile, so any process with that profile's read access could theoretically mint MITM certs — this is the standard mitmproxy/Fiddler trust model and is accepted and documented here.
 13. **OpenSSL 3.4.0 only in `SbieCapture.exe`.** Do not link OpenSSL, parsers, or HAR writers into `SbieDrv` or `SbieSvc`. Use the version in `Installer/buildVariables.cmd`; do not hard-code a different version in that file.
 14. **Win8+ redirect is the MVP path.** `FwpsRedirectHandleCreate0` / `FwpsQueryConnectionRedirectState0` are resolved at runtime. If they are absent, HTTPS capability stays clear and start returns `STATUS_NOT_SUPPORTED`. The Win7 SOCKS5 fallback from the architecture doc is Phase 4.1 / later, not this MVP.
 15. **Do not bump `CAPTURE_WIRE_VERSION`.** Old 112-byte `CAPTURE_START_REQ` still starts connection-audit. Extended start stays 132 bytes plus new *trailing* flags only if they fit without moving existing fields. Prefer a new flag bit and a new SET message over resizing start.
@@ -383,8 +383,8 @@ Deploy `SandMan.exe`, `QSbieAPI.dll`, `SbieCapture.exe`, and the OpenSSL 3.4.0 D
 7. Broker kill: session `FAILED`, new boxed curl to 443 fails, host curl still works, ALE audit still works. After `STOP`, boxed curl to 443 works again.
 8. Direct connect to the broker loopback port without WFP context is refused.
 9. Denied `NetworkAccess` destination is still denied (no redirect bypass).
-10. Host `HKCU`/`HKLM` Root store hashes unchanged. A second sandbox’s virtual Root store unchanged. Target box virtual Root contains the session CA during the run and is removed on stop.
-11. Cross-SID / cross-session HTTPS start still `0xC0000022`.
+10. Host `HKCU` Root store contains the persistent session CA during and after the run (idempotent, not removed on stop). A second sandbox’s virtual Root store unchanged. The box’s virtual Root store is not modified by capture.
+11. Cross-SID / cross-session **process-scoped** HTTPS start still `0xC0000022`.
 12. IPv4 and, if the host has working IPv6 egress, IPv6. Only claim the families actually run.
 
 Capability bits turn on only after 1–11 pass. MCP `httpsInspection` / `harExport` become true. SandMan HTTPS Start can enable. HTTP/2, Firefox/NSS, and Win7 SOCKS5 remain out of scope.
@@ -417,6 +417,8 @@ Build / deploy follow the Phase 3 recipes and `kmdutil-driver-reload`.
 - Changing `NetworkAccess` semantics so capture can bypass a deny
 - OpenSSL or HTTP parsers in `SbieDrv` / `SbieSvc`
 - `FWPS_STREAM_ACTION_NEED_MORE_DATA`
+- IP-literal HTTPS targets (e.g. `https://1.1.1.1`): Schannel omits SNI for IP addresses and matches the principal against the leaf's SAN, but the broker mints a `DNS:` SAN from the SNI; the handshake fails with `SEC_E_WRONG_PRINCIPAL`. DNS-name targets work and are what Slice 8 exercises.
+- Revocation soft-failure tolerance: sandboxed Schannel outbound credentials get `SCH_CRED_IGNORE_NO_REVOCATION_CHECK | SCH_CRED_IGNORE_REVOCATION_OFFLINE` unconditionally (the MITM leaf has no CRL/OCSP endpoint); this suppresses only "cannot check revocation" soft errors, never `CRYPT_E_REVOKED`, and does not change trust anchors.
 
 ---
 
@@ -428,7 +430,7 @@ Build / deploy follow the Phase 3 recipes and `kmdutil-driver-reload`.
 | Broker death restores direct 443 | Fail-closed: keep redirect to the dead listener until `STOP` |
 | Loopback listener becomes an open proxy | Reject sockets without matching redirect context |
 | Recursive redirect of broker upstream | Copy WFP redirect records; skip `REDIRECTED_BY_SELF` |
-| Host or other-box trusts the CA | Import only via in-box helper into virtual CU Root; hash host + other box |
+| Host or other-box trusts the CA | Persistent CA imported only into the host user's Root store (once, prompted); the box's virtual Root is never modified |
 | CA private key lands in the box | Helper receives only the public cert bytes |
 | HTTP/2-only Chromium | Force ALPN http/1.1; document refusal as MVP limit; still require curl + WinHTTP |
 | Packet isolation regresses after new terminating callout | Slice 5 hard-gates Phase 2/3 e2e before any HTTPS traffic test |

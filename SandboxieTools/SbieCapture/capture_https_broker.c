@@ -48,6 +48,7 @@ static DWORD WINAPI CaptureHttps_AcceptThread(void *param)
         SOCKET client = HttpsMitm_TryAccept(runtime->mitm, 100);
         HTTPS_REDIRECT_CONTEXT context;
         const HTTPS_REDIRECT_CONTEXT *serveContext = NULL;
+        ULONG queryError = 0;
 
         if (client == INVALID_SOCKET)
             continue;
@@ -57,6 +58,13 @@ static DWORD WINAPI CaptureHttps_AcceptThread(void *param)
                 continue;
             }
             serveContext = &context;
+        } else if (HttpsMitm_QueryRedirectContextEx(
+                client, &context, &queryError)) {
+            serveContext = &context;
+        } else {
+            UNREFERENCED_PARAMETER(queryError);
+            closesocket(client);
+            continue;
         }
         HttpsMitm_ServeOnce(runtime->mitm, client, serveContext);
         closesocket(client);
@@ -87,7 +95,30 @@ CAPTURE_HTTPS_RUNTIME *CaptureHttps_Start(
     runtime->section = section;
     runtime->test_preamble = options->test_preamble;
     runtime->expected = options->expected_context;
-    runtime->ca = CaptureCa_Create();
+    if (options->import_host_root) {
+        //
+        // persistent CA: reuse one CA across capture sessions so the host
+        // Root trust is granted only once.  the private key lives in the
+        // owner's per-user config directory; create it first.
+        //
+        WCHAR caDir[512];
+        WCHAR tmp[512];
+        DWORD evLen = GetEnvironmentVariableW(L"LOCALAPPDATA", tmp, ARRAYSIZE(tmp));
+        if (evLen == 0 || evLen >= ARRAYSIZE(tmp))
+            goto fail;
+        if (swprintf_s(caDir, ARRAYSIZE(caDir), L"%s\\SbieCapture", tmp) < 0)
+            goto fail;
+        if (! CreateDirectoryW(caDir, NULL) &&
+                GetLastError() != ERROR_ALREADY_EXISTS) {
+            goto fail;
+        }
+        runtime->ca = CaptureCa_LoadOrCreatePersistent(caDir);
+        if (! runtime->ca)
+            goto fail;
+    }
+    else {
+        runtime->ca = CaptureCa_Create();
+    }
     if (! runtime->ca)
         goto fail;
     if (CaptureCa_WritePublicPemHandle(runtime->ca, options->ca_file) !=
@@ -96,9 +127,28 @@ CAPTURE_HTTPS_RUNTIME *CaptureHttps_Start(
     }
     FlushFileBuffers(options->ca_file);
 
+    if (options->import_host_root) {
+        //
+        // import the session CA into the HOST user's real Root store:
+        // trust decisions for sandboxed schannel clients are taken by
+        // host-side machinery which cannot see the sandboxed registry
+        // copy.  the import is idempotent: if this CA is already trusted
+        // (the persistent case) the add is skipped and no UI is raised.
+        //
+        char pem[4096];
+        ULONG pemLength = 0;
+        if (CaptureCa_ExportPublicPem(
+                runtime->ca, pem, sizeof(pem), &pemLength) != CAPTURE_CA_OK ||
+                CaptureCa_ImportPublicPemToUserSystemStore(
+                    pem, pemLength, L"Root") != CAPTURE_CA_OK) {
+            goto fail;
+        }
+    }
+
     memset(&mitmOptions, 0, sizeof(mitmOptions));
     mitmOptions.ca = runtime->ca;
-    mitmOptions.expected_context = &runtime->expected;
+    mitmOptions.expected_context = options->test_preamble ?
+        &runtime->expected : NULL;
     mitmOptions.har_file = options->har_file;
     mitmOptions.redact = options->redact;
     mitmOptions.include_bodies = options->include_bodies;

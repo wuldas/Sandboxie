@@ -50,6 +50,7 @@ typedef struct _CAPTURE_SESSION {
     CAPTURE_STREAM_QUEUE *stream_queue;
     BOOLEAN payload_enabled;
     BOOLEAN https_redirect_enabled;
+    ULONG https_broker_pid;
     HANDLE section_kernel_handle;
     PVOID section_object;
     CAPTURE_BROKER_SECTION *section_system_address;
@@ -568,15 +569,20 @@ static NTSTATUS Capture_Stop(
 
 
 static NTSTATUS Capture_EnableHttps(
-    const CAPTURE_DRIVER_SESSION_ID *captureId)
+    const CAPTURE_DRIVER_SESSION_ID *captureId,
+    ULONG brokerPid)
 {
     KIRQL irql;
     CAPTURE_SESSION *session;
     NTSTATUS status = STATUS_NOT_FOUND;
 
+    if (! brokerPid)
+        return STATUS_INVALID_PARAMETER;
+
     KeAcquireSpinLock(&Capture_Lock, &irql);
     session = Capture_FindSessionLocked(captureId);
     if (session) {
+        session->https_broker_pid = brokerPid;
         session->https_redirect_enabled = TRUE;
         status = STATUS_SUCCESS;
     }
@@ -698,7 +704,8 @@ static NTSTATUS Capture_Api_Control(PROCESS *proc, ULONG64 *parms)
             status = STATUS_NOT_SUPPORTED;
         }
         else {
-            status = Capture_EnableHttps(&control->capture_id);
+            status = Capture_EnableHttps(
+                &control->capture_id, control->target_pid);
         }
     }
     else {
@@ -1208,13 +1215,14 @@ void Capture_RecordEvent(
 BOOLEAN Capture_LookupHttpsRedirect(
     const CAPTURE_FILTER_IDENTITY *identity,
     USHORT *listenPort,
+    ULONG *brokerPid,
     ULONG64 *captureIdHigh,
     ULONG64 *captureIdLow,
     ULONG64 *generation)
 {
     BOOLEAN found = FALSE;
 
-    if (! identity || ! listenPort || ! captureIdHigh ||
+    if (! identity || ! listenPort || ! brokerPid || ! captureIdHigh ||
             ! captureIdLow || ! generation || ! Capture_Initialized) {
         return FALSE;
     }
@@ -1231,9 +1239,11 @@ BOOLEAN Capture_LookupHttpsRedirect(
             if (session->section_system_address)
                 port = session->section_system_address->https_listen_port;
             if (session->https_redirect_enabled &&
+                    session->https_broker_pid != 0 &&
                     port != 0 && port <= 0xFFFFul &&
                     CaptureFilter_Matches(&session->target, identity)) {
                 *listenPort = (USHORT)port;
+                *brokerPid = session->https_broker_pid;
                 *captureIdHigh = session->capture_id.high;
                 *captureIdLow = session->capture_id.low;
                 *generation = CaptureBroker_CalculateGeneration(

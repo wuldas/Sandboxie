@@ -525,6 +525,7 @@ _FX BOOLEAN Ldr_Init()
     Ldr_Inject_Init(FALSE);
     Sxs_ActivateDefaultManifest((void *)Ldr_ImageBase);
 
+
     return TRUE;
 }
 
@@ -1092,6 +1093,35 @@ _FX void Ldr_MyDllCallbackW(const WCHAR *ImageName, HMODULE ImageBase, BOOL Load
 }
 
 
+static WCHAR Ldr_NameLower(WCHAR c)
+{
+    if (c >= L'A' && c <= L'Z')
+        c = (WCHAR)(c - L'A' + L'a');
+    return c;
+}
+
+
+static BOOLEAN Ldr_NameContains(const WCHAR *name, const WCHAR *sub)
+{
+    const WCHAR *scan;
+
+    if (! name || ! sub)
+        return FALSE;
+    for (scan = name; *scan; ++scan) {
+        const WCHAR *a = scan;
+        const WCHAR *b = sub;
+        while (*b && Ldr_NameLower(*a) == Ldr_NameLower(*b)) {
+            ++a;
+            ++b;
+        }
+        if (! *b)
+            return TRUE;
+    }
+    return FALSE;
+}
+
+
+
 _FX void Ldr_MyDllCallbackNew(const WCHAR *ImageName, HMODULE ImageBase, BOOL LoadState) // Windows 8.1 and later
 {
     WCHAR text[4096];
@@ -1100,6 +1130,7 @@ _FX void Ldr_MyDllCallbackNew(const WCHAR *ImageName, HMODULE ImageBase, BOOL Lo
     else
         Sbie_snwprintf(text, ARRAYSIZE(text), L"%s (unloaded)", ImageName);
     SbieApi_MonitorPutMsg(MONITOR_IMAGE, text);
+
 
     //
     // invoke our sub-modules as necessary
@@ -1139,6 +1170,41 @@ _FX void Ldr_MyDllCallbackNew(const WCHAR *ImageName, HMODULE ImageBase, BOOL Lo
 
     if (LoadState)
         Ldr_DetectImageType(ImageName);
+}
+
+
+//---------------------------------------------------------------------------
+// Ldr_InitLoadedDll
+//---------------------------------------------------------------------------
+
+
+_FX void Ldr_InitLoadedDll(const WCHAR *name)
+{
+    DLL *dll = Ldr_Dlls;
+    HMODULE module;
+
+    //
+    // HTTPS capture: DLLs pulled in as static imports of the executable
+    // (crypt32, SspiCli for curl.exe) are already mapped before our LDR
+    // notification is registered, and a minimal client never calls
+    // LdrLoadDll dynamically, so the Ldr_CallDllCallbacks catch-up never
+    // fires either.  Initialize the table entry directly when the module
+    // is already present so its hooks get installed.
+    //
+
+    while (dll->nameW) {
+        if (_wcsicmp(name, dll->nameW) == 0)
+            break;
+        ++dll;
+    }
+    if (! dll->nameW)
+        return;
+    if (dll->state)
+        return;
+    module = GetModuleHandleW(name);
+    if (! module)
+        return;
+    Ldr_MyDllCallbackNew(name, module, TRUE);
 }
 
 

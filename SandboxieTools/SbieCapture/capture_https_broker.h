@@ -32,6 +32,7 @@ typedef struct _CAPTURE_HTTPS_OPTIONS {
     BOOL test_preamble;
     BOOL redact;
     BOOL include_bodies;
+    BOOL import_host_root;
     HTTPS_REDIRECT_CONTEXT expected_context;
 
 } CAPTURE_HTTPS_OPTIONS;

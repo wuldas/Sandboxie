@@ -3312,7 +3312,8 @@ SB_RESULT(SSbieCaptureSession) CSbieAPI::StartCapture(
 		Options.Mode == 0)
 		return SB_ERR(STATUS_INVALID_PARAMETER);
 	if (Options.Mode != SSbieCaptureStart::eConnections &&
-		Options.Mode != SSbieCaptureStart::ePackets)
+		Options.Mode != SSbieCaptureStart::ePackets &&
+		Options.Mode != SSbieCaptureStart::eHttps)
 		return SB_ERR(STATUS_NOT_SUPPORTED);
 	if ((Options.Flags & ~(SSbieCaptureStart::eIncludeFutureProcesses |
 			SSbieCaptureStart::eIncludeLoopback |

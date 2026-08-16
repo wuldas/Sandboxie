@@ -100,7 +100,10 @@ int __cdecl wmain(int argc, WCHAR **argv)
     BOOL haveGeneration = FALSE;
     BOOL httpsListen = FALSE;
     BOOL httpsTestPreamble = FALSE;
+    BOOL httpsImportHostRoot = FALSE;
     BOOL importCa = FALSE;
+    BOOL removeCa = FALSE;
+    BOOL systemStore = FALSE;
     ULONG64 rawImport = 0;
     HANDLE importHandle = NULL;
     const WCHAR *importPath = NULL;
@@ -194,6 +197,9 @@ int __cdecl wmain(int argc, WCHAR **argv)
         else if (_wcsicmp(argv[index], L"--https-test-preamble") == 0) {
             httpsTestPreamble = TRUE;
         }
+        else if (_wcsicmp(argv[index], L"--https-import-host-root") == 0) {
+            httpsImportHostRoot = TRUE;
+        }
         else if (ReadOption(argc, argv, &index, L"--import-ca", &text)) {
             if (importCa || ! ParseUInt64(text, 16, &rawImport) || rawImport == 0)
                 goto InvalidArguments;
@@ -206,10 +212,19 @@ int __cdecl wmain(int argc, WCHAR **argv)
             importCa = TRUE;
             importPath = text;
         }
+        else if (ReadOption(argc, argv, &index, L"--remove-ca-path", &text)) {
+            if (removeCa || ! text || ! text[0])
+                goto InvalidArguments;
+            removeCa = TRUE;
+            importPath = text;
+        }
         else if (ReadOption(argc, argv, &index, L"--store", &text)) {
             if (! text || ! text[0])
                 goto InvalidArguments;
             storeName = text;
+        }
+        else if (_wcsicmp(argv[index], L"--system-store") == 0) {
+            systemStore = TRUE;
         }
         else if (_wcsicmp(argv[index], L"--help") == 0 ||
                  _wcsicmp(argv[index], L"-h") == 0) {
@@ -221,7 +236,7 @@ int __cdecl wmain(int argc, WCHAR **argv)
         }
     }
 
-    if (importCa) {
+    if (importCa || removeCa) {
         HANDLE file = importHandle;
         int importStatus;
         if (haveSection || haveFile || httpsListen)
@@ -247,8 +262,18 @@ int __cdecl wmain(int argc, WCHAR **argv)
                 return CAPTURE_BROKER_ERROR;
             }
             pem[readSize] = 0;
-            importStatus = CaptureCa_ImportPublicPemToStore(
-                pem, readSize, storeName);
+            if (systemStore)
+                importStatus = importCa
+                    ? CaptureCa_ImportPublicPemToUserSystemStore(
+                          pem, readSize, storeName)
+                    : CaptureCa_RemovePublicPemFromUserSystemStore(
+                          pem, readSize, storeName);
+            else
+                importStatus = importCa
+                    ? CaptureCa_ImportPublicPemToStore(
+                          pem, readSize, storeName)
+                    : CaptureCa_RemovePublicPemFromStore(
+                          pem, readSize, storeName);
         }
         if (importPath)
             CloseHandle(file);
@@ -304,6 +329,7 @@ int __cdecl wmain(int argc, WCHAR **argv)
         httpsOptions.test_preamble = httpsTestPreamble;
         httpsOptions.redact = TRUE;
         httpsOptions.include_bodies = FALSE;
+        httpsOptions.import_host_root = httpsImportHostRoot;
         httpsOptions.expected_context.magic = HTTPS_REDIRECT_CONTEXT_MAGIC;
         httpsOptions.expected_context.version = HTTPS_REDIRECT_CONTEXT_VERSION;
         httpsOptions.expected_context.capture_id_high = rawCaptureHigh;

@@ -67,6 +67,7 @@ void Capture_RecordPayloadByFlow(
 BOOLEAN Capture_LookupHttpsRedirect(
     const CAPTURE_FILTER_IDENTITY *identity,
     USHORT *listenPort,
+    ULONG *brokerPid,
     ULONG64 *captureIdHigh,
     ULONG64 *captureIdLow,
     ULONG64 *generation);

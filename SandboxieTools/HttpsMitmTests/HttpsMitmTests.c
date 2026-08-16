@@ -41,9 +41,11 @@
 #include <stddef.h>
 
 #include "../SbieCapture/capture_ca.h"
+#include "../SbieCapture/capture_ca_priv.h"
 #include "../SbieCapture/https_mitm.h"
 #include "../SbieCapture/capture_https_broker.h"
 #include "../SbieCapture/capture_broker.h"
+#include "../../Sandboxie/core/dll/crypt_https_trust.h"
 
 
 static int Require(int condition, const char *message)
@@ -220,6 +222,7 @@ typedef struct _UPSTREAM_SERVER {
     char *ca_pem;
     HANDLE thread;
     volatile LONG stop;
+    BOOL require_sni;
 
 } UPSTREAM_SERVER;
 
@@ -265,6 +268,15 @@ static DWORD WINAPI UpstreamThread(void *param)
         }
         SSL_set_fd(ssl, (int)client);
         if (SSL_accept(ssl) == 1) {
+            const char *sni = SSL_get_servername(
+                ssl, TLSEXT_NAMETYPE_host_name);
+            if (server->require_sni &&
+                    (! sni || _stricmp(sni, "example.com") != 0)) {
+                SSL_shutdown(ssl);
+                SSL_free(ssl);
+                closesocket(client);
+                continue;
+            }
             got = SSL_read(ssl, request, sizeof(request) - 1);
             if (got > 0)
                 SSL_write(ssl, kResponse, (int)strlen(kResponse));
@@ -517,15 +529,440 @@ static int TestImportPublicPemToDisposableStore(void)
                      pem, length, L"SbieCaptureTest") == CAPTURE_CA_OK,
                  "import public PEM to disposable store") &&
         Require(CaptureCa_ImportPublicPemToStore(
-                    "-----BEGIN PRIVATE KEY-----\nabc\n-----END PRIVATE KEY-----\n",
+                    "[REDACTED PRIVATE KEY]\n",
                     60, L"SbieCaptureTest") == CAPTURE_CA_ERROR,
                 "reject private key material");
+    store = CertOpenStore(
+        CERT_STORE_PROV_SYSTEM_W, 0, 0,
+        CERT_SYSTEM_STORE_CURRENT_USER, L"SbieCaptureTest");
+    if (! Require(store != NULL, "open SYSTEM store after REG import")) {
+        CaptureCa_Free(ca);
+        return 0;
+    }
+    {
+        WCHAR subject[] = L"SbieCapture Session CA";
+        PCCERT_CONTEXT found = CertFindCertificateInStore(
+            store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+            CERT_FIND_SUBJECT_STR, subject, NULL);
+        ok = ok && Require(found != NULL,
+                           "SYSTEM store sees REG-imported session CA");
+        if (found)
+            CertFreeCertificateContext(found);
+    }
+    CertCloseStore(store, 0);
     store = CertOpenStore(
         CERT_STORE_PROV_SYSTEM_W, 0, 0,
         CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_DELETE_FLAG,
         L"SbieCaptureTest");
     if (store)
         CertCloseStore(store, 0);
+    CaptureCa_Free(ca);
+    return ok;
+}
+
+
+static int TestRemovePublicPemFromStore(void)
+{
+    CAPTURE_CA *ca = CaptureCa_Create();
+    char pem[4096];
+    ULONG length = 0;
+    int ok;
+    HCERTSTORE store;
+
+    if (! Require(ca != NULL, "create CA for removal"))
+        return 0;
+    if (! Require(CaptureCa_ExportPublicPem(ca, pem, sizeof(pem), &length) ==
+                    CAPTURE_CA_OK,
+                  "export PEM for removal")) {
+        CaptureCa_Free(ca);
+        return 0;
+    }
+    ok = Require(CaptureCa_ImportPublicPemToStore(
+                     pem, length, L"SbieCaptureTestRemove") == CAPTURE_CA_OK,
+                 "import public PEM before removal");
+    store = CertOpenStore(
+        CERT_STORE_PROV_SYSTEM_W, 0, 0,
+        CERT_SYSTEM_STORE_CURRENT_USER, L"SbieCaptureTestRemove");
+    if (! Require(store != NULL, "open SYSTEM store before removal")) {
+        CaptureCa_Free(ca);
+        return 0;
+    }
+    {
+        WCHAR subject[] = L"SbieCapture Session CA";
+        PCCERT_CONTEXT found = CertFindCertificateInStore(
+            store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+            CERT_FIND_SUBJECT_STR, subject, NULL);
+        ok = ok && Require(found != NULL, "session CA present before removal");
+        if (found)
+            CertFreeCertificateContext(found);
+    }
+    CertCloseStore(store, 0);
+
+    ok = ok && Require(CaptureCa_RemovePublicPemFromStore(
+                           pem, length, L"SbieCaptureTestRemove") ==
+                           CAPTURE_CA_OK,
+                       "remove public PEM from store");
+
+    store = CertOpenStore(
+        CERT_STORE_PROV_SYSTEM_W, 0, 0,
+        CERT_SYSTEM_STORE_CURRENT_USER, L"SbieCaptureTestRemove");
+    if (! Require(store != NULL, "open SYSTEM store after removal")) {
+        CaptureCa_Free(ca);
+        return 0;
+    }
+    {
+        WCHAR subject[] = L"SbieCapture Session CA";
+        PCCERT_CONTEXT found = CertFindCertificateInStore(
+            store, X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, 0,
+            CERT_FIND_SUBJECT_STR, subject, NULL);
+        ok = ok && Require(found == NULL, "session CA gone after removal");
+        if (found)
+            CertFreeCertificateContext(found);
+    }
+    CertCloseStore(store, 0);
+
+    ok = ok && Require(CaptureCa_RemovePublicPemFromStore(
+                           pem, length, L"SbieCaptureTestRemove") ==
+                           CAPTURE_CA_OK,
+                       "removal is idempotent when absent");
+
+    store = CertOpenStore(
+        CERT_STORE_PROV_SYSTEM_W, 0, 0,
+        CERT_SYSTEM_STORE_CURRENT_USER | CERT_STORE_DELETE_FLAG,
+        L"SbieCaptureTestRemove");
+    if (store)
+        CertCloseStore(store, 0);
+    CaptureCa_Free(ca);
+    return ok;
+}
+
+
+static int TestImportPublicPemToMachineStoreIsBestEffort(void)
+{
+    CAPTURE_CA *ca = CaptureCa_Create();
+    char pem[4096];
+    ULONG length = 0;
+    int machine;
+    int policy;
+    HCERTSTORE store;
+
+    if (! Require(ca != NULL, "create CA for machine import"))
+        return 0;
+    if (! Require(CaptureCa_ExportPublicPem(ca, pem, sizeof(pem), &length) ==
+                    CAPTURE_CA_OK,
+                  "export PEM for machine import")) {
+        CaptureCa_Free(ca);
+        return 0;
+    }
+    machine = CaptureCa_ImportPublicPemToStoreEx(
+        pem, length, L"SbieCaptureTest", CAPTURE_CA_STORE_LOCAL_MACHINE);
+    policy = CaptureCa_ImportPublicPemToStoreEx(
+        pem, length, L"SbieCaptureTest", CAPTURE_CA_STORE_GROUP_POLICY);
+    if (machine == CAPTURE_CA_OK) {
+        store = CertOpenStore(
+            CERT_STORE_PROV_SYSTEM_W, 0, 0,
+            CERT_SYSTEM_STORE_LOCAL_MACHINE | CERT_STORE_DELETE_FLAG,
+            L"SbieCaptureTest");
+        if (store)
+            CertCloseStore(store, 0);
+    }
+    CaptureCa_Free(ca);
+    return Require(
+        machine == CAPTURE_CA_OK || machine == CAPTURE_CA_ERROR,
+        "machine import is best-effort and does not crash") &&
+        Require(
+            policy == CAPTURE_CA_OK || policy == CAPTURE_CA_ERROR,
+            "policy import is best-effort and does not crash");
+}
+
+
+static int EncodeX509(X509 *cert, BYTE **out, DWORD *outLen)
+{
+    int len;
+    BYTE *der;
+    BYTE *cursor;
+
+    if (! cert || ! out || ! outLen)
+        return 0;
+    len = i2d_X509(cert, NULL);
+    if (len <= 0)
+        return 0;
+    der = (BYTE *)malloc((size_t)len);
+    if (! der)
+        return 0;
+    cursor = der;
+    if (i2d_X509(cert, &cursor) != len) {
+        free(der);
+        return 0;
+    }
+    *out = der;
+    *outLen = (DWORD)len;
+    return 1;
+}
+
+
+static DWORD ChainError(PCCERT_CONTEXT leaf, HCERTSTORE extra)
+{
+    CERT_CHAIN_PARA para;
+    PCCERT_CHAIN_CONTEXT chain = NULL;
+    DWORD error = (DWORD)-1;
+
+    memset(&para, 0, sizeof(para));
+    para.cbSize = sizeof(para);
+    if (! CertGetCertificateChain(
+            NULL, leaf, NULL, extra, &para, 0, NULL, &chain) || ! chain)
+        return error;
+    error = chain->TrustStatus.dwErrorStatus;
+    CertFreeCertificateChain(chain);
+    return error;
+}
+
+
+static int RelaxAndReadError(
+    PCCERT_CONTEXT leaf,
+    HCERTSTORE sessionCas,
+    DWORD *errorOut)
+{
+    CERT_CHAIN_PARA para;
+    PCCERT_CHAIN_CONTEXT chain = NULL;
+    BOOL relaxed;
+
+    memset(&para, 0, sizeof(para));
+    para.cbSize = sizeof(para);
+    if (! CertGetCertificateChain(
+            NULL, leaf, NULL, NULL, &para, 0, NULL, &chain) || ! chain)
+        return 0;
+    relaxed = CryptHttps_RelaxSessionCaChain(chain, sessionCas);
+    *errorOut = chain->TrustStatus.dwErrorStatus;
+    CertFreeCertificateChain(chain);
+    return relaxed ? 1 : 0;
+}
+
+
+static int TestLeafTrustedWithSessionCaExtraStore(void)
+{
+    CAPTURE_CA *ca = CaptureCa_Create();
+    X509 *leafX509 = NULL;
+    EVP_PKEY *leafKey = NULL;
+    BYTE *caDer = NULL;
+    BYTE *leafDer = NULL;
+    DWORD caLen = 0;
+    DWORD leafLen = 0;
+    PCCERT_CONTEXT leafCtx = NULL;
+    HCERTSTORE extra = NULL;
+    DWORD withoutExtra;
+    DWORD withExtra;
+    int extraTrusted;
+    int ok;
+
+    if (! Require(ca != NULL, "create CA for chain trust") ||
+            CaptureCa_MintLeaf(ca, "example.com", &leafX509, &leafKey) !=
+                CAPTURE_CA_OK) {
+        CaptureCa_Free(ca);
+        return Require(0, "mint leaf for chain trust");
+    }
+    if (! EncodeX509(ca->cert, &caDer, &caLen) ||
+            ! EncodeX509(leafX509, &leafDer, &leafLen)) {
+        EVP_PKEY_free(leafKey);
+        X509_free(leafX509);
+        CaptureCa_Free(ca);
+        return Require(0, "encode CA/leaf DER");
+    }
+    leafCtx = CertCreateCertificateContext(
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, leafDer, leafLen);
+    extra = CryptHttps_StoreFromEncodedCa(caDer, caLen);
+    if (! leafCtx || ! extra) {
+        if (leafCtx)
+            CertFreeCertificateContext(leafCtx);
+        if (extra)
+            CertCloseStore(extra, 0);
+        free(caDer);
+        free(leafDer);
+        EVP_PKEY_free(leafKey);
+        X509_free(leafX509);
+        CaptureCa_Free(ca);
+        return Require(0, "build leaf context and extra store");
+    }
+    withoutExtra = ChainError(leafCtx, NULL);
+    extraTrusted = RelaxAndReadError(leafCtx, extra, &withExtra);
+    ok = Require(
+            (withoutExtra & (CERT_TRUST_IS_UNTRUSTED_ROOT |
+                             CERT_TRUST_IS_PARTIAL_CHAIN)) != 0,
+            "leaf is untrusted without session CA extra store") &&
+        Require(extraTrusted, "relax helper verifies session-CA chain") &&
+        Require(
+            (withExtra & (CERT_TRUST_IS_UNTRUSTED_ROOT |
+                          CERT_TRUST_IS_PARTIAL_CHAIN)) == 0,
+            "leaf is trusted after session-CA chain relax");
+    CertFreeCertificateContext(leafCtx);
+    CertCloseStore(extra, 0);
+    free(caDer);
+    free(leafDer);
+    EVP_PKEY_free(leafKey);
+    X509_free(leafX509);
+    CaptureCa_Free(ca);
+    return ok;
+}
+
+
+static int TestPolicyRelaxClearsUntrustedRoot(void)
+{
+    CAPTURE_CA *ca = CaptureCa_Create();
+    X509 *leafX509 = NULL;
+    EVP_PKEY *leafKey = NULL;
+    BYTE *caDer = NULL;
+    BYTE *leafDer = NULL;
+    DWORD caLen = 0;
+    DWORD leafLen = 0;
+    PCCERT_CONTEXT leafCtx = NULL;
+    HCERTSTORE extra = NULL;
+    CERT_CHAIN_PARA para;
+    PCCERT_CHAIN_CONTEXT chain = NULL;
+    CERT_CHAIN_POLICY_PARA policyPara;
+    CERT_CHAIN_POLICY_STATUS policyStatus;
+    BOOL policyOk;
+    BOOL relaxed;
+    int ok;
+
+    if (! Require(ca != NULL, "create CA for policy relax") ||
+            CaptureCa_MintLeaf(ca, "example.com", &leafX509, &leafKey) !=
+                CAPTURE_CA_OK) {
+        CaptureCa_Free(ca);
+        return Require(0, "mint leaf for policy relax");
+    }
+    if (! EncodeX509(ca->cert, &caDer, &caLen) ||
+            ! EncodeX509(leafX509, &leafDer, &leafLen)) {
+        EVP_PKEY_free(leafKey);
+        X509_free(leafX509);
+        CaptureCa_Free(ca);
+        return Require(0, "encode CA/leaf DER for policy");
+    }
+    leafCtx = CertCreateCertificateContext(
+        X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, leafDer, leafLen);
+    extra = CryptHttps_StoreFromEncodedCa(caDer, caLen);
+    memset(&para, 0, sizeof(para));
+    para.cbSize = sizeof(para);
+    if (! leafCtx || ! extra ||
+            ! CertGetCertificateChain(
+                NULL, leafCtx, NULL, NULL, &para, 0, NULL, &chain) ||
+            ! chain) {
+        if (chain)
+            CertFreeCertificateChain(chain);
+        if (leafCtx)
+            CertFreeCertificateContext(leafCtx);
+        if (extra)
+            CertCloseStore(extra, 0);
+        free(caDer);
+        free(leafDer);
+        EVP_PKEY_free(leafKey);
+        X509_free(leafX509);
+        CaptureCa_Free(ca);
+        return Require(0, "build untrusted chain for policy");
+    }
+    memset(&policyPara, 0, sizeof(policyPara));
+    policyPara.cbSize = sizeof(policyPara);
+    memset(&policyStatus, 0, sizeof(policyStatus));
+    policyStatus.cbSize = sizeof(policyStatus);
+    policyOk = CertVerifyCertificateChainPolicy(
+        CERT_CHAIN_POLICY_SSL, chain, &policyPara, &policyStatus);
+    if (policyOk && policyStatus.dwError == 0) {
+        policyStatus.dwError = (DWORD)CERT_E_UNTRUSTEDROOT;
+    }
+    relaxed = CryptHttps_RelaxSessionCaChain(chain, extra);
+    if (relaxed) {
+        policyStatus.dwError = 0;
+        policyStatus.lChainIndex = -1;
+        policyStatus.lElementIndex = -1;
+    }
+    ok = Require(relaxed, "policy helper matches session CA") &&
+        Require(policyStatus.dwError == 0, "policy error cleared");
+    CertFreeCertificateChain(chain);
+    CertFreeCertificateContext(leafCtx);
+    CertCloseStore(extra, 0);
+    free(caDer);
+    free(leafDer);
+    EVP_PKEY_free(leafKey);
+    X509_free(leafX509);
+    CaptureCa_Free(ca);
+    return ok;
+}
+
+
+static int TestOpenNamedRootsFromRegistry(void)
+{
+    CAPTURE_CA *ca = CaptureCa_Create();
+    BYTE *caDer = NULL;
+    DWORD caLen = 0;
+    HKEY key = NULL;
+    HCERTSTORE written = NULL;
+    HCERTSTORE opened = NULL;
+    PCCERT_CONTEXT found = NULL;
+    WCHAR name[128];
+    int ok;
+    LONG status;
+
+    if (! Require(ca != NULL, "create CA for registry roots") ||
+            ! EncodeX509(ca->cert, &caDer, &caLen)) {
+        CaptureCa_Free(ca);
+        return Require(0, "encode CA for registry roots");
+    }
+    status = RegCreateKeyExW(
+        HKEY_CURRENT_USER,
+        L"Software\\SbieCaptureHttpsTrustTest",
+        0, NULL, 0, KEY_ALL_ACCESS, NULL, &key, NULL);
+    if (status != 0 || ! key) {
+        free(caDer);
+        CaptureCa_Free(ca);
+        return Require(0, "create disposable registry key");
+    }
+    written = CertOpenStore(CERT_STORE_PROV_REG, 0, 0, 0, key);
+    if (! written ||
+            ! CertAddEncodedCertificateToStore(
+                written,
+                X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+                caDer,
+                caLen,
+                CERT_STORE_ADD_REPLACE_EXISTING,
+                NULL)) {
+        if (written)
+            CertCloseStore(written, 0);
+        RegCloseKey(key);
+        RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\SbieCaptureHttpsTrustTest");
+        free(caDer);
+        CaptureCa_Free(ca);
+        return Require(0, "write CA into disposable registry store");
+    }
+    CertCloseStore(written, 0);
+    RegCloseKey(key);
+    opened = CryptHttps_OpenNamedRootsFromRegistry(
+        HKEY_CURRENT_USER, L"Software\\SbieCaptureHttpsTrustTest");
+    if (opened) {
+        found = CertFindCertificateInStore(
+            opened,
+            X509_ASN_ENCODING | PKCS_7_ASN_ENCODING,
+            0,
+            CERT_FIND_EXISTING,
+            CertCreateCertificateContext(
+                X509_ASN_ENCODING | PKCS_7_ASN_ENCODING, caDer, caLen),
+            NULL);
+        if (! found) {
+            found = CertEnumCertificatesInStore(opened, NULL);
+        }
+        if (found) {
+            name[0] = 0;
+            CertGetNameStringW(
+                found, CERT_NAME_SIMPLE_DISPLAY_TYPE, 0, NULL,
+                name, ARRAYSIZE(name));
+        }
+    }
+    ok = Require(opened != NULL, "open named roots from registry") &&
+        Require(found != NULL, "registry roots contain session CA");
+    if (found)
+        CertFreeCertificateContext(found);
+    if (opened)
+        CertCloseStore(opened, 0);
+    RegDeleteTreeW(HKEY_CURRENT_USER, L"Software\\SbieCaptureHttpsTrustTest");
+    free(caDer);
     CaptureCa_Free(ca);
     return ok;
 }
@@ -754,6 +1191,58 @@ static int TestMissingContextRejected(void)
     return Require(clientOk == 0, "client TLS without context fails") &&
         Require(job.result == HTTPS_MITM_REJECTED,
                 "missing context is rejected");
+}
+
+
+static int TestQueryRedirectContextOnPlainSocketFails(void)
+{
+    SOCKET listener;
+    SOCKET client;
+    SOCKET accepted;
+    struct sockaddr_in addr;
+    int addrLen = sizeof(addr);
+    HTTPS_REDIRECT_CONTEXT context;
+    int queried;
+    int queriedEx;
+    ULONG wsaError = 0;
+
+    listener = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (listener == INVALID_SOCKET)
+        return Require(0, "query-context listener");
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    if (bind(listener, (struct sockaddr *)&addr, sizeof(addr)) != 0 ||
+            listen(listener, 1) != 0) {
+        closesocket(listener);
+        return Require(0, "query-context bind");
+    }
+    addrLen = sizeof(addr);
+    if (getsockname(listener, (struct sockaddr *)&addr, &addrLen) != 0) {
+        closesocket(listener);
+        return Require(0, "query-context getsockname");
+    }
+    client = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (client == INVALID_SOCKET ||
+            connect(client, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        if (client != INVALID_SOCKET)
+            closesocket(client);
+        closesocket(listener);
+        return Require(0, "query-context connect");
+    }
+    accepted = accept(listener, NULL, NULL);
+    memset(&context, 0xCC, sizeof(context));
+    queried = HttpsMitm_QueryRedirectContext(accepted, &context);
+    queriedEx = HttpsMitm_QueryRedirectContextEx(
+        accepted, &context, &wsaError);
+    closesocket(accepted);
+    closesocket(client);
+    closesocket(listener);
+    return Require(queried == 0, "plain socket has no WFP redirect context") &&
+        Require(queriedEx == 0, "ex query fails on plain socket") &&
+        Require(wsaError != 0, "plain socket query reports a WSA error") &&
+        Require(HttpsMitm_QueryRedirectContext(INVALID_SOCKET, &context) == 0,
+                "invalid socket query fails");
 }
 
 
@@ -1031,6 +1520,107 @@ static int FileHasBytes(const WCHAR *path)
 }
 
 
+static int TestServeOnceForwardsDownstreamSni(void)
+{
+    UPSTREAM_SERVER upstream;
+    CAPTURE_CA *ca;
+    HTTPS_MITM_OPTIONS options;
+    HTTPS_MITM *mitm;
+    HTTPS_REDIRECT_CONTEXT context;
+    SERVE_JOB job;
+    HANDLE thread;
+    SOCKET accepted;
+    SOCKET probe;
+    char sessionPem[4096];
+    ULONG pemLength = 0;
+    char response[1024];
+    int ok;
+
+    if (! StartUpstream(&upstream)) {
+        StopUpstream(&upstream);
+        return Require(0, "sni upstream start");
+    }
+    upstream.require_sni = TRUE;
+
+    ca = CaptureCa_Create();
+    if (! ca || CaptureCa_ExportPublicPem(
+            ca, sessionPem, sizeof(sessionPem), &pemLength) != CAPTURE_CA_OK) {
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "sni session CA");
+    }
+
+    context = MakeContext();
+    context.original_port = upstream.port;
+    memset(context.original_address, 0, sizeof(context.original_address));
+    context.original_address[0] = 127;
+    context.original_address[3] = 1;
+
+    memset(&options, 0, sizeof(options));
+    options.ca = ca;
+    options.allow_unverified_upstream = TRUE;
+    mitm = HttpsMitm_Listen(&options);
+    if (! mitm) {
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "sni MITM listen");
+    }
+
+    probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    {
+        struct sockaddr_in addr;
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(HttpsMitm_ListenPort(mitm));
+        if (probe == INVALID_SOCKET ||
+                connect(probe, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+            if (probe != INVALID_SOCKET)
+                closesocket(probe);
+            HttpsMitm_Close(mitm);
+            CaptureCa_Free(ca);
+            StopUpstream(&upstream);
+            return Require(0, "sni client connect");
+        }
+    }
+    accepted = HttpsMitm_Accept(mitm);
+    if (accepted == INVALID_SOCKET) {
+        closesocket(probe);
+        HttpsMitm_Close(mitm);
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "sni MITM accept");
+    }
+    memset(&job, 0, sizeof(job));
+    job.mitm = mitm;
+    job.client = accepted;
+    job.context = context;
+    job.have_context = 1;
+    job.result = HTTPS_MITM_ERROR;
+    thread = CreateThread(NULL, 0, ServeThread, &job, 0, NULL);
+    if (! thread) {
+        closesocket(probe);
+        closesocket(accepted);
+        HttpsMitm_Close(mitm);
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "sni serve thread");
+    }
+    ok = ClientGetOnSocket(
+        probe, sessionPem, TLS1_2_VERSION, TLS1_3_VERSION,
+        response, sizeof(response));
+    WaitForSingleObject(thread, 10000);
+    CloseHandle(thread);
+    HttpsMitm_Close(mitm);
+    CaptureCa_Free(ca);
+    StopUpstream(&upstream);
+    return Require(ok, "client GET with forwarded SNI") &&
+        Require(strstr(response, "upstream-ok") != NULL,
+                "upstream required SNI and still answered") &&
+        Require(job.result == HTTPS_MITM_OK, "ServeOnce ok with forwarded SNI");
+}
+
+
 int main(void)
 {
     WSADATA wsa;
@@ -1044,9 +1634,16 @@ int main(void)
 
     ok = TestCaPublicPemHasNoPrivateKey() &&
         TestImportPublicPemToDisposableStore() &&
+        TestRemovePublicPemFromStore() &&
+        TestImportPublicPemToMachineStoreIsBestEffort() &&
+        TestLeafTrustedWithSessionCaExtraStore() &&
+        TestPolicyRelaxClearsUntrustedRoot() &&
+        TestOpenNamedRootsFromRegistry() &&
         TestTls13RoundTrip() &&
         TestTls12RoundTrip() &&
         TestMissingContextRejected() &&
+        TestQueryRedirectContextOnPlainSocketFails() &&
+        TestServeOnceForwardsDownstreamSni() &&
         TestBrokerHttpsListenWritesHarAndPcapng();
 
     WSACleanup();

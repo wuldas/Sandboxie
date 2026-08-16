@@ -30,8 +30,16 @@
 #include "core/drv/api_flags.h"
 
 #include <wincrypt.h>
+#ifndef CRYPT_STRING_BASE64ANY
+#define CRYPT_STRING_BASE64ANY 0x00000006
+#endif
 #include <sddl.h>
 #include <stddef.h>
+#include <userenv.h>
+#include <wtsapi32.h>
+
+#pragma comment(lib, "userenv.lib")
+#pragma comment(lib, "wtsapi32.lib")
 
 
 //---------------------------------------------------------------------------
@@ -61,6 +69,7 @@ typedef struct _CAPTURE_SESSION_OBJ {
     HANDLE export_file;
     HANDLE har_file;
     HANDLE ca_file;
+    WCHAR ca_path[MAX_PATH];
     HANDLE section_handle;
     HANDLE broker_job;
     HANDLE broker_process;
@@ -876,6 +885,10 @@ MSG_HEADER *CaptureServer::QueryCapsHandler(MSG_HEADER *msg)
         if (driverFlags & CAPTURE_DRIVER_FLAG_INCLUDE_PAYLOAD)
             rpl->capabilities |= CAPTURE_CAP_PACKET_CAPTURE |
                 CAPTURE_CAP_PCAPNG_EXPORT;
+        if ((driverFlags & CAPTURE_DRIVER_FLAG_INCLUDE_PAYLOAD) &&
+                (driverFlags & CAPTURE_DRIVER_FLAG_HTTPS_REDIRECT))
+            rpl->capabilities |= CAPTURE_CAP_HTTPS_INSPECTION |
+                CAPTURE_CAP_HAR_EXPORT;
 #endif
     }
     rpl->max_sessions_per_owner = CAPTURE_MAX_SESSIONS_PER_OWNER;
@@ -2054,8 +2067,10 @@ static ULONG CaptureServer_WaitListenPort(
             status = STATUS_SUCCESS;
             break;
         }
-        if (GetTickCount() - startTick >= 5000)
+        if (GetTickCount() - startTick >= 5000) {
+            status = STATUS_IO_TIMEOUT;
             break;
+        }
         Sleep(20);
     }
     UnmapViewOfFile(section);
@@ -2064,7 +2079,8 @@ static ULONG CaptureServer_WaitListenPort(
 
 
 static ULONG CaptureServer_EnableHttpsRedirect(
-    const CAPTURE_SESSION_ID *captureId)
+    CAPTURE_SESSION_OBJ *session,
+    ULONG brokerPid)
 {
     UCHAR buffer[CAPTURE_DRIVER_CONTROL_BASE_SIZE];
     memzero(buffer, sizeof(buffer));
@@ -2072,131 +2088,163 @@ static ULONG CaptureServer_EnableHttpsRedirect(
     control->version = CAPTURE_DRIVER_VERSION;
     control->size = sizeof(buffer);
     control->operation = CAPTURE_DRIVER_CONTROL_ENABLE_HTTPS;
-    control->capture_id.high = captureId->high;
-    control->capture_id.low = captureId->low;
+    if (! session || ! brokerPid)
+        return STATUS_INVALID_PARAMETER;
+    control->capture_id.high = session->info.capture_id.high;
+    control->capture_id.low = session->info.capture_id.low;
+    control->target_pid = brokerPid;
     return SbieApi_Call(API_CAPTURE_CONTROL, 1, (ULONG_PTR)control);
 }
 
 
-static ULONG CaptureServer_ImportCaInBox(CAPTURE_SESSION_OBJ *session)
+static ULONG CaptureServer_RunCaTool(
+    CAPTURE_SESSION_OBJ *session,
+    BOOLEAN boxed,
+    BOOLEAN remove)
 {
     HANDLE ownerProcess = NULL;
     HANDLE ownerToken = NULL;
     HANDLE primaryToken = NULL;
-    HANDLE childCa = NULL;
-    HANDLE inheritedHandles[1] = { 0 };
+    HANDLE impersonationToken = NULL;
+    LPVOID environment = NULL;
     WCHAR homePath[512];
+    WCHAR startPath[512];
     WCHAR executablePath[512];
-    WCHAR commandLine[768];
-    SBIE_STARTUPINFOEXW startup = { 0 };
+    WCHAR commandLine[1280];
+    STARTUPINFOW startup = { 0 };
     PROCESS_INFORMATION processInfo = { 0 };
-    PVOID attributes = NULL;
-    SIZE_T attributesSize = 0;
-    BOOL attributesInitialized = FALSE;
     ULONG status = STATUS_UNSUCCESSFUL;
     DWORD exitCode = STILL_ACTIVE;
-    HMODULE kernel32;
-    SBIE_INITIALIZE_ATTRIBUTE_LIST initializeAttributes;
-    SBIE_UPDATE_ATTRIBUTE updateAttribute;
-    SBIE_DELETE_ATTRIBUTE_LIST deleteAttributes;
 
-    if (! session || ! session->ca_file)
+    if (! session || ! session->ca_file || ! session->ca_path[0])
         return STATUS_DEVICE_NOT_READY;
 
     ownerProcess = OpenProcess(
         PROCESS_QUERY_INFORMATION, FALSE, session->owner_pid);
-    if (! ownerProcess)
-        goto cleanup;
-    if (! OpenProcessToken(
-            ownerProcess,
-            TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY,
-            &ownerToken) ||
-            ! DuplicateTokenEx(
-                ownerToken,
-                TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY,
-                NULL, SecurityImpersonation, TokenPrimary, &primaryToken)) {
+    if (! ownerProcess) {
+        status = STATUS_INVALID_HANDLE;
         goto cleanup;
     }
-    if (! CaptureServer_DuplicateInheritable(session->ca_file, &childCa))
+    {
+        DWORD ownerSession = 0;
+        if (! ProcessIdToSessionId(session->owner_pid, &ownerSession) ||
+                ownerSession == 0 ||
+                ! WTSQueryUserToken(ownerSession, &ownerToken)) {
+            ownerToken = NULL;
+        }
+    }
+    if (! ownerToken &&
+            ! OpenProcessToken(
+                ownerProcess,
+                TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY,
+                &ownerToken)) {
+        status = STATUS_ACCESS_DENIED;
         goto cleanup;
-    inheritedHandles[0] = childCa;
+    }
+    if (! DuplicateTokenEx(
+                ownerToken,
+                TOKEN_DUPLICATE | TOKEN_ASSIGN_PRIMARY | TOKEN_QUERY |
+                    TOKEN_IMPERSONATE,
+                NULL, SecurityImpersonation, TokenPrimary, &primaryToken) ||
+            ! DuplicateToken(
+                primaryToken, SecurityImpersonation, &impersonationToken)) {
+        status = STATUS_ACCESS_DENIED;
+        goto cleanup;
+    }
 
-    if (SbieApi_GetHomePath(NULL, 0, homePath, ARRAYSIZE(homePath)) != 0)
+    if (SbieApi_GetHomePath(NULL, 0, homePath, ARRAYSIZE(homePath)) != 0) {
+        status = STATUS_OBJECT_PATH_NOT_FOUND;
         goto cleanup;
-    if (wcscpy_s(executablePath, ARRAYSIZE(executablePath), homePath) != 0 ||
+    }
+    if (wcscpy_s(startPath, ARRAYSIZE(startPath), homePath) != 0 ||
+            wcscat_s(startPath, ARRAYSIZE(startPath), L"\\Start.exe") != 0 ||
+            wcscpy_s(executablePath, ARRAYSIZE(executablePath), homePath) != 0 ||
             wcscat_s(executablePath, ARRAYSIZE(executablePath),
                      L"\\SbieCapture.exe") != 0) {
+        status = STATUS_BUFFER_OVERFLOW;
         goto cleanup;
     }
-    if (swprintf_s(
-            commandLine, ARRAYSIZE(commandLine),
-            L"\"%s\" --import-ca %p --store Root",
-            executablePath, childCa) < 0) {
-        goto cleanup;
+    if (boxed) {
+        if (! session->info.box_name[0] ||
+                swprintf_s(
+                    commandLine, ARRAYSIZE(commandLine),
+                    L"\"%s\" /box:%s /silent /hide_window /wait \"%s\" "
+                    L"--%s-ca-path \"%s\" --store Root",
+                    startPath, session->info.box_name, executablePath,
+                    remove ? L"remove" : L"import",
+                    session->ca_path) < 0) {
+            status = STATUS_BUFFER_OVERFLOW;
+            goto cleanup;
+        }
+    }
+    else if (remove) {
+        //
+        // registry-direct removal by certificate hash; the system-store
+        // view and the registry share the same backing keys
+        //
+        if (wcscpy_s(startPath, ARRAYSIZE(startPath), executablePath) != 0 ||
+                swprintf_s(
+                    commandLine, ARRAYSIZE(commandLine),
+                    L"\"%s\" --remove-ca-path \"%s\" --store Root",
+                    executablePath, session->ca_path) < 0) {
+            status = STATUS_BUFFER_OVERFLOW;
+            goto cleanup;
+        }
+    }
+    else {
+        //
+        // host import: write the session CA into the host user's Root
+        // store (registry-direct).  the trust decision for sandboxed
+        // schannel clients is taken by host-side machinery which cannot
+        // see the sandboxed (virtualized) copy, so the CA must also be
+        // present in the real user hive for the capture session.
+        //
+        if (swprintf_s(
+                commandLine, ARRAYSIZE(commandLine),
+                L"\"%s\" --import-ca-path \"%s\" --store Root",
+                executablePath, session->ca_path) < 0) {
+            status = STATUS_BUFFER_OVERFLOW;
+            goto cleanup;
+        }
+        if (wcscpy_s(startPath, ARRAYSIZE(startPath), executablePath) != 0) {
+            status = STATUS_BUFFER_OVERFLOW;
+            goto cleanup;
+        }
     }
 
-    kernel32 = GetModuleHandleW(L"kernel32.dll");
-    if (! kernel32)
-        goto cleanup;
-    initializeAttributes = (SBIE_INITIALIZE_ATTRIBUTE_LIST)
-        GetProcAddress(kernel32, "InitializeProcThreadAttributeList");
-    updateAttribute = (SBIE_UPDATE_ATTRIBUTE)
-        GetProcAddress(kernel32, "UpdateProcThreadAttribute");
-    deleteAttributes = (SBIE_DELETE_ATTRIBUTE_LIST)
-        GetProcAddress(kernel32, "DeleteProcThreadAttributeList");
-    if (! initializeAttributes || ! updateAttribute || ! deleteAttributes)
-        goto cleanup;
-    initializeAttributes(NULL, 1, 0, &attributesSize);
-    attributes = HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, attributesSize);
-    if (! attributes ||
-            ! initializeAttributes(attributes, 1, 0, &attributesSize)) {
+    startup.cb = sizeof(startup);
+    startup.lpDesktop = L"WinSta0\\Default";
+    startup.dwFlags = STARTF_USESHOWWINDOW | STARTF_FORCEOFFFEEDBACK;
+    startup.wShowWindow = SW_HIDE;
+    if (! CreateEnvironmentBlock(&environment, primaryToken, FALSE))
+        environment = NULL;
+    if (! SetThreadToken(NULL, impersonationToken) ||
+            ! CreateProcessAsUserW(
+                primaryToken, startPath, commandLine, NULL, NULL, FALSE,
+                CREATE_NO_WINDOW | CREATE_UNICODE_ENVIRONMENT,
+                environment, NULL, &startup, &processInfo)) {
+        status = STATUS_PRIVILEGE_NOT_HELD;
         goto cleanup;
     }
-    attributesInitialized = TRUE;
-    if (! updateAttribute(
-            attributes, 0, SBIE_PROC_THREAD_ATTRIBUTE_HANDLE_LIST,
-            inheritedHandles, sizeof(inheritedHandles), NULL, NULL)) {
-        goto cleanup;
-    }
-
-    startup.StartupInfo.cb = sizeof(startup);
-    startup.attribute_list = attributes;
-    if (! CreateProcessAsUserW(
-            primaryToken, NULL, commandLine, NULL, NULL, TRUE,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED |
-                CREATE_NO_WINDOW,
-            NULL, NULL, &startup.StartupInfo, &processInfo)) {
-        goto cleanup;
-    }
-    if (SbieApi_Call(
-            API_START_PROCESS, 2,
-            (ULONG_PTR)session->info.box_name,
-            (ULONG_PTR)processInfo.dwProcessId) != 0) {
-        TerminateProcess(processInfo.hProcess, ERROR_PROCESS_ABORTED);
-        goto cleanup;
-    }
-    if (ResumeThread(processInfo.hThread) == (DWORD)-1) {
-        TerminateProcess(processInfo.hProcess, ERROR_PROCESS_ABORTED);
-        goto cleanup;
-    }
-    if (WaitForSingleObject(processInfo.hProcess, 10000) != WAIT_OBJECT_0 ||
+    if (WaitForSingleObject(processInfo.hProcess, 20000) != WAIT_OBJECT_0 ||
             ! GetExitCodeProcess(processInfo.hProcess, &exitCode) ||
             exitCode != 0) {
+        if (exitCode == STILL_ACTIVE)
+            TerminateProcess(processInfo.hProcess, 0);
         goto cleanup;
     }
     status = STATUS_SUCCESS;
 
 cleanup:
-    if (attributesInitialized)
-        deleteAttributes(attributes);
-    if (attributes)
-        HeapFree(GetProcessHeap(), 0, attributes);
+    SetThreadToken(NULL, NULL);
+    if (environment)
+        DestroyEnvironmentBlock(environment);
     if (processInfo.hThread)
         CloseHandle(processInfo.hThread);
     if (processInfo.hProcess)
         CloseHandle(processInfo.hProcess);
-    if (childCa)
-        CloseHandle(childCa);
+    if (impersonationToken)
+        CloseHandle(impersonationToken);
     if (primaryToken)
         CloseHandle(primaryToken);
     if (ownerToken)
@@ -2237,6 +2285,7 @@ static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session)
     SBIE_UPDATE_ATTRIBUTE updateAttribute = NULL;
     SBIE_DELETE_ATTRIBUTE_LIST deleteAttributes = NULL;
     HMODULE kernel32 = NULL;
+    LPVOID environment = NULL;
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION limits = { 0 };
     DWORD exitCode = STILL_ACTIVE;
     WCHAR homePath[512];
@@ -2302,20 +2351,57 @@ static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session)
     inheritedHandles[1] = childFile;
     inheritedHandles[2] = childStopEvent;
     if (CaptureServer_IsHttpsMode(session)) {
+        WCHAR profileDir[MAX_PATH];
         WCHAR tempDir[MAX_PATH];
         WCHAR tempPath[MAX_PATH];
-        if (! GetTempPathW(ARRAYSIZE(tempDir), tempDir) ||
-                ! GetTempFileNameW(tempDir, L"sca", 0, tempPath)) {
+        HANDLE impersonationToken = NULL;
+        DWORD profileLen;
+        if (! DuplicateToken(
+                primaryToken, SecurityImpersonation, &impersonationToken) ||
+                ! SetThreadToken(NULL, impersonationToken)) {
+            if (impersonationToken)
+                CloseHandle(impersonationToken);
+            goto cleanup;
+        }
+
+        //
+        // the PEM must land in the OWNER's temp, not the service's
+        // (GetTempPathW reads the service process environment = C:\WINDOWS
+        // \TEMP, which sandboxed children cannot reliably read).  resolve
+        // the owner profile and use <profile>\AppData\Local\Temp.
+        //
+        profileLen = ARRAYSIZE(profileDir);
+        if (! GetUserProfileDirectoryW(
+                impersonationToken, profileDir, &profileLen) ||
+                swprintf_s(
+                    tempDir, ARRAYSIZE(tempDir),
+                    L"%s\\AppData\\Local\\Temp", profileDir) < 0) {
+            //
+            // fallback: service temp (best effort)
+            //
+            if (! GetTempPathW(ARRAYSIZE(tempDir), tempDir)) {
+                SetThreadToken(NULL, NULL);
+                CloseHandle(impersonationToken);
+                goto cleanup;
+            }
+        }
+        CreateDirectoryW(tempDir, NULL);
+        if (! GetTempFileNameW(tempDir, L"sca", 0, tempPath)) {
+            SetThreadToken(NULL, NULL);
+            CloseHandle(impersonationToken);
             goto cleanup;
         }
         session->ca_file = CreateFileW(
             tempPath, GENERIC_READ | GENERIC_WRITE,
             FILE_SHARE_READ | FILE_SHARE_WRITE, NULL, CREATE_ALWAYS,
-            FILE_ATTRIBUTE_TEMPORARY | FILE_FLAG_DELETE_ON_CLOSE, NULL);
+            FILE_ATTRIBUTE_TEMPORARY, NULL);
+        SetThreadToken(NULL, NULL);
+        CloseHandle(impersonationToken);
         if (! session->ca_file || session->ca_file == INVALID_HANDLE_VALUE) {
             session->ca_file = NULL;
             goto cleanup;
         }
+        wcscpy_s(session->ca_path, ARRAYSIZE(session->ca_path), tempPath);
         if (! CaptureServer_DuplicateInheritable(
                 session->har_file, &childHar) ||
                 ! CaptureServer_DuplicateInheritable(
@@ -2361,7 +2447,8 @@ static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session)
         WCHAR extra[256];
         if (swprintf_s(
                 extra, ARRAYSIZE(extra),
-                L" --https-listen --har %p --ca-file %p",
+                L" --https-listen --har %p --ca-file %p "
+                L"--https-import-host-root",
                 childHar, childCa) < 0 ||
                 wcscat_s(commandLine, ARRAYSIZE(commandLine), extra) != 0) {
             goto cleanup;
@@ -2400,6 +2487,15 @@ static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session)
 
     startup.StartupInfo.cb = sizeof(startup);
     startup.attribute_list = attributes;
+
+    //
+    // build the owner's environment so the broker resolves per-user paths
+    // (LOCALAPPDATA) correctly; without this it inherits the service's
+    // SYSTEM environment and would write the persistent CA to systemprofile
+    //
+    if (! CreateEnvironmentBlock(&environment, primaryToken, FALSE))
+        environment = NULL;
+
     if (! CreateProcessAsUserW(
             primaryToken,
             NULL,
@@ -2407,8 +2503,9 @@ static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session)
             NULL,
             NULL,
             TRUE,
-            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED,
-            NULL,
+            EXTENDED_STARTUPINFO_PRESENT | CREATE_SUSPENDED |
+                (environment ? CREATE_UNICODE_ENVIRONMENT : 0),
+            environment,
             NULL,
             &startup.StartupInfo,
             &processInfo)) {
@@ -2436,10 +2533,8 @@ static ULONG CaptureServer_StartBroker(CAPTURE_SESSION_OBJ *session)
         status = CaptureServer_WaitListenPort(
             session->section_handle, &listenPort);
         if (NT_SUCCESS(status))
-            status = CaptureServer_ImportCaInBox(session);
-        if (NT_SUCCESS(status))
             status = CaptureServer_EnableHttpsRedirect(
-                &session->info.capture_id);
+                session, processInfo.dwProcessId);
         if (! NT_SUCCESS(status))
             goto cleanup;
     }
@@ -2461,7 +2556,11 @@ cleanup:
         deleteAttributes(attributes);
     if (attributes)
         HeapFree(GetProcessHeap(), 0, attributes);
+    if (environment)
+        DestroyEnvironmentBlock(environment);
     if (processCreated && status != STATUS_SUCCESS) {
+        DWORD died = STILL_ACTIVE;
+        GetExitCodeProcess(processInfo.hProcess, &died);
         TerminateProcess(processInfo.hProcess, ERROR_PROCESS_ABORTED);
         WaitForSingleObject(processInfo.hProcess, 5000);
     }
@@ -2710,8 +2809,17 @@ ULONG CaptureServer::StopBackend(
         session->har_file = NULL;
     }
     if (! session->backend_active && session->ca_file) {
+        //
+        // the session CA lives only in the HOST user Root (persistent CA,
+        // imported by the broker and intentionally left installed).  no
+        // per-box virtual Root import is done, so nothing to remove here.
+        //
         CloseHandle(session->ca_file);
         session->ca_file = NULL;
+        if (session->ca_path[0]) {
+            DeleteFileW(session->ca_path);
+            session->ca_path[0] = 0;
+        }
     }
     if (! session->backend_active && session->section_handle) {
         CloseHandle(session->section_handle);
@@ -2765,6 +2873,8 @@ void CaptureServer::DeleteSession(CAPTURE_SESSION_OBJ *session)
         CloseHandle(session->har_file);
     if (session->ca_file)
         CloseHandle(session->ca_file);
+    if (session->ca_path[0])
+        DeleteFileW(session->ca_path);
     if (session->section_handle)
         CloseHandle(session->section_handle);
     if (session->stopped_events)

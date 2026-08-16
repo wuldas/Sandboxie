@@ -564,6 +564,15 @@ _FX void Dll_InitExeEntry(void)
     //
 
     //
+    // HTTPS capture: crypt32/sspicli are static imports of clients like
+    // curl.exe, so they were mapped before our LDR notification existed.
+    // Make sure their hook init runs before the image entrypoint executes.
+    //
+
+    Ldr_InitLoadedDll(L"crypt32.dll");
+    Ldr_InitLoadedDll(L"sspicli.dll");
+
+    //
     // hook DefWindowProc on Windows 7, after USER32 has been initialized
     //
 

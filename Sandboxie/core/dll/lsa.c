@@ -132,5 +132,5 @@ _FX BOOLEAN Lsa_Init_SspiCli(HMODULE module)
         return TRUE;
     }
 
-    return Lsa_Init_Common(DllName_sspicli, module);
+    return Lsa_Init_Common(DllName_sspicli, module) && Crypt_InitSspi(module);
 }

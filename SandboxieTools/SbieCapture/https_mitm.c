@@ -24,6 +24,8 @@
 #include "har.h"
 #include "http11.h"
 
+#include <mstcpip.h>
+
 #include <openssl/bio.h>
 #include <openssl/err.h>
 #include <openssl/pem.h>
@@ -462,6 +464,156 @@ int HttpsMitm_RecvContext(SOCKET client, HTTPS_REDIRECT_CONTEXT *context)
 }
 
 
+int HttpsMitm_QueryRedirectContext(
+    SOCKET client,
+    HTTPS_REDIRECT_CONTEXT *context)
+{
+    ULONG ignored = 0;
+    return HttpsMitm_QueryRedirectContextEx(client, context, &ignored);
+}
+
+
+static int HttpsMitm_IoctlTimed(
+    SOCKET client,
+    DWORD code,
+    void *outBuf,
+    DWORD outLen,
+    DWORD *bytes,
+    ULONG timeoutMs,
+    ULONG *wsaError)
+{
+    WSAOVERLAPPED overlapped;
+    DWORD localBytes = 0;
+    DWORD flags = 0;
+    HANDLE eventHandle;
+
+    if (bytes)
+        *bytes = 0;
+    memset(&overlapped, 0, sizeof(overlapped));
+    eventHandle = CreateEventW(NULL, TRUE, FALSE, NULL);
+    if (! eventHandle) {
+        if (wsaError)
+            *wsaError = GetLastError();
+        return 0;
+    }
+    overlapped.hEvent = eventHandle;
+    if (WSAIoctl(
+            client, code, NULL, 0, outBuf, outLen, &localBytes,
+            &overlapped, NULL) == 0) {
+        if (bytes)
+            *bytes = localBytes;
+        CloseHandle(eventHandle);
+        if (wsaError)
+            *wsaError = 0;
+        return 1;
+    }
+    if (WSAGetLastError() != WSA_IO_PENDING) {
+        if (wsaError)
+            *wsaError = (ULONG)WSAGetLastError();
+        CloseHandle(eventHandle);
+        return 0;
+    }
+    if (WaitForSingleObject(eventHandle, timeoutMs) != WAIT_OBJECT_0) {
+        CancelIo((HANDLE)(ULONG_PTR)client);
+        if (wsaError)
+            *wsaError = WSAETIMEDOUT;
+        CloseHandle(eventHandle);
+        return 0;
+    }
+    if (! WSAGetOverlappedResult(
+            client, &overlapped, &localBytes, FALSE, &flags)) {
+        if (wsaError)
+            *wsaError = (ULONG)WSAGetLastError();
+        CloseHandle(eventHandle);
+        return 0;
+    }
+    if (bytes)
+        *bytes = localBytes;
+    CloseHandle(eventHandle);
+    if (wsaError)
+        *wsaError = 0;
+    return 1;
+}
+
+
+int HttpsMitm_QueryRedirectContextEx(
+    SOCKET client,
+    HTTPS_REDIRECT_CONTEXT *context,
+    ULONG *wsaError)
+{
+    UCHAR stackBuf[512];
+    UCHAR *buffer = stackBuf;
+    DWORD bytes = 0;
+    ULONG error = 0;
+    int ok = 0;
+
+    if (wsaError)
+        *wsaError = WSAEINVAL;
+    if (client == INVALID_SOCKET || ! context)
+        return 0;
+    memset(context, 0, sizeof(*context));
+    if (! HttpsMitm_IoctlTimed(
+            client, SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT,
+            stackBuf, sizeof(stackBuf), &bytes, 300, &error)) {
+        if (error == WSAENOBUFS && bytes > sizeof(stackBuf) && bytes < 8192) {
+            buffer = (UCHAR *)HeapAlloc(GetProcessHeap(), HEAP_ZERO_MEMORY, bytes);
+            if (! buffer) {
+                if (wsaError)
+                    *wsaError = ERROR_NOT_ENOUGH_MEMORY;
+                return 0;
+            }
+            if (! HttpsMitm_IoctlTimed(
+                    client, SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT,
+                    buffer, bytes, &bytes, 300, &error)) {
+                HeapFree(GetProcessHeap(), 0, buffer);
+                if (wsaError)
+                    *wsaError = error;
+                return 0;
+            }
+        }
+        else {
+            if (wsaError)
+                *wsaError = error;
+            return 0;
+        }
+    }
+    if (bytes >= sizeof(*context) &&
+            ((HTTPS_REDIRECT_CONTEXT *)buffer)->magic ==
+                HTTPS_REDIRECT_CONTEXT_MAGIC) {
+        memcpy(context, buffer, sizeof(*context));
+        ok = 1;
+        error = 0;
+    }
+    else if (wsaError && error == 0)
+        error = WSAEINVAL;
+    if (buffer != stackBuf)
+        HeapFree(GetProcessHeap(), 0, buffer);
+    if (wsaError)
+        *wsaError = error;
+    return ok;
+}
+
+
+static void HttpsMitm_ForwardRedirectRecords(SOCKET accepted, SOCKET upstream)
+{
+    UCHAR records[4096];
+    DWORD bytes = 0;
+    ULONG error = 0;
+
+    if (accepted == INVALID_SOCKET || upstream == INVALID_SOCKET)
+        return;
+    if (! HttpsMitm_IoctlTimed(
+            accepted, SIO_QUERY_WFP_CONNECTION_REDIRECT_RECORDS,
+            records, sizeof(records), &bytes, 300, &error) ||
+            bytes == 0) {
+        return;
+    }
+    WSAIoctl(
+        upstream, SIO_SET_WFP_CONNECTION_REDIRECT_RECORDS,
+        records, bytes, NULL, 0, &bytes, NULL, NULL);
+}
+
+
 int HttpsMitm_ServeOnce(
     HTTPS_MITM *mitm,
     SOCKET client,
@@ -482,7 +634,11 @@ int HttpsMitm_ServeOnce(
 
     if (! mitm || client == INVALID_SOCKET)
         return HTTPS_MITM_ERROR;
-    if (! mitm->have_expected ||
+    if (! context || context->magic != HTTPS_REDIRECT_CONTEXT_MAGIC) {
+        shutdown(client, SD_BOTH);
+        return HTTPS_MITM_REJECTED;
+    }
+    if (mitm->have_expected &&
             ! HttpsMitm_ContextEqual(&mitm->expected, context)) {
         shutdown(client, SD_BOTH);
         return HTTPS_MITM_REJECTED;
@@ -504,6 +660,7 @@ int HttpsMitm_ServeOnce(
         char host[64];
         const char *upstreamHost = mitm->upstream_host;
         USHORT upstreamPort = mitm->upstream_port;
+        const char *sni = SSL_get_servername(down, TLSEXT_NAMETYPE_host_name);
         if ((! upstreamHost[0] || upstreamPort == 0) && context) {
             HttpsMitm_FormatIpv4(context->original_address, host, sizeof(host));
             upstreamHost = host;
@@ -511,15 +668,18 @@ int HttpsMitm_ServeOnce(
                 upstreamPort = context->original_port;
         }
         upstream = HttpsMitm_ConnectTcp(upstreamHost, upstreamPort);
+        if (upstream == INVALID_SOCKET)
+            goto done;
+        HttpsMitm_ForwardRedirectRecords(client, upstream);
+        up = SSL_new(upCtx);
+        if (! up)
+            goto done;
+        SSL_set_fd(up, (int)upstream);
+        if (sni && sni[0])
+            SSL_set_tlsext_host_name(up, sni);
+        if (SSL_connect(up) != 1)
+            goto done;
     }
-    if (upstream == INVALID_SOCKET)
-        goto done;
-    up = SSL_new(upCtx);
-    if (! up)
-        goto done;
-    SSL_set_fd(up, (int)upstream);
-    if (SSL_connect(up) != 1)
-        goto done;
 
     if (! HttpsMitm_ReadMessage(
             down, requestBuf, sizeof(requestBuf), &requestSize, 1,

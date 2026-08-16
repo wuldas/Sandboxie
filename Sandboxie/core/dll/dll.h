@@ -669,6 +669,8 @@ BOOLEAN Ldr_Init(void);
 
 void Ldr_CallDllCallbacks_WithLock(void);
 
+void Ldr_InitLoadedDll(const WCHAR *name);
+
 BOOLEAN Ldr_MakeStaticDll(ULONG_PTR BaseAddress);
 
 void *Ldr_GetProcAddrNew(const WCHAR *DllName, const WCHAR *ProcNameW,char *ProcNameA);
@@ -692,6 +694,8 @@ BOOLEAN Cred_Init(HMODULE);
 BOOLEAN NcryptProv_Init(HMODULE module);
 
 BOOLEAN Crypt_Init(HMODULE);
+
+BOOLEAN Crypt_InitSspi(HMODULE);
 
 BOOLEAN Trust_Init(HMODULE);
 
