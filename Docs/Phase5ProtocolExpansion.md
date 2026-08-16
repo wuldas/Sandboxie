@@ -252,9 +252,9 @@ boxed 客户端 → WFP 重定向 → broker 监听套接字（不变）
 
 ---
 
-## 开放问题（不阻塞 Slice 1–2）
+## 开放问题（全部已在 Phase 5 落地时解决）
 
-1. **手写 HPACK 还是 nghttp2。** 默认手写以保证可审查性，延续 Phase 4 的不用库约定。若 Huffman 表 + 编解码器膨胀超过约 1,500 行或测试变得不稳定，切换到 nghttp2（仅链接进 `SbieCapture.exe`）并在此注明。
-2. **h2→h2 上游优先级。** Slice 6（h2→h2 + gRPC）是最大的 slice。与用户确认 gRPC 是 Phase 5 硬性要求还是可以滑到 Phase 5.1；若滑期，Slice 5（h2→h1）仍为浏览器/curl 交付 HTTP/2 检查。
-3. **Firefox 机制。** `security.enterprise_roots.enabled` 侵入最小但信任整个宿主 Root store；`certutil` cert9.db 注入更精准但盒内需要 NSS 工具。Slice 8 期间决定哪个是 MVP。
-4. **key-log 面。** key-log 需要新 SET-export 消息还是可复用既有句柄，在 Slice 7 broker 回调可用后决定。
+1. **手写 HPACK 还是 nghttp2。** ✅ 已解决（Slice 1）：手写。`hpack.c` + `hpack.h` 共 785 行，低于 1,500 行阈值；`HpackTests` 78 checks 全部通过（含 RFC 7541 附录 C 全部向量、Huffman 往返、畸形输入拒绝），测试稳定，无需切换到 nghttp2。
+2. **h2→h2 上游优先级。** ✅ 已解决（Slice 6）：gRPC 按 Phase 5 硬性要求实现——h2→h2 上游中继 + gRPC 元数据捕获（元数据 + trailers + 消息计数）已交付。
+3. **Firefox 机制。** ✅ 已解决（Slice 8）：两种机制都实现——`--firefox-enterprise-roots`（enterprise roots，首选）与 `--firefox-import-ca`（certutil cert9.db 注入，更强），均仅限 boxed profile，`--certutil` 可指定工具路径。
+4. **key-log 面。** ✅ 已解决（Slice 7）：复用调用方打开的既有文件句柄，经 `--keylog HANDLE` 启动参数传递；未新增 SET-export 消息，预留的 `MSGID_CAPTURE_SET_KEYLOG_EXPORT 0x200B` 与 `CAPTURE_FLAG_KEYLOG` 未实现（代码中不存在）。
