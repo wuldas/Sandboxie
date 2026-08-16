@@ -295,6 +295,145 @@ static int HttpsMitm_SslWriteAll(SSL *ssl, const char *buffer, ULONG size)
 }
 
 
+/* Case-insensitive token match within a comma-separated header value. */
+static int HttpsMitm_HeaderHasToken(const char *value, const char *token)
+{
+    const char *cursor;
+    size_t tokenLen;
+
+    if (! value || ! token)
+        return 0;
+    tokenLen = strlen(token);
+    cursor = value;
+    while (*cursor) {
+        while (*cursor == ' ' || *cursor == '\t' || *cursor == ',')
+            ++cursor;
+        if (! *cursor)
+            break;
+        if (_strnicmp(cursor, token, tokenLen) == 0) {
+            char next = cursor[tokenLen];
+            if (next == 0 || next == ',' || next == ' ' || next == '\t' ||
+                    next == ';')
+                return 1;
+        }
+        while (*cursor && *cursor != ',')
+            ++cursor;
+    }
+    return 0;
+}
+
+
+/* RFC 6455 opening handshake: Upgrade + Connection tokens and a key. */
+static int HttpsMitm_IsWebSocketUpgrade(const HTTP11_REQUEST *request)
+{
+    const HTTP11_HEADER *upgrade;
+    const HTTP11_HEADER *connection;
+    const HTTP11_HEADER *key;
+
+    if (! request)
+        return 0;
+    upgrade = Http11_FindHeader(
+        request->headers, request->header_count, "Upgrade");
+    connection = Http11_FindHeader(
+        request->headers, request->header_count, "Connection");
+    key = Http11_FindHeader(
+        request->headers, request->header_count, "Sec-WebSocket-Key");
+    if (! upgrade || ! connection || ! key)
+        return 0;
+    if (_stricmp(upgrade->value, "websocket") != 0)
+        return 0;
+    return HttpsMitm_HeaderHasToken(connection->value, "upgrade");
+}
+
+
+/* Relay bytes bidirectionally between two established TLS connections until
+   both sides reach EOF.  *bytesIn counts downstream->upstream traffic,
+   *bytesOut counts upstream->downstream.  No WebSocket framing is decoded:
+   this is a transparent byte tunnel. */
+static void HttpsMitm_Tunnel(
+    SSL *down,
+    SSL *up,
+    ULONG64 *bytesIn,
+    ULONG64 *bytesOut)
+{
+    char buffer[HTTPS_MITM_IO_CAP];
+    SOCKET downFd = (SOCKET)SSL_get_fd(down);
+    SOCKET upFd = (SOCKET)SSL_get_fd(up);
+    BOOL downEof = FALSE;
+    BOOL upEof = FALSE;
+
+    *bytesIn = 0;
+    *bytesOut = 0;
+
+    for (;;) {
+        fd_set readSet;
+        struct timeval timeout;
+        int n;
+
+        /* drain already-decrypted data without blocking on select() */
+        if (! downEof && SSL_pending(down) > 0) {
+            n = SSL_read(down, buffer, sizeof(buffer));
+            if (n > 0) {
+                if (! HttpsMitm_SslWriteAll(up, buffer, (ULONG)n))
+                    return;
+                *bytesIn += (ULONG64)n;
+                continue;
+            }
+            downEof = TRUE;
+        }
+        if (! upEof && SSL_pending(up) > 0) {
+            n = SSL_read(up, buffer, sizeof(buffer));
+            if (n > 0) {
+                if (! HttpsMitm_SslWriteAll(down, buffer, (ULONG)n))
+                    return;
+                *bytesOut += (ULONG64)n;
+                continue;
+            }
+            upEof = TRUE;
+        }
+
+        if (downEof && upEof)
+            break;
+
+        FD_ZERO(&readSet);
+        if (! downEof)
+            FD_SET((u_int)downFd, &readSet);
+        if (! upEof)
+            FD_SET((u_int)upFd, &readSet);
+        if (readSet.fd_count == 0)
+            break;
+
+        timeout.tv_sec = 5;
+        timeout.tv_usec = 0;
+        if (select(0, &readSet, NULL, NULL, &timeout) <= 0)
+            continue;
+
+        if (FD_ISSET((u_int)downFd, &readSet)) {
+            n = SSL_read(down, buffer, sizeof(buffer));
+            if (n > 0) {
+                if (! HttpsMitm_SslWriteAll(up, buffer, (ULONG)n))
+                    return;
+                *bytesIn += (ULONG64)n;
+            }
+            else {
+                downEof = TRUE;
+            }
+        }
+        if (FD_ISSET((u_int)upFd, &readSet)) {
+            n = SSL_read(up, buffer, sizeof(buffer));
+            if (n > 0) {
+                if (! HttpsMitm_SslWriteAll(down, buffer, (ULONG)n))
+                    return;
+                *bytesOut += (ULONG64)n;
+            }
+            else {
+                upEof = TRUE;
+            }
+        }
+    }
+}
+
+
 static SOCKET HttpsMitm_ConnectTcp(const char *host, USHORT port)
 {
     SOCKET sock;
@@ -337,7 +476,9 @@ static int HttpsMitm_WriteHar(
     const char *requestBytes,
     ULONG requestSize,
     const char *responseBytes,
-    ULONG responseSize)
+    ULONG responseSize,
+    ULONG64 wsTunnelBytesIn,
+    ULONG64 wsTunnelBytesOut)
 {
     HAR_WRITER *writer;
     HAR_EXCHANGE exchange;
@@ -445,6 +586,8 @@ static int HttpsMitm_WriteHar(
     exchange.response_body_original_len = response->chunked
         ? responseBodyLen : response->content_length;
     exchange.body_cap = 64 * 1024;
+    exchange.ws_tunnel_bytes_in = wsTunnelBytesIn;
+    exchange.ws_tunnel_bytes_out = wsTunnelBytesOut;
 
     status = HarWriter_WriteExchange(writer, &exchange);
     return status == HAR_OK ? HTTPS_MITM_OK : HTTPS_MITM_ERROR;
@@ -778,12 +921,14 @@ int HttpsMitm_ServeOnce(
         MITM_READER upReader;
         ULONG requestSize = 0;
         ULONG responseSize = 0;
+        BOOL isWebSocket;
 
         /* read one request from the downstream client (EOF ends keep-alive) */
         if (! HttpsMitm_ReadMessage(&downReader, requestBuf, sizeof(requestBuf),
                 &requestSize, 1, &request, &response)) {
             break;
         }
+        isWebSocket = HttpsMitm_IsWebSocketUpgrade(&request);
 
         /* open a fresh upstream connection for this request */
         upstream = HttpsMitm_ConnectTcp(upstreamHost, upstreamPort);
@@ -815,9 +960,43 @@ int HttpsMitm_ServeOnce(
         if (! HttpsMitm_SslWriteAll(down, responseBuf, responseSize))
             goto done;
 
+        if (isWebSocket && response.status == 101) {
+            ULONG64 wsIn = 0;
+            ULONG64 wsOut = 0;
+
+            /* fold any bytes the readers already buffered past the handshake
+               into the tunnel's byte accounting */
+            if (downReader.pending_len > 0) {
+                if (! HttpsMitm_SslWriteAll(
+                        up, downReader.pending, downReader.pending_len)) {
+                    goto done;
+                }
+                wsIn += downReader.pending_len;
+                downReader.pending_len = 0;
+            }
+            if (upReader.pending_len > 0) {
+                if (! HttpsMitm_SslWriteAll(
+                        down, upReader.pending, upReader.pending_len)) {
+                    goto done;
+                }
+                wsOut += upReader.pending_len;
+                upReader.pending_len = 0;
+            }
+
+            /* switch to a transparent byte tunnel until both sides close */
+            HttpsMitm_Tunnel(down, up, &wsIn, &wsOut);
+
+            HttpsMitm_WriteHar(mitm, context, down, &request, &response,
+                requestBuf, requestSize, responseBuf, responseSize, wsIn, wsOut);
+
+            served = TRUE;
+            break;   /* the tunneled connection is done; up/upstream are
+                        released in the done: block */
+        }
+
         /* record the exchange (best-effort) */
         HttpsMitm_WriteHar(mitm, context, down, &request, &response,
-            requestBuf, requestSize, responseBuf, responseSize);
+            requestBuf, requestSize, responseBuf, responseSize, 0, 0);
 
         served = TRUE;
 

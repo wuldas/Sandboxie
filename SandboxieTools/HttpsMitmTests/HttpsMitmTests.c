@@ -224,8 +224,29 @@ typedef struct _UPSTREAM_SERVER {
     volatile LONG stop;
     BOOL require_sni;
     BOOL chunked;
+    BOOL websocket;
 
 } UPSTREAM_SERVER;
+
+
+/* WebSocket tunnel fixtures (RFC 6455 opening handshake).  The tunnel is
+   byte-transparent, so these are not decoded -- only counted. */
+static const char kWsHandshakeRequest[] =
+    "GET /chat HTTP/1.1\r\n"
+    "Host: example.com\r\n"
+    "Upgrade: websocket\r\n"
+    "Connection: Upgrade\r\n"
+    "Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n"
+    "Sec-WebSocket-Version: 13\r\n"
+    "\r\n";
+static const char kWs101Response[] =
+    "HTTP/1.1 101 Switching Protocols\r\n"
+    "Upgrade: websocket\r\n"
+    "Connection: Upgrade\r\n"
+    "Sec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n"
+    "\r\n";
+static const char kWsClientPayload[] = "0123456789";   /* 10 bytes */
+static const char kWsServerPayload[] = "HELLO";        /* 5 bytes */
 
 
 static DWORD WINAPI UpstreamThread(void *param)
@@ -289,9 +310,46 @@ static DWORD WINAPI UpstreamThread(void *param)
                 closesocket(client);
                 continue;
             }
-            got = SSL_read(ssl, request, sizeof(request) - 1);
-            if (got > 0)
-                SSL_write(ssl, response, (int)strlen(response));
+            if (server->websocket) {
+                char handshake[2048];
+                int handshakeLen = 0;
+
+                /* read the upgrade handshake until the header terminator */
+                handshake[0] = 0;
+                while (handshakeLen < (int)sizeof(handshake) - 1 &&
+                        strstr(handshake, "\r\n\r\n") == NULL) {
+                    int n = SSL_read(
+                        ssl, handshake + handshakeLen,
+                        (int)sizeof(handshake) - 1 - handshakeLen);
+                    if (n <= 0)
+                        break;
+                    handshakeLen += n;
+                    handshake[handshakeLen] = 0;
+                }
+                if (strstr(handshake, "\r\n\r\n") != NULL)
+                    SSL_write(ssl, kWs101Response,
+                              (int)strlen(kWs101Response));
+
+                /* consume the client's tunneled bytes, then answer */
+                {
+                    int expect = (int)strlen(kWsClientPayload);
+                    int received = 0;
+                    char payload[128];
+                    while (received < expect) {
+                        int n = SSL_read(ssl, payload, sizeof(payload));
+                        if (n <= 0)
+                            break;
+                        received += n;
+                    }
+                }
+                SSL_write(ssl, kWsServerPayload,
+                          (int)strlen(kWsServerPayload));
+            }
+            else {
+                got = SSL_read(ssl, request, sizeof(request) - 1);
+                if (got > 0)
+                    SSL_write(ssl, response, (int)strlen(response));
+            }
         }
         SSL_shutdown(ssl);
         SSL_free(ssl);
@@ -578,6 +636,100 @@ static int ClientGetMultipleOnSocket(
 }
 
 
+/* Perform a WebSocket upgrade handshake over an established TLS connection,
+   then exchange kWsClientPayload for kWsServerPayload.  Returns 1 when the 101
+   response and the full server payload were both received. */
+static int ClientWebSocketOnSocket(
+    SOCKET sock,
+    const char *sessionCaPem,
+    char *response,
+    ULONG responseCap)
+{
+    SSL_CTX *ctx;
+    SSL *ssl;
+    BIO *trustBio;
+    X509 *trustCert;
+    X509_STORE *store;
+    char handshake[2048];
+    int handshakeLen = 0;
+    int echoCap = (int)responseCap;
+    int expected = (int)strlen(kWsServerPayload);
+    int ok = 0;
+
+    if (echoCap < expected + 1)
+        return 0;
+    response[0] = 0;
+    if (sock == INVALID_SOCKET)
+        return 0;
+
+    ctx = SSL_CTX_new(TLS_client_method());
+    if (! ctx) {
+        closesocket(sock);
+        return 0;
+    }
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    trustBio = BIO_new_mem_buf(sessionCaPem, -1);
+    trustCert = trustBio ? PEM_read_bio_X509(trustBio, NULL, NULL, NULL) : NULL;
+    store = SSL_CTX_get_cert_store(ctx);
+    if (! trustCert || X509_STORE_add_cert(store, trustCert) != 1) {
+        X509_free(trustCert);
+        BIO_free(trustBio);
+        SSL_CTX_free(ctx);
+        closesocket(sock);
+        return 0;
+    }
+    X509_free(trustCert);
+    BIO_free(trustBio);
+
+    ssl = SSL_new(ctx);
+    if (! ssl) {
+        SSL_CTX_free(ctx);
+        closesocket(sock);
+        return 0;
+    }
+    SSL_set_fd(ssl, (int)sock);
+    SSL_set_tlsext_host_name(ssl, "example.com");
+    if (SSL_connect(ssl) == 1) {
+        if (SSL_write(ssl, kWsHandshakeRequest,
+                (int)strlen(kWsHandshakeRequest)) > 0) {
+            handshake[0] = 0;
+            while (handshakeLen < (int)sizeof(handshake) - 1 &&
+                    strstr(handshake, "\r\n\r\n") == NULL) {
+                int n = SSL_read(ssl, handshake + handshakeLen,
+                                 (int)sizeof(handshake) - 1 - handshakeLen);
+                if (n <= 0)
+                    break;
+                handshakeLen += n;
+                handshake[handshakeLen] = 0;
+            }
+            if (strstr(handshake, "101") != NULL) {
+                if (SSL_write(ssl, kWsClientPayload,
+                        (int)strlen(kWsClientPayload)) > 0) {
+                    int got = 0;
+                    while (got < expected) {
+                        int n = SSL_read(
+                            ssl, response + got, echoCap - 1 - got);
+                        if (n <= 0)
+                            break;
+                        got += n;
+                        response[got] = 0;
+                    }
+                    if (got == expected)
+                        ok = 1;
+                }
+            }
+        }
+    }
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    closesocket(sock);
+    return ok;
+}
+
+
 static int TestChunkedResponse(void)
 {
     UPSTREAM_SERVER upstream;
@@ -802,6 +954,124 @@ static int TestKeepAliveRoundTrip(void)
     }
     ok = Require(CountOccurrences((const char *)harBytes, "startedDateTime") == 2,
                  "two HAR entries for two exchanges");
+    free(harBytes);
+    DeleteFileW(harPath);
+    return ok;
+}
+
+
+static int TestWebSocketTunnel(void)
+{
+    UPSTREAM_SERVER upstream;
+    CAPTURE_CA *ca;
+    HTTPS_MITM_OPTIONS options;
+    HTTPS_MITM *mitm;
+    HTTPS_REDIRECT_CONTEXT context;
+    SERVE_JOB job;
+    HANDLE thread;
+    SOCKET accepted;
+    SOCKET probe;
+    struct sockaddr_in addr;
+    char sessionPem[4096];
+    ULONG pemLength = 0;
+    char response[512];
+    WCHAR harPath[MAX_PATH];
+    UCHAR *harBytes = NULL;
+    DWORD harSize = 0;
+    int clientOk;
+    int ok;
+
+    if (! StartUpstream(&upstream)) {
+        StopUpstream(&upstream);
+        return Require(0, "ws upstream");
+    }
+    upstream.websocket = TRUE;
+
+    ca = CaptureCa_Create();
+    if (! ca || CaptureCa_ExportPublicPem(
+            ca, sessionPem, sizeof(sessionPem), &pemLength) != CAPTURE_CA_OK) {
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "ws session CA");
+    }
+
+    MakeTempPath(harPath, MAX_PATH, L"sbie-mitm-ws.har");
+    DeleteFileW(harPath);
+
+    context = MakeContext();
+    memset(&options, 0, sizeof(options));
+    options.ca = ca;
+    options.expected_context = &context;
+    options.upstream_host = "127.0.0.1";
+    options.upstream_port = upstream.port;
+    options.upstream_ca_pem = upstream.ca_pem;
+    options.har_path = harPath;
+    options.redact = TRUE;
+    options.include_bodies = TRUE;
+
+    mitm = HttpsMitm_Listen(&options);
+    if (! mitm) {
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "ws listen");
+    }
+
+    probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(HttpsMitm_ListenPort(mitm));
+    if (connect(probe, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        closesocket(probe);
+        HttpsMitm_Close(mitm);
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "ws connect");
+    }
+    accepted = HttpsMitm_Accept(mitm);
+    memset(&job, 0, sizeof(job));
+    job.mitm = mitm;
+    job.client = accepted;
+    job.context = context;
+    job.have_context = 1;
+    job.result = HTTPS_MITM_ERROR;
+    thread = CreateThread(NULL, 0, ServeThread, &job, 0, NULL);
+    if (! thread) {
+        closesocket(probe);
+        closesocket(accepted);
+        HttpsMitm_Close(mitm);
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "ws serve thread");
+    }
+    clientOk = ClientWebSocketOnSocket(
+        probe, sessionPem, response, sizeof(response));
+    WaitForSingleObject(thread, 10000);
+    CloseHandle(thread);
+    closesocket(probe);
+    HttpsMitm_Close(mitm);
+    CaptureCa_Free(ca);
+    StopUpstream(&upstream);
+
+    ok = Require(clientOk, "ws handshake + tunnel round trip") &&
+        Require(job.result == HTTPS_MITM_OK, "ws MITM serve success");
+    if (! ok) {
+        DeleteFileW(harPath);
+        return 0;
+    }
+
+    if (! Require(ReadAll(harPath, &harBytes, &harSize), "read ws HAR")) {
+        DeleteFileW(harPath);
+        return 0;
+    }
+    ok = Require(strstr((const char *)harBytes, "\"status\": 101") != NULL,
+                 "ws handshake recorded (101)") &&
+        Require(strstr((const char *)harBytes, "\"wsTunnelBytesIn\": 10") != NULL,
+                "ws tunnel bytes in recorded") &&
+        Require(strstr((const char *)harBytes, "\"wsTunnelBytesOut\": 5") != NULL,
+                "ws tunnel bytes out recorded") &&
+        Require(strstr((const char *)harBytes, "0123456789") == NULL,
+                "ws tunnel payload not decoded into HAR");
     free(harBytes);
     DeleteFileW(harPath);
     return ok;
@@ -1998,6 +2268,7 @@ int main(void)
         TestTls12RoundTrip() &&
         TestChunkedResponse() &&
         TestKeepAliveRoundTrip() &&
+        TestWebSocketTunnel() &&
         TestMissingContextRejected() &&
         TestQueryRedirectContextOnPlainSocketFails() &&
         TestServeOnceForwardsDownstreamSni() &&

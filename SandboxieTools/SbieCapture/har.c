@@ -480,6 +480,10 @@ int HarWriter_WriteExchange(HAR_WRITER *writer, const HAR_EXCHANGE *exchange)
                 writer, exchange->tls_version ? exchange->tls_version : "") ||
             ! Har_WriteText(writer, ",\n          \"pinningFailed\": ") ||
             ! Har_WriteBool(writer, exchange->pinning_failed) ||
+            ! Har_WriteText(writer, ",\n          \"wsTunnelBytesIn\": ") ||
+            ! Har_WriteULong64(writer, exchange->ws_tunnel_bytes_in) ||
+            ! Har_WriteText(writer, ",\n          \"wsTunnelBytesOut\": ") ||
+            ! Har_WriteULong64(writer, exchange->ws_tunnel_bytes_out) ||
             ! Har_WriteText(writer, "\n        }\n      }")) {
         return HAR_ERROR;
     }

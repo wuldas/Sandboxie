@@ -52,6 +52,8 @@ typedef struct _HAR_EXCHANGE {
     ULONG response_body_len;
     ULONG response_body_original_len;
     ULONG body_cap;
+    ULONG64 ws_tunnel_bytes_in;
+    ULONG64 ws_tunnel_bytes_out;
 
 } HAR_EXCHANGE;
 
