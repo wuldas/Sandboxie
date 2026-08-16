@@ -22,6 +22,8 @@
 #include "https_mitm.h"
 #include "capture_ca_priv.h"
 #include "har.h"
+#include "hpack.h"
+#include "http2.h"
 #include "http11.h"
 
 #include <mstcpip.h>
@@ -105,7 +107,8 @@ static int HttpsMitm_AlpnSelect(
     unsigned int inlen,
     void *arg)
 {
-    static const unsigned char kHttp11[] = {
+    static const unsigned char kProtocols[] = {
+        2, 'h', '2',
         8, 'h', 't', 't', 'p', '/', '1', '.', '1'
     };
     unsigned char *selected = NULL;
@@ -114,7 +117,7 @@ static int HttpsMitm_AlpnSelect(
     UNREFERENCED_PARAMETER(ssl);
     UNREFERENCED_PARAMETER(arg);
     if (SSL_select_next_proto(
-            &selected, &selectedLen, kHttp11, sizeof(kHttp11), in, inlen) !=
+            &selected, &selectedLen, kProtocols, sizeof(kProtocols), in, inlen) !=
             OPENSSL_NPN_NEGOTIATED) {
         return SSL_TLSEXT_ERR_ALERT_FATAL;
     }
@@ -857,6 +860,587 @@ static void HttpsMitm_ForwardRedirectRecords(SOCKET accepted, SOCKET upstream)
 }
 
 
+//---------------------------------------------------------------------------
+// HTTP/2 downstream termination -> HTTP/1.1 upstream relay
+//---------------------------------------------------------------------------
+
+#define HTTP2_RELAY_BODY_CAP    (64 * 1024)
+
+typedef struct _H2_RELAY_STREAM {
+
+    BOOL active;
+    ULONG stream_id;
+    char method[HTTP11_MAX_METHOD];
+    char target[HTTP11_MAX_TARGET];
+    char authority[HTTP11_MAX_TARGET];
+    HTTP11_HEADER headers[HTTP11_MAX_HEADERS];
+    ULONG header_count;
+    UCHAR body[HTTP2_RELAY_BODY_CAP];
+    ULONG body_len;
+    BOOL have_request;
+
+} H2_RELAY_STREAM;
+
+
+static H2_RELAY_STREAM *HttpsMitm_H2GetStream(
+    H2_RELAY_STREAM *streams,
+    ULONG stream_id)
+{
+    ULONG i;
+
+    for (i = 0; i < HTTP2_MAX_STREAMS; ++i) {
+        if (streams[i].active && streams[i].stream_id == stream_id)
+            return &streams[i];
+    }
+    for (i = 0; i < HTTP2_MAX_STREAMS; ++i) {
+        if (! streams[i].active) {
+            memset(&streams[i], 0, sizeof(streams[i]));
+            streams[i].active = TRUE;
+            streams[i].stream_id = stream_id;
+            return &streams[i];
+        }
+    }
+    return NULL;
+}
+
+
+static void HttpsMitm_H2Lower(char *s)
+{
+    while (*s) {
+        if (*s >= 'A' && *s <= 'Z')
+            *s = (char)(*s - 'A' + 'a');
+        ++s;
+    }
+}
+
+
+/* connection-specific headers that must not be forwarded over h2
+   (RFC 7540 8.1.2.2). */
+static int HttpsMitm_H2IsConnectionHeader(const char *name)
+{
+    static const char *const kSkip[] = {
+        "connection", "keep-alive", "proxy-connection", "transfer-encoding",
+        "upgrade", "te"
+    };
+    ULONG i;
+
+    for (i = 0; i < ARRAYSIZE(kSkip); ++i) {
+        if (_stricmp(name, kSkip[i]) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+
+static int HttpsMitm_H2WriteFrame(
+    SSL *ssl,
+    UCHAR type,
+    UCHAR flags,
+    ULONG stream_id,
+    const UCHAR *payload,
+    ULONG payload_len)
+{
+    UCHAR header[HTTP2_FRAME_HEADER_LEN];
+    HTTP2_FRAME_HEADER fh;
+
+    fh.length = payload_len;
+    fh.type = type;
+    fh.flags = flags;
+    fh.stream_id = stream_id;
+    if (Http2_WriteFrameHeader(header, sizeof(header), &fh) != HTTP2_OK)
+        return 0;
+    if (! HttpsMitm_SslWriteAll(ssl, (const char *)header, sizeof(header)))
+        return 0;
+    if (payload_len > 0 &&
+            ! HttpsMitm_SslWriteAll(ssl, (const char *)payload, payload_len))
+        return 0;
+    return 1;
+}
+
+
+static int HttpsMitm_H2ReadFrame(
+    SSL *ssl,
+    HTTP2_FRAME_HEADER *fh,
+    UCHAR *payload,
+    ULONG payload_cap)
+{
+    UCHAR header[HTTP2_FRAME_HEADER_LEN];
+    ULONG got = 0;
+    int n;
+
+    while (got < HTTP2_FRAME_HEADER_LEN) {
+        n = SSL_read(ssl, header + got, (int)(HTTP2_FRAME_HEADER_LEN - got));
+        if (n <= 0)
+            return 0;
+        got += (ULONG)n;
+    }
+    if (Http2_ParseFrameHeader(header, got, fh) != HTTP2_OK)
+        return 0;
+    if (fh->length > payload_cap)
+        return 0;
+    got = 0;
+    while (got < fh->length) {
+        n = SSL_read(ssl, payload + got, (int)(fh->length - got));
+        if (n <= 0)
+            return 0;
+        got += (ULONG)n;
+    }
+    return 1;
+}
+
+
+static int HttpsMitm_H2SendSettings(SSL *ssl)
+{
+    return HttpsMitm_H2WriteFrame(ssl, HTTP2_FRAME_SETTINGS, 0, 0, NULL, 0);
+}
+
+
+static int HttpsMitm_H2SendSettingsAck(SSL *ssl)
+{
+    return HttpsMitm_H2WriteFrame(
+        ssl, HTTP2_FRAME_SETTINGS, HTTP2_FLAG_ACK, 0, NULL, 0);
+}
+
+
+static int HttpsMitm_H2SendPingAck(SSL *ssl, const UCHAR *payload)
+{
+    return HttpsMitm_H2WriteFrame(
+        ssl, HTTP2_FRAME_PING, HTTP2_FLAG_ACK, 0, payload, 8);
+}
+
+
+static int HttpsMitm_H2SendGoAway(SSL *ssl, ULONG last_stream, ULONG error)
+{
+    UCHAR payload[8];
+
+    payload[0] = (UCHAR)(last_stream >> 24);
+    payload[1] = (UCHAR)(last_stream >> 16);
+    payload[2] = (UCHAR)(last_stream >> 8);
+    payload[3] = (UCHAR)last_stream;
+    payload[4] = (UCHAR)(error >> 24);
+    payload[5] = (UCHAR)(error >> 16);
+    payload[6] = (UCHAR)(error >> 8);
+    payload[7] = (UCHAR)error;
+    return HttpsMitm_H2WriteFrame(
+        ssl, HTTP2_FRAME_GOAWAY, 0, 0, payload, sizeof(payload));
+}
+
+
+/* Decode a complete h2 header block into a logical request (pseudo-headers
+   become method/target/authority; regular headers are kept, connection-
+   specific ones dropped). */
+static int HttpsMitm_H2DecodeRequest(
+    HPACK_DECODER *decoder,
+    const UCHAR *block,
+    ULONG block_len,
+    H2_RELAY_STREAM *stream)
+{
+    HPACK_HEADER *headers;
+    ULONG count = 0;
+    ULONG consumed = 0;
+    ULONG i;
+    ULONG header_count = 0;
+
+    /* HPACK_HEADER is ~4 KB; a 128-entry array is too large for the stack. */
+    headers = (HPACK_HEADER *)malloc(HPACK_MAX_HEADERS * sizeof(*headers));
+    if (! headers)
+        return 0;
+    if (Hpack_DecodeBlock(decoder, block, block_len,
+            headers, HPACK_MAX_HEADERS, &count, &consumed) != HPACK_OK) {
+        free(headers);
+        return 0;
+    }
+
+    stream->method[0] = 0;
+    stream->target[0] = 0;
+    stream->authority[0] = 0;
+    stream->header_count = 0;
+    stream->body_len = 0;
+
+    for (i = 0; i < count; ++i) {
+        const char *name = headers[i].name;
+        const char *value = headers[i].value;
+
+        if (name[0] == ':') {
+            if (_stricmp(name, ":method") == 0)
+                strcpy_s(stream->method, sizeof(stream->method), value);
+            else if (_stricmp(name, ":path") == 0)
+                strcpy_s(stream->target, sizeof(stream->target), value);
+            else if (_stricmp(name, ":authority") == 0)
+                strcpy_s(stream->authority, sizeof(stream->authority), value);
+            continue;   /* :scheme and any other pseudo-header are ignored */
+        }
+        if (HttpsMitm_H2IsConnectionHeader(name))
+            continue;
+        if (header_count >= HTTP11_MAX_HEADERS)
+            continue;
+        strcpy_s(stream->headers[header_count].name,
+                 sizeof(stream->headers[header_count].name), name);
+        strcpy_s(stream->headers[header_count].value,
+                 sizeof(stream->headers[header_count].value), value);
+        ++header_count;
+    }
+    stream->header_count = header_count;
+    stream->have_request = TRUE;
+    free(headers);
+    return 1;
+}
+
+
+/* Rebuild an HTTP/1.1 request (request line + Host + headers + body) from a
+   translated h2 request. */
+static int HttpsMitm_H2BuildH1Request(
+    const H2_RELAY_STREAM *stream,
+    char *out,
+    ULONG cap,
+    ULONG *out_len)
+{
+    ULONG pos = 0;
+    ULONG i;
+    int n;
+
+    n = sprintf_s(out, cap, "%s %s HTTP/1.1\r\n",
+                  stream->method[0] ? stream->method : "GET",
+                  stream->target[0] ? stream->target : "/");
+    if (n < 0)
+        return 0;
+    pos = (ULONG)n;
+
+    if (stream->authority[0]) {
+        n = sprintf_s(out + pos, cap - pos, "Host: %s\r\n", stream->authority);
+        if (n < 0)
+            return 0;
+        pos += (ULONG)n;
+    }
+    for (i = 0; i < stream->header_count; ++i) {
+        n = sprintf_s(out + pos, cap - pos, "%s: %s\r\n",
+                      stream->headers[i].name, stream->headers[i].value);
+        if (n < 0)
+            return 0;
+        pos += (ULONG)n;
+    }
+    if (stream->body_len > 0) {
+        n = sprintf_s(out + pos, cap - pos, "Content-Length: %lu\r\n",
+                      stream->body_len);
+        if (n < 0)
+            return 0;
+        pos += (ULONG)n;
+    }
+    if (pos + 2 > cap)
+        return 0;
+    out[pos++] = '\r';
+    out[pos++] = '\n';
+    if (stream->body_len > 0) {
+        if (pos + stream->body_len > cap)
+            return 0;
+        memcpy(out + pos, stream->body, stream->body_len);
+        pos += stream->body_len;
+    }
+    *out_len = pos;
+    return 1;
+}
+
+
+static int HttpsMitm_H2EncodeOne(
+    HPACK_ENCODER *encoder,
+    const char *name,
+    const char *value,
+    UCHAR *block,
+    ULONG block_cap,
+    ULONG *block_len)
+{
+    UCHAR tmp[HPACK_MAX_VALUE * 2 + 64];
+    ULONG n = 0;
+
+    if (Hpack_EncodeHeader(encoder, name, value, tmp, sizeof(tmp), &n) !=
+            HPACK_OK)
+        return 0;
+    if (*block_len + n > block_cap)
+        return 0;
+    memcpy(block + *block_len, tmp, n);
+    *block_len += n;
+    return 1;
+}
+
+
+/* Translate an HTTP/1.1 response into downstream h2 HEADERS + DATA frames. */
+static int HttpsMitm_H2SendResponse(
+    SSL *down,
+    HPACK_ENCODER *encoder,
+    ULONG stream_id,
+    const HTTP11_RESPONSE *response,
+    const char *responseBytes,
+    ULONG responseSize)
+{
+    UCHAR block[HTTP2_MAX_HEADER_BLOCK];
+    ULONG block_len = 0;
+    char status[16];
+    const UCHAR *body = NULL;
+    ULONG body_len = 0;
+    UCHAR *heapBody = NULL;
+    ULONG i;
+    int ok = 0;
+
+    sprintf_s(status, sizeof(status), "%lu", response->status);
+    if (! HttpsMitm_H2EncodeOne(encoder, ":status", status,
+            block, sizeof(block), &block_len))
+        goto done;
+
+    for (i = 0; i < response->header_count; ++i) {
+        char name[HTTP11_MAX_NAME];
+        strcpy_s(name, sizeof(name), response->headers[i].name);
+        HttpsMitm_H2Lower(name);
+        if (HttpsMitm_H2IsConnectionHeader(name))
+            continue;
+        if (! HttpsMitm_H2EncodeOne(encoder, name, response->headers[i].value,
+                block, sizeof(block), &block_len))
+            goto done;
+    }
+
+    if (response->chunked) {
+        ULONG decoded = 0;
+        ULONG total = 0;
+        heapBody = (UCHAR *)malloc(HTTPS_MITM_IO_CAP);
+        if (! heapBody)
+            goto done;
+        if (Http11_DecodeChunked((const UCHAR *)responseBytes, responseSize,
+                response->header_bytes, heapBody, HTTPS_MITM_IO_CAP,
+                &decoded, &total) == HTTP11_OK) {
+            body = heapBody;
+            body_len = decoded;
+        }
+    }
+    else if (responseSize > response->header_bytes) {
+        body = (const UCHAR *)responseBytes + response->header_bytes;
+        body_len = responseSize - response->header_bytes;
+    }
+
+    if (! HttpsMitm_H2WriteFrame(down, HTTP2_FRAME_HEADERS,
+            (UCHAR)(body_len == 0
+                ? HTTP2_FLAG_END_HEADERS | HTTP2_FLAG_END_STREAM
+                : HTTP2_FLAG_END_HEADERS),
+            stream_id, block, block_len))
+        goto done;
+
+    if (body_len > 0 &&
+            ! HttpsMitm_H2WriteFrame(down, HTTP2_FRAME_DATA,
+                HTTP2_FLAG_END_STREAM, stream_id, body, body_len))
+        goto done;
+
+    ok = 1;
+
+done:
+    free(heapBody);
+    return ok;
+}
+
+
+/* Relay one completed h2 request stream through an HTTP/1.1 upstream. */
+static int HttpsMitm_H2RelayStream(
+    HTTPS_MITM *mitm,
+    SSL *down,
+    SSL_CTX *upCtx,
+    const char *upstreamHost,
+    USHORT upstreamPort,
+    const char *sni,
+    const HTTPS_REDIRECT_CONTEXT *context,
+    HPACK_ENCODER *encoder,
+    H2_RELAY_STREAM *stream)
+{
+    char h1Request[HTTPS_MITM_IO_CAP];
+    char h1Response[HTTPS_MITM_IO_CAP];
+    ULONG requestSize = 0;
+    ULONG responseSize = 0;
+    HTTP11_REQUEST *request = NULL;
+    HTTP11_RESPONSE *response = NULL;
+    MITM_READER upReader;
+    SOCKET upstream = INVALID_SOCKET;
+    SSL *up = NULL;
+    int ok = 0;
+
+    request = (HTTP11_REQUEST *)malloc(sizeof(*request));
+    response = (HTTP11_RESPONSE *)malloc(sizeof(*response));
+    if (! request || ! response)
+        goto done;
+
+    if (! HttpsMitm_H2BuildH1Request(
+            stream, h1Request, sizeof(h1Request), &requestSize))
+        goto done;
+    if (Http11_ParseRequest((const UCHAR *)h1Request, requestSize,
+            request) != HTTP11_OK)
+        goto done;
+    strcpy_s(request->version, sizeof(request->version), "HTTP/2");
+
+    upstream = HttpsMitm_ConnectTcp(upstreamHost, upstreamPort);
+    if (upstream == INVALID_SOCKET)
+        goto done;
+    up = SSL_new(upCtx);
+    if (! up)
+        goto done;
+    SSL_set_fd(up, (int)upstream);
+    if (sni && sni[0])
+        SSL_set_tlsext_host_name(up, sni);
+    if (SSL_connect(up) != 1)
+        goto done;
+
+    if (! HttpsMitm_SslWriteAll(up, h1Request, requestSize))
+        goto done;
+
+    memset(&upReader, 0, sizeof(upReader));
+    upReader.ssl = up;
+    if (! HttpsMitm_ReadMessage(&upReader, h1Response, sizeof(h1Response),
+            &responseSize, 0, request, response))
+        goto done;
+    if (Http11_ParseResponse((const UCHAR *)h1Response, responseSize,
+            response) != HTTP11_OK)
+        goto done;
+    strcpy_s(response->version, sizeof(response->version), "HTTP/2");
+
+    if (! HttpsMitm_H2SendResponse(down, encoder, stream->stream_id,
+            response, h1Response, responseSize))
+        goto done;
+
+    HttpsMitm_WriteHar(mitm, context, down, request, response,
+        h1Request, requestSize, h1Response, responseSize, 0, 0);
+
+    ok = 1;
+
+done:
+    free(request);
+    free(response);
+    if (up) {
+        SSL_shutdown(up);
+        SSL_free(up);
+    }
+    if (upstream != INVALID_SOCKET)
+        closesocket(upstream);
+    return ok;
+}
+
+
+/* Terminate a downstream HTTP/2 connection: demultiplex streams, translate
+   each to HTTP/1.1 upstream, and emit HAR. */
+static int HttpsMitm_ServeHttp2(
+    HTTPS_MITM *mitm,
+    SSL *down,
+    const HTTPS_REDIRECT_CONTEXT *context,
+    SSL_CTX *upCtx,
+    const char *upstreamHost,
+    USHORT upstreamPort,
+    const char *sni)
+{
+    HTTP2_SESSION session;
+    HPACK_DECODER decoder;
+    HPACK_ENCODER encoder;
+    H2_RELAY_STREAM *streams;
+    UCHAR payload[HTTP2_MAX_HEADER_BLOCK];
+    UCHAR magic[24];
+    BOOL served = FALSE;
+    ULONG got = 0;
+    int n;
+
+    Http2_SessionInit(&session);
+    Hpack_DecoderInit(&decoder, HTTP2_DEFAULT_HEADER_TABLE_SIZE);
+    Hpack_EncoderInit(&encoder, HTTP2_DEFAULT_HEADER_TABLE_SIZE, FALSE);
+    /* per-stream relay state is large (~200 KB * 256), so heap-allocate it
+       instead of blowing the broker's stack. */
+    streams = (H2_RELAY_STREAM *)calloc(HTTP2_MAX_STREAMS, sizeof(*streams));
+    if (! streams)
+        return HTTPS_MITM_ERROR;
+
+    /* client connection preface (RFC 7540 3.5): 24-byte magic string */
+    while (got < sizeof(magic)) {
+        n = SSL_read(down, magic + got, (int)(sizeof(magic) - got));
+        if (n <= 0) {
+            free(streams);
+            return HTTPS_MITM_ERROR;
+        }
+        got += (ULONG)n;
+    }
+
+    HttpsMitm_H2SendSettings(down);
+
+    for (;;) {
+        HTTP2_FRAME_HEADER fh;
+        HTTP2_FRAME_RESULT result;
+        H2_RELAY_STREAM *stream;
+        int rc;
+
+        if (! HttpsMitm_H2ReadFrame(down, &fh, payload, sizeof(payload)))
+            break;
+
+        rc = Http2_ProcessFrame(&session, &fh, payload, &result);
+        if (rc != HTTP2_OK) {
+            HttpsMitm_H2SendGoAway(down, session.last_stream_id,
+                                   HTTP2_PROTOCOL_ERROR);
+            break;
+        }
+
+        switch (fh.type) {
+        case HTTP2_FRAME_SETTINGS:
+            if (! (fh.flags & HTTP2_FLAG_ACK))
+                HttpsMitm_H2SendSettingsAck(down);
+            break;
+        case HTTP2_FRAME_PING:
+            if (! (fh.flags & HTTP2_FLAG_ACK))
+                HttpsMitm_H2SendPingAck(down, payload);
+            break;
+        case HTTP2_FRAME_GOAWAY: {
+            int status = served ? HTTPS_MITM_OK : HTTPS_MITM_ERROR;
+            free(streams);
+            return status;
+        }
+        case HTTP2_FRAME_HEADERS:
+        case HTTP2_FRAME_CONTINUATION:
+            if (result.have_header_block) {
+                stream = HttpsMitm_H2GetStream(streams, result.stream_id);
+                if (! stream ||
+                        ! HttpsMitm_H2DecodeRequest(&decoder,
+                            result.header_block, result.header_block_len,
+                            stream)) {
+                    HttpsMitm_H2SendGoAway(down, session.last_stream_id,
+                                           HTTP2_COMPRESSION_ERROR);
+                    {
+                        int status = served ? HTTPS_MITM_OK : HTTPS_MITM_ERROR;
+                        free(streams);
+                        return status;
+                    }
+                }
+            }
+            break;
+        case HTTP2_FRAME_DATA:
+            if (result.is_data) {
+                stream = HttpsMitm_H2GetStream(streams, result.stream_id);
+                if (stream &&
+                        stream->body_len + result.data_len <=
+                            HTTP2_RELAY_BODY_CAP) {
+                    memcpy(stream->body + stream->body_len,
+                           result.data, result.data_len);
+                    stream->body_len += result.data_len;
+                }
+            }
+            break;
+        default:
+            break;
+        }
+
+        if (result.end_stream) {
+            stream = HttpsMitm_H2GetStream(streams, result.stream_id);
+            if (stream && stream->have_request &&
+                    HttpsMitm_H2RelayStream(mitm, down, upCtx, upstreamHost,
+                        upstreamPort, sni, context, &encoder, stream))
+                served = TRUE;
+        }
+    }
+
+    {
+        int status = served ? HTTPS_MITM_OK : HTTPS_MITM_ERROR;
+        free(streams);
+        return status;
+    }
+}
+
+
 int HttpsMitm_ServeOnce(
     HTTPS_MITM *mitm,
     SOCKET client,
@@ -912,6 +1496,19 @@ int HttpsMitm_ServeOnce(
         upstreamHost = host;
         if (upstreamPort == 0)
             upstreamPort = context->original_port;
+    }
+
+    /* HTTP/2 downstream: terminate and translate to upstream HTTP/1.1 */
+    {
+        const unsigned char *alpn = NULL;
+        unsigned int alpnLen = 0;
+
+        SSL_get0_alpn_selected(down, &alpn, &alpnLen);
+        if (alpn && alpnLen == 2 && alpn[0] == 'h' && alpn[1] == '2') {
+            status = HttpsMitm_ServeHttp2(mitm, down, context, upCtx,
+                upstreamHost, upstreamPort, sni);
+            goto done;
+        }
     }
 
     memset(&downReader, 0, sizeof(downReader));

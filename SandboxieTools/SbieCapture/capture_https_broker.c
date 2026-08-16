@@ -161,7 +161,7 @@ CAPTURE_HTTPS_RUNTIME *CaptureHttps_Start(
     MemoryBarrier();
 
     runtime->thread = CreateThread(
-        NULL, 0, CaptureHttps_AcceptThread, runtime, 0, NULL);
+        NULL, 4 * 1024 * 1024, CaptureHttps_AcceptThread, runtime, 0, NULL);
     if (! runtime->thread)
         goto fail;
     return runtime;

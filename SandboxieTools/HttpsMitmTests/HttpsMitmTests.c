@@ -45,6 +45,8 @@
 #include "../SbieCapture/https_mitm.h"
 #include "../SbieCapture/capture_https_broker.h"
 #include "../SbieCapture/capture_broker.h"
+#include "../SbieCapture/hpack.h"
+#include "../SbieCapture/http2.h"
 #include "../../Sandboxie/core/dll/crypt_https_trust.h"
 
 
@@ -730,6 +732,264 @@ static int ClientWebSocketOnSocket(
 }
 
 
+/* --- HTTP/2 client helpers --- */
+
+static int ClientH2_WriteAll(SSL *ssl, const void *buf, int len)
+{
+    int off = 0;
+    while (off < len) {
+        int n = SSL_write(ssl, (const char *)buf + off, len - off);
+        if (n <= 0)
+            return 0;
+        off += n;
+    }
+    return 1;
+}
+
+
+static int ClientH2_Encode(
+    HPACK_ENCODER *encoder,
+    const char *name,
+    const char *value,
+    UCHAR *block,
+    ULONG blockCap,
+    ULONG *blockLen)
+{
+    UCHAR tmp[1024];
+    ULONG n = 0;
+
+    if (Hpack_EncodeHeader(encoder, name, value, tmp, sizeof(tmp), &n) !=
+            HPACK_OK)
+        return 0;
+    if (*blockLen + n > blockCap)
+        return 0;
+    memcpy(block + *blockLen, tmp, n);
+    *blockLen += n;
+    return 1;
+}
+
+
+static int ClientH2_SendFrame(
+    SSL *ssl,
+    UCHAR type,
+    UCHAR flags,
+    ULONG streamId,
+    const UCHAR *payload,
+    ULONG payloadLen)
+{
+    UCHAR header[HTTP2_FRAME_HEADER_LEN];
+    HTTP2_FRAME_HEADER fh;
+
+    fh.length = payloadLen;
+    fh.type = type;
+    fh.flags = flags;
+    fh.stream_id = streamId;
+    if (Http2_WriteFrameHeader(header, sizeof(header), &fh) != HTTP2_OK)
+        return 0;
+    if (! ClientH2_WriteAll(ssl, header, (int)sizeof(header)))
+        return 0;
+    if (payloadLen > 0 && ! ClientH2_WriteAll(ssl, payload, (int)payloadLen))
+        return 0;
+    return 1;
+}
+
+
+static int ClientH2_ReadFrame(
+    SSL *ssl,
+    HTTP2_FRAME_HEADER *fh,
+    UCHAR *payload,
+    ULONG payloadCap)
+{
+    UCHAR header[HTTP2_FRAME_HEADER_LEN];
+    ULONG got = 0;
+    int n;
+
+    while (got < HTTP2_FRAME_HEADER_LEN) {
+        n = SSL_read(ssl, header + got, (int)(HTTP2_FRAME_HEADER_LEN - got));
+        if (n <= 0)
+            return 0;
+        got += (ULONG)n;
+    }
+    if (Http2_ParseFrameHeader(header, got, fh) != HTTP2_OK)
+        return 0;
+    if (fh->length > payloadCap)
+        return 0;
+    got = 0;
+    while (got < fh->length) {
+        n = SSL_read(ssl, payload + got, (int)(fh->length - got));
+        if (n <= 0)
+            return 0;
+        got += (ULONG)n;
+    }
+    return 1;
+}
+
+
+/* h2 client: TLS + ALPN h2, then one GET request.  Returns 1 when the response
+   body and :status were both received. */
+static int ClientHttpGet2OnSocket(
+    SOCKET sock,
+    const char *sessionCaPem,
+    char *response,
+    ULONG responseCap,
+    ULONG *statusOut)
+{
+    SSL_CTX *ctx;
+    SSL *ssl;
+    BIO *trustBio;
+    X509 *trustCert;
+    X509_STORE *store;
+    HPACK_ENCODER encoder;
+    HPACK_DECODER decoder;
+    UCHAR block[512];
+    ULONG blockLen = 0;
+    int gotStatus = 0;
+    ULONG bodyLen = 0;
+    int ok = 0;
+
+    if (responseCap)
+        response[0] = 0;
+    if (statusOut)
+        *statusOut = 0;
+    if (sock == INVALID_SOCKET)
+        return 0;
+
+    ctx = SSL_CTX_new(TLS_client_method());
+    if (! ctx) {
+        closesocket(sock);
+        return 0;
+    }
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    {
+        static const unsigned char kAlpn[] = { 2, 'h', '2' };
+        SSL_CTX_set_alpn_protos(ctx, kAlpn, sizeof(kAlpn));
+    }
+    trustBio = BIO_new_mem_buf(sessionCaPem, -1);
+    trustCert = trustBio ? PEM_read_bio_X509(trustBio, NULL, NULL, NULL) : NULL;
+    store = SSL_CTX_get_cert_store(ctx);
+    if (! trustCert || X509_STORE_add_cert(store, trustCert) != 1) {
+        X509_free(trustCert);
+        BIO_free(trustBio);
+        SSL_CTX_free(ctx);
+        closesocket(sock);
+        return 0;
+    }
+    X509_free(trustCert);
+    BIO_free(trustBio);
+
+    ssl = SSL_new(ctx);
+    if (! ssl) {
+        SSL_CTX_free(ctx);
+        closesocket(sock);
+        return 0;
+    }
+    SSL_set_fd(ssl, (int)sock);
+    SSL_set_tlsext_host_name(ssl, "example.com");
+    if (SSL_connect(ssl) != 1)
+        goto out;
+
+    {
+        const unsigned char *alpn = NULL;
+        unsigned int alpnLen = 0;
+        SSL_get0_alpn_selected(ssl, &alpn, &alpnLen);
+        if (! alpn || alpnLen != 2 || alpn[0] != 'h' || alpn[1] != '2')
+            goto out;
+    }
+
+    /* client connection preface: magic + SETTINGS */
+    {
+        static const char kMagic[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        if (SSL_write(ssl, kMagic, (int)strlen(kMagic)) <= 0)
+            goto out;
+        if (! ClientH2_SendFrame(ssl, HTTP2_FRAME_SETTINGS, 0, 0, NULL, 0))
+            goto out;
+    }
+
+    /* HEADERS: GET https://example.com/ */
+    Hpack_EncoderInit(&encoder, HTTP2_DEFAULT_HEADER_TABLE_SIZE, FALSE);
+    blockLen = 0;
+    if (! ClientH2_Encode(&encoder, ":method", "GET", block,
+            sizeof(block), &blockLen) ||
+            ! ClientH2_Encode(&encoder, ":scheme", "https", block,
+                sizeof(block), &blockLen) ||
+            ! ClientH2_Encode(&encoder, ":path", "/", block,
+                sizeof(block), &blockLen) ||
+            ! ClientH2_Encode(&encoder, ":authority", "example.com", block,
+                sizeof(block), &blockLen))
+        goto out;
+    if (! ClientH2_SendFrame(ssl, HTTP2_FRAME_HEADERS,
+            HTTP2_FLAG_END_HEADERS | HTTP2_FLAG_END_STREAM, 1, block, blockLen))
+        goto out;
+
+    /* read response frames until END_STREAM */
+    Hpack_DecoderInit(&decoder, HTTP2_DEFAULT_HEADER_TABLE_SIZE);
+    {
+        int done = 0;
+        while (! done) {
+            HTTP2_FRAME_HEADER fh;
+            UCHAR payload[HTTP2_MAX_HEADER_BLOCK];
+
+            if (! ClientH2_ReadFrame(ssl, &fh, payload, sizeof(payload)))
+                goto out;
+
+            if (fh.type == HTTP2_FRAME_HEADERS &&
+                    (fh.flags & HTTP2_FLAG_END_HEADERS)) {
+                HPACK_HEADER *headers = (HPACK_HEADER *)malloc(
+                    HPACK_MAX_HEADERS * sizeof(*headers));
+                ULONG count = 0;
+                ULONG consumed = 0;
+                ULONG i;
+
+                if (! headers)
+                    goto out;
+                if (Hpack_DecodeBlock(&decoder, payload, fh.length, headers,
+                        HPACK_MAX_HEADERS, &count, &consumed) != HPACK_OK) {
+                    free(headers);
+                    goto out;
+                }
+                for (i = 0; i < count; ++i) {
+                    if (_stricmp(headers[i].name, ":status") == 0) {
+                        if (statusOut)
+                            *statusOut = (ULONG)strtoul(
+                                headers[i].value, NULL, 10);
+                        gotStatus = 1;
+                    }
+                }
+                free(headers);
+                if (fh.flags & HTTP2_FLAG_END_STREAM)
+                    done = 1;
+            }
+            else if (fh.type == HTTP2_FRAME_DATA) {
+                if (bodyLen + fh.length < responseCap) {
+                    memcpy(response + bodyLen, payload, fh.length);
+                    bodyLen += fh.length;
+                    response[bodyLen] = 0;
+                }
+                if (fh.flags & HTTP2_FLAG_END_STREAM)
+                    done = 1;
+            }
+            else if (fh.type == HTTP2_FRAME_SETTINGS &&
+                    ! (fh.flags & HTTP2_FLAG_ACK)) {
+                ClientH2_SendFrame(
+                    ssl, HTTP2_FRAME_SETTINGS, HTTP2_FLAG_ACK, 0, NULL, 0);
+            }
+        }
+    }
+
+    if (gotStatus && bodyLen > 0)
+        ok = 1;
+
+out:
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    closesocket(sock);
+    return ok;
+}
+
+
 static int TestChunkedResponse(void)
 {
     UPSTREAM_SERVER upstream;
@@ -805,7 +1065,7 @@ static int TestChunkedResponse(void)
     job.context = context;
     job.have_context = 1;
     job.result = HTTPS_MITM_ERROR;
-    thread = CreateThread(NULL, 0, ServeThread, &job, 0, NULL);
+    thread = CreateThread(NULL, 4 * 1024 * 1024, ServeThread, &job, 0, NULL);
     if (! thread) {
         closesocket(probe);
         closesocket(accepted);
@@ -920,7 +1180,7 @@ static int TestKeepAliveRoundTrip(void)
     job.context = context;
     job.have_context = 1;
     job.result = HTTPS_MITM_ERROR;
-    thread = CreateThread(NULL, 0, ServeThread, &job, 0, NULL);
+    thread = CreateThread(NULL, 4 * 1024 * 1024, ServeThread, &job, 0, NULL);
     if (! thread) {
         closesocket(probe);
         closesocket(accepted);
@@ -1035,7 +1295,7 @@ static int TestWebSocketTunnel(void)
     job.context = context;
     job.have_context = 1;
     job.result = HTTPS_MITM_ERROR;
-    thread = CreateThread(NULL, 0, ServeThread, &job, 0, NULL);
+    thread = CreateThread(NULL, 4 * 1024 * 1024, ServeThread, &job, 0, NULL);
     if (! thread) {
         closesocket(probe);
         closesocket(accepted);
@@ -1072,6 +1332,125 @@ static int TestWebSocketTunnel(void)
                 "ws tunnel bytes out recorded") &&
         Require(strstr((const char *)harBytes, "0123456789") == NULL,
                 "ws tunnel payload not decoded into HAR");
+    free(harBytes);
+    DeleteFileW(harPath);
+    return ok;
+}
+
+
+static int TestHttp2Relay(void)
+{
+    UPSTREAM_SERVER upstream;
+    CAPTURE_CA *ca;
+    HTTPS_MITM_OPTIONS options;
+    HTTPS_MITM *mitm;
+    HTTPS_REDIRECT_CONTEXT context;
+    SERVE_JOB job;
+    HANDLE thread;
+    SOCKET accepted;
+    SOCKET probe;
+    struct sockaddr_in addr;
+    char sessionPem[4096];
+    ULONG pemLength = 0;
+    char response[512];
+    ULONG status = 0;
+    WCHAR harPath[MAX_PATH];
+    UCHAR *harBytes = NULL;
+    DWORD harSize = 0;
+    int clientOk;
+    int ok;
+
+    if (! StartUpstream(&upstream)) {
+        StopUpstream(&upstream);
+        return Require(0, "h2 upstream");
+    }
+
+    ca = CaptureCa_Create();
+    if (! ca || CaptureCa_ExportPublicPem(
+            ca, sessionPem, sizeof(sessionPem), &pemLength) != CAPTURE_CA_OK) {
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "h2 session CA");
+    }
+
+    MakeTempPath(harPath, MAX_PATH, L"sbie-mitm-h2.har");
+    DeleteFileW(harPath);
+
+    context = MakeContext();
+    memset(&options, 0, sizeof(options));
+    options.ca = ca;
+    options.expected_context = &context;
+    options.upstream_host = "127.0.0.1";
+    options.upstream_port = upstream.port;
+    options.upstream_ca_pem = upstream.ca_pem;
+    options.har_path = harPath;
+    options.redact = TRUE;
+    options.include_bodies = TRUE;
+
+    mitm = HttpsMitm_Listen(&options);
+    if (! mitm) {
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "h2 listen");
+    }
+
+    probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(HttpsMitm_ListenPort(mitm));
+    if (connect(probe, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        closesocket(probe);
+        HttpsMitm_Close(mitm);
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "h2 connect");
+    }
+    accepted = HttpsMitm_Accept(mitm);
+    memset(&job, 0, sizeof(job));
+    job.mitm = mitm;
+    job.client = accepted;
+    job.context = context;
+    job.have_context = 1;
+    job.result = HTTPS_MITM_ERROR;
+    thread = CreateThread(NULL, 4 * 1024 * 1024, ServeThread, &job, 0, NULL);
+    if (! thread) {
+        closesocket(probe);
+        closesocket(accepted);
+        HttpsMitm_Close(mitm);
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "h2 serve thread");
+    }
+    clientOk = ClientHttpGet2OnSocket(
+        probe, sessionPem, response, sizeof(response), &status);
+    WaitForSingleObject(thread, 10000);
+    CloseHandle(thread);
+    closesocket(probe);
+    HttpsMitm_Close(mitm);
+    CaptureCa_Free(ca);
+    StopUpstream(&upstream);
+
+    ok = Require(clientOk, "h2 client GET round trip") &&
+        Require(status == 200, "h2 :status 200") &&
+        Require(strstr(response, "upstream-ok") != NULL, "h2 response body") &&
+        Require(job.result == HTTPS_MITM_OK, "h2 MITM serve success");
+    if (! ok) {
+        DeleteFileW(harPath);
+        return 0;
+    }
+
+    if (! Require(ReadAll(harPath, &harBytes, &harSize), "read h2 HAR")) {
+        DeleteFileW(harPath);
+        return 0;
+    }
+    ok = Require(strstr((const char *)harBytes,
+                        "\"httpVersion\": \"HTTP/2\"") != NULL,
+                 "h2 HAR httpVersion") &&
+        Require(strstr((const char *)harBytes, "\"alpn\": \"h2\"") != NULL,
+                "h2 HAR alpn") &&
+        Require(strstr((const char *)harBytes, "upstream-ok") != NULL,
+                "h2 HAR body");
     free(harBytes);
     DeleteFileW(harPath);
     return ok;
@@ -1678,7 +2057,7 @@ static int RunMitmRoundTrip(int minVersion, int maxVersion, const char *label)
         job.context = context;
         job.have_context = 1;
         job.result = HTTPS_MITM_ERROR;
-        thread = CreateThread(NULL, 0, ServeThread, &job, 0, NULL);
+        thread = CreateThread(NULL, 4 * 1024 * 1024, ServeThread, &job, 0, NULL);
         if (! thread) {
             closesocket(probe);
             closesocket(accepted);
@@ -1802,7 +2181,7 @@ static int TestMissingContextRejected(void)
     job.client = accepted;
     job.have_context = 0;
     job.result = HTTPS_MITM_OK;
-    thread = CreateThread(NULL, 0, ServeThread, &job, 0, NULL);
+    thread = CreateThread(NULL, 4 * 1024 * 1024, ServeThread, &job, 0, NULL);
     clientOk = ClientGetOnSocket(
         probe, sessionPem, TLS1_3_VERSION, TLS1_3_VERSION,
         response, sizeof(response));
@@ -2222,7 +2601,7 @@ static int TestServeOnceForwardsDownstreamSni(void)
     job.context = context;
     job.have_context = 1;
     job.result = HTTPS_MITM_ERROR;
-    thread = CreateThread(NULL, 0, ServeThread, &job, 0, NULL);
+    thread = CreateThread(NULL, 4 * 1024 * 1024, ServeThread, &job, 0, NULL);
     if (! thread) {
         closesocket(probe);
         closesocket(accepted);
@@ -2269,6 +2648,7 @@ int main(void)
         TestChunkedResponse() &&
         TestKeepAliveRoundTrip() &&
         TestWebSocketTunnel() &&
+        TestHttp2Relay() &&
         TestMissingContextRejected() &&
         TestQueryRedirectContextOnPlainSocketFails() &&
         TestServeOnceForwardsDownstreamSni() &&
