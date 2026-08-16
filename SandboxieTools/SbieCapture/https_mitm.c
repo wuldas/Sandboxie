@@ -57,6 +57,9 @@ struct _HTTPS_MITM {
     BOOL redact;
     BOOL include_bodies;
     BOOL allow_unverified_upstream;
+    HANDLE keylog_file;
+    CRITICAL_SECTION keylog_lock;
+    int have_keylog;
 
 };
 
@@ -127,12 +130,62 @@ static int HttpsMitm_AlpnSelect(
 }
 
 
+/* TLS key-log: emit "CLIENT_RANDOM <client_random> <master_secret>" lines to a
+   caller-opened file so Wireshark can decrypt the captured PCAPNG.  Opt-in only
+   -- no lines are written unless the session was started with a key-log handle. */
+static int g_keylog_ex_index = -1;
+
+static void HttpsMitm_InitKeylogIndex(void)
+{
+    int idx;
+
+    if (g_keylog_ex_index >= 0)
+        return;
+    idx = SSL_get_ex_new_index(0, NULL, NULL, NULL, NULL);
+    if (idx >= 0)
+        InterlockedCompareExchange((LONG *)&g_keylog_ex_index, idx, -1);
+}
+
+
+static void HttpsMitm_KeylogCallback(const SSL *ssl, const char *line)
+{
+    HTTPS_MITM *mitm;
+    char text[512];
+    DWORD written;
+    int len;
+
+    if (g_keylog_ex_index < 0 || ! ssl || ! line || ! line[0])
+        return;
+    mitm = (HTTPS_MITM *)SSL_get_ex_data(ssl, g_keylog_ex_index);
+    if (! mitm || ! mitm->have_keylog ||
+            ! mitm->keylog_file || mitm->keylog_file == INVALID_HANDLE_VALUE)
+        return;
+    len = sprintf_s(text, sizeof(text), "%s\n", line);
+    if (len <= 0)
+        return;
+    EnterCriticalSection(&mitm->keylog_lock);
+    WriteFile(mitm->keylog_file, text, (DWORD)len, &written, NULL);
+    LeaveCriticalSection(&mitm->keylog_lock);
+}
+
+
+/* associate a freshly-created SSL with its MITM so the key-log callback can
+   find the file handle (key-log is opt-in; a no-op otherwise). */
+static void HttpsMitm_AttachKeylog(HTTPS_MITM *mitm, SSL *ssl)
+{
+    if (! mitm || ! ssl || g_keylog_ex_index < 0)
+        return;
+    SSL_set_ex_data(ssl, g_keylog_ex_index, mitm);
+}
+
+
 static SSL_CTX *HttpsMitm_NewDownstreamCtx(CAPTURE_CA *ca)
 {
     SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
     if (! ctx)
         return NULL;
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_keylog_callback(ctx, HttpsMitm_KeylogCallback);
     SSL_CTX_set_tlsext_servername_callback(ctx, HttpsMitm_SniCallback);
     SSL_CTX_set_tlsext_servername_arg(ctx, ca);
     SSL_CTX_set_alpn_select_cb(ctx, HttpsMitm_AlpnSelect, NULL);
@@ -150,6 +203,7 @@ static SSL_CTX *HttpsMitm_NewUpstreamCtx(const char *caPem, BOOL allowUnverified
     if (! ctx)
         return NULL;
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_keylog_callback(ctx, HttpsMitm_KeylogCallback);
     {
         /* offer h2 first so an h2-capable origin uses it (Slice 6) */
         static const unsigned char kUpstreamAlpn[] = {
@@ -656,6 +710,13 @@ HTTPS_MITM *HttpsMitm_Listen(const HTTPS_MITM_OPTIONS *options)
     mitm->redact = options->redact;
     mitm->include_bodies = options->include_bodies;
     mitm->allow_unverified_upstream = options->allow_unverified_upstream;
+    if (options->keylog_file &&
+            options->keylog_file != INVALID_HANDLE_VALUE) {
+        mitm->keylog_file = options->keylog_file;
+        mitm->have_keylog = 1;
+        InitializeCriticalSection(&mitm->keylog_lock);
+        HttpsMitm_InitKeylogIndex();
+    }
     if (options->har_file && options->har_file != INVALID_HANDLE_VALUE)
         mitm->har_writer = HarWriter_OpenHandle(options->har_file);
     else if (options->har_path && options->har_path[0])
@@ -1692,6 +1753,7 @@ static int HttpsMitm_H2RelayStream(
     if (! up)
         goto done;
     SSL_set_fd(up, (int)upstream);
+    HttpsMitm_AttachKeylog(mitm, up);
     if (sni && sni[0])
         SSL_set_tlsext_host_name(up, sni);
     if (SSL_connect(up) != 1)
@@ -1916,6 +1978,7 @@ int HttpsMitm_ServeOnce(
     if (! down)
         goto done;
     SSL_set_fd(down, (int)client);
+    HttpsMitm_AttachKeylog(mitm, down);
     if (SSL_accept(down) != 1)
         goto done;
 
@@ -1968,6 +2031,7 @@ int HttpsMitm_ServeOnce(
         if (! up)
             goto done;
         SSL_set_fd(up, (int)upstream);
+        HttpsMitm_AttachKeylog(mitm, up);
         if (sni && sni[0])
             SSL_set_tlsext_host_name(up, sni);
         if (SSL_connect(up) != 1)
@@ -2073,6 +2137,8 @@ void HttpsMitm_Close(HTTPS_MITM *mitm)
         closesocket(mitm->listen_socket);
     if (mitm->har_writer)
         HarWriter_Close(mitm->har_writer);
+    if (mitm->have_keylog)
+        DeleteCriticalSection(&mitm->keylog_lock);
     free(mitm->upstream_ca_pem);
     HeapFree(GetProcessHeap(), 0, mitm);
 }

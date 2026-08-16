@@ -150,6 +150,7 @@ CAPTURE_HTTPS_RUNTIME *CaptureHttps_Start(
     mitmOptions.expected_context = options->test_preamble ?
         &runtime->expected : NULL;
     mitmOptions.har_file = options->har_file;
+    mitmOptions.keylog_file = options->keylog_file;
     mitmOptions.redact = options->redact;
     mitmOptions.include_bodies = options->include_bodies;
     mitmOptions.allow_unverified_upstream = options->test_preamble;

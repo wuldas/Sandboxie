@@ -29,6 +29,7 @@ typedef struct _CAPTURE_HTTPS_OPTIONS {
 
     HANDLE har_file;
     HANDLE ca_file;
+    HANDLE keylog_file;
     BOOL test_preamble;
     BOOL redact;
     BOOL include_bodies;

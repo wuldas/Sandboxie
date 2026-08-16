@@ -118,7 +118,9 @@ copy /Y "$(VcpkgInstalled)\bin\libcrypto-3-x64.dll" "$(OutDir)"</Command>
     <ClCompile Include="capture_ca.c" />
     <ClCompile Include="capture_https_broker.c" />
     <ClCompile Include="har.c" />
+    <ClCompile Include="hpack.c" />
     <ClCompile Include="http11.c" />
+    <ClCompile Include="http2.c" />
     <ClCompile Include="https_mitm.c" />
     <ClCompile Include="main.c" />
     <ClCompile Include="pcapng.c" />

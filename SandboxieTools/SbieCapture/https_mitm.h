@@ -42,6 +42,7 @@ typedef struct _HTTPS_MITM_OPTIONS {
     const char *upstream_ca_pem;
     const WCHAR *har_path;
     HANDLE har_file;
+    HANDLE keylog_file;
     BOOL redact;
     BOOL include_bodies;
     BOOL allow_unverified_upstream;

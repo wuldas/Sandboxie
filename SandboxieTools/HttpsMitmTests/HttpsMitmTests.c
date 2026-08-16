@@ -2814,6 +2814,151 @@ static int TestTls12RoundTrip(void)
 }
 
 
+static int TestTlsKeylog(void)
+{
+    UPSTREAM_SERVER upstream;
+    CAPTURE_CA *ca;
+    HTTPS_MITM_OPTIONS options;
+    HTTPS_MITM *mitm;
+    HTTPS_REDIRECT_CONTEXT context;
+    SERVE_JOB job;
+    HANDLE thread;
+    SOCKET accepted;
+    SOCKET probe;
+    char sessionPem[4096];
+    ULONG pemLength = 0;
+    char response[1024];
+    WCHAR keylogPath[MAX_PATH];
+    HANDLE keylogFile;
+    UCHAR *keylogBytes = NULL;
+    DWORD keylogSize = 0;
+    int clientOk;
+    int lineCount;
+    int ok;
+
+    if (! StartUpstream(&upstream)) {
+        StopUpstream(&upstream);
+        return Require(0, "start upstream for keylog test");
+    }
+    ca = CaptureCa_Create();
+    if (! ca || CaptureCa_ExportPublicPem(ca, sessionPem, sizeof(sessionPem),
+            &pemLength) != CAPTURE_CA_OK) {
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "CA for keylog test");
+    }
+
+    MakeTempPath(keylogPath, MAX_PATH, L"sbie-mitm.keys");
+    DeleteFileW(keylogPath);
+    keylogFile = CreateFileW(keylogPath, FILE_APPEND_DATA,
+        FILE_SHARE_READ, NULL, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (keylogFile == INVALID_HANDLE_VALUE) {
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "open keylog file");
+    }
+
+    context = MakeContext();
+    memset(&options, 0, sizeof(options));
+    options.ca = ca;
+    options.expected_context = &context;
+    options.upstream_host = "127.0.0.1";
+    options.upstream_port = upstream.port;
+    options.upstream_ca_pem = upstream.ca_pem;
+    options.keylog_file = keylogFile;
+
+    mitm = HttpsMitm_Listen(&options);
+    if (! mitm) {
+        CloseHandle(keylogFile);
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        DeleteFileW(keylogPath);
+        return Require(0, "listen MITM for keylog test");
+    }
+
+    {
+        struct sockaddr_in addr;
+        probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+        memset(&addr, 0, sizeof(addr));
+        addr.sin_family = AF_INET;
+        addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        addr.sin_port = htons(HttpsMitm_ListenPort(mitm));
+        if (connect(probe, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+            closesocket(probe);
+            HttpsMitm_Close(mitm);
+            CloseHandle(keylogFile);
+            CaptureCa_Free(ca);
+            StopUpstream(&upstream);
+            DeleteFileW(keylogPath);
+            return Require(0, "client TCP connect for keylog test");
+        }
+        accepted = HttpsMitm_Accept(mitm);
+        memset(&job, 0, sizeof(job));
+        job.mitm = mitm;
+        job.client = accepted;
+        job.context = context;
+        job.have_context = 1;
+        job.result = HTTPS_MITM_ERROR;
+        thread = CreateThread(NULL, 4 * 1024 * 1024, ServeThread, &job, 0, NULL);
+        clientOk = ClientGetOnSocket(probe, sessionPem, TLS1_3_VERSION,
+            TLS1_3_VERSION, response, sizeof(response));
+        WaitForSingleObject(thread, 10000);
+        CloseHandle(thread);
+        closesocket(probe);
+    }
+
+    HttpsMitm_Close(mitm);
+    CaptureCa_Free(ca);
+    StopUpstream(&upstream);
+    CloseHandle(keylogFile);
+
+    ok = Require(clientOk, "keylog client GET") &&
+        Require(job.result == HTTPS_MITM_OK, "keylog MITM serve success");
+
+    if (! Require(ReadAll(keylogPath, &keylogBytes, &keylogSize),
+            "read keylog file")) {
+        DeleteFileW(keylogPath);
+        return 0;
+    }
+    {
+        /* a valid SSLKEYLOGFILE line starts with CLIENT_RANDOM (TLS 1.2) or a
+           TLS 1.3 traffic-secret label (OpenSSL 3.x emits these for TLS 1.3) */
+        static const char *const kLabels[] = {
+            "CLIENT_RANDOM",
+            "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+            "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+            "EXPORTER_SECRET",
+            "SERVER_TRAFFIC_SECRET_0",
+            "CLIENT_TRAFFIC_SECRET_0",
+            "SERVER_TRAFFIC_SECRET_1",
+            "CLIENT_TRAFFIC_SECRET_1",
+        };
+        char *cur = (char *)keylogBytes;
+        char *end = cur + keylogSize;
+        ULONG li;
+        lineCount = 0;
+        while (cur < end) {
+            char *nl = memchr(cur, '\n', (size_t)(end - cur));
+            char *lineEnd = nl ? nl : end;
+            for (li = 0; li < ARRAYSIZE(kLabels); ++li) {
+                size_t n = strlen(kLabels[li]);
+                if ((size_t)(lineEnd - cur) >= n + 1 &&
+                        memcmp(cur, kLabels[li], n) == 0 && cur[n] == ' ') {
+                    ++lineCount;
+                    break;
+                }
+            }
+            cur = nl ? nl + 1 : end;
+        }
+    }
+    free(keylogBytes);
+    DeleteFileW(keylogPath);
+
+    return ok && Require(lineCount >= 2,
+        ">=2 TLS keylog lines (CLIENT_RANDOM / TLS 1.3 secrets)");
+}
+
+
 static int TestMissingContextRejected(void)
 {
     UPSTREAM_SERVER upstream;
@@ -3339,6 +3484,7 @@ int main(void)
         TestOpenNamedRootsFromRegistry() &&
         TestTls13RoundTrip() &&
         TestTls12RoundTrip() &&
+        TestTlsKeylog() &&
         TestChunkedResponse() &&
         TestKeepAliveRoundTrip() &&
         TestWebSocketTunnel() &&

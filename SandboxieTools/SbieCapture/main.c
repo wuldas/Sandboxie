@@ -78,7 +78,7 @@ static void PrintUsage(void)
         L"[--stop-event HANDLE] [--snaplen N] [--max-file-bytes N] "
         L"[--max-seconds N] [--rotate-count N] "
         L"[--https-listen --har HANDLE --ca-file HANDLE "
-        L"[--https-test-preamble]]\n");
+        L"[--keylog HANDLE] [--https-test-preamble]]\n");
 }
 
 
@@ -92,6 +92,7 @@ int __cdecl wmain(int argc, WCHAR **argv)
     ULONG64 rawGeneration = 0;
     ULONG64 rawHar = 0;
     ULONG64 rawCa = 0;
+    ULONG64 rawKeylog = 0;
     ULONG64 value = 0;
     BOOL haveSection = FALSE;
     BOOL haveFile = FALSE;
@@ -113,6 +114,7 @@ int __cdecl wmain(int argc, WCHAR **argv)
     HANDLE stopEvent = NULL;
     HANDLE harFile = NULL;
     HANDLE caFile = NULL;
+    HANDLE keylogFile = NULL;
     ULONG snapLength = 0;
     ULONG maxFileBytes = 0;
     ULONG maxSeconds = 0;
@@ -190,6 +192,12 @@ int __cdecl wmain(int argc, WCHAR **argv)
             if (caFile || ! ParseUInt64(text, 16, &rawCa) || rawCa == 0)
                 goto InvalidArguments;
             caFile = (HANDLE)(ULONG_PTR)rawCa;
+        }
+        else if (ReadOption(argc, argv, &index, L"--keylog", &text)) {
+            if (keylogFile || ! ParseUInt64(text, 16, &rawKeylog) ||
+                    rawKeylog == 0)
+                goto InvalidArguments;
+            keylogFile = (HANDLE)(ULONG_PTR)rawKeylog;
         }
         else if (_wcsicmp(argv[index], L"--https-listen") == 0) {
             httpsListen = TRUE;
@@ -288,6 +296,8 @@ int __cdecl wmain(int argc, WCHAR **argv)
         goto InvalidArguments;
     if (! httpsListen && (harFile || caFile || httpsTestPreamble))
         goto InvalidArguments;
+    if (! httpsListen && keylogFile)
+        goto InvalidArguments;
 
     sectionHandle = (HANDLE)(ULONG_PTR)rawSection;
     outputFile = (HANDLE)(ULONG_PTR)rawFile;
@@ -326,6 +336,7 @@ int __cdecl wmain(int argc, WCHAR **argv)
         memset(&httpsOptions, 0, sizeof(httpsOptions));
         httpsOptions.har_file = harFile;
         httpsOptions.ca_file = caFile;
+        httpsOptions.keylog_file = keylogFile;
         httpsOptions.test_preamble = httpsTestPreamble;
         httpsOptions.redact = TRUE;
         httpsOptions.include_bodies = FALSE;
@@ -359,6 +370,8 @@ int __cdecl wmain(int argc, WCHAR **argv)
         CloseHandle(harFile);
     if (caFile)
         CloseHandle(caFile);
+    if (keylogFile)
+        CloseHandle(keylogFile);
     return status;
 
 InvalidArguments:
