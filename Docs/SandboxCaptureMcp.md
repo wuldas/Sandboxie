@@ -411,6 +411,38 @@ pinning failures are reported; broker failure does not leak direct traffic.
 - Optional TLS key-log adapters for selected pinned applications.
 - Evaluate, but do not promise, QUIC termination and HTTP/3 parsing.
 
+### Firefox/NSS trust (boxed profile, opt-in)
+
+Firefox does not read the Windows Root store by default, so a boxed Firefox does
+not automatically trust the Phase 4 session CA even after
+`--https-import-host-root`.  Two opt-in mechanisms exist, both
+boxed-profile-only (never touch the host Firefox profile or host NSS databases):
+
+1. **Enterprise roots (primary).** Point Firefox at the host Root store (where
+   the session CA already lives):
+
+   ```
+   SbieCapture.exe --firefox-enterprise-roots <boxed-profile-dir>
+   ```
+
+   This writes `user_pref("security.enterprise_roots.enabled", true);` into the
+   profile's `user.js` (idempotent; `prefs.js` is left untouched).
+
+2. **NSS cert9.db injection (stronger, needs the NSS tools).** Import the CA
+   public certificate directly into the profile's `cert9.db` with `certutil`:
+
+   ```
+   SbieCapture.exe --firefox-import-ca <boxed-profile-dir> \
+       --import-ca-path <ca-public.pem> [--certutil <path-to-certutil>]
+   ```
+
+   `certutil` defaults to resolving from PATH; the profile must be closed while
+   `cert9.db` is modified.
+
+Firefox must be (re)started after either change.  Removal restores the profile
+`user.js` / `cert9.db` and restarts Firefox.  Host-profile and host-NSS hashes
+must remain unchanged (verified in the live isolation suite).
+
 ## Verification Matrix
 
 Required validation includes:

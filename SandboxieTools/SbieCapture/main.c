@@ -21,6 +21,7 @@
 #include "capture_https_broker.h"
 #include "capture_broker.h"
 #include "capture_ca.h"
+#include "firefox_trust.h"
 
 #include <errno.h>
 #include <stdio.h>
@@ -78,7 +79,11 @@ static void PrintUsage(void)
         L"[--stop-event HANDLE] [--snaplen N] [--max-file-bytes N] "
         L"[--max-seconds N] [--rotate-count N] "
         L"[--https-listen --har HANDLE --ca-file HANDLE "
-        L"[--keylog HANDLE] [--https-test-preamble]]\n");
+        L"[--keylog HANDLE] [--https-test-preamble]]\n"
+        L"[--import-ca HANDLE | --import-ca-path PATH [--store NAME] "
+        L"[--system-store]]\n"
+        L"[--firefox-enterprise-roots DIR]\n"
+        L"[--firefox-import-ca DIR --import-ca-path PATH [--certutil PATH]]\n");
 }
 
 
@@ -109,6 +114,10 @@ int __cdecl wmain(int argc, WCHAR **argv)
     HANDLE importHandle = NULL;
     const WCHAR *importPath = NULL;
     const WCHAR *storeName = L"Root";
+    BOOL firefoxEnterpriseRoots = FALSE;
+    BOOL firefoxImportCa = FALSE;
+    const WCHAR *firefoxProfile = NULL;
+    const WCHAR *certutilPath = NULL;
     HANDLE sectionHandle = NULL;
     HANDLE outputFile = NULL;
     HANDLE stopEvent = NULL;
@@ -234,6 +243,27 @@ int __cdecl wmain(int argc, WCHAR **argv)
         else if (_wcsicmp(argv[index], L"--system-store") == 0) {
             systemStore = TRUE;
         }
+        else if (ReadOption(
+                     argc, argv, &index, L"--firefox-enterprise-roots", &text)) {
+            if (firefoxEnterpriseRoots || firefoxImportCa ||
+                    ! text || ! text[0])
+                goto InvalidArguments;
+            firefoxEnterpriseRoots = TRUE;
+            firefoxProfile = text;
+        }
+        else if (ReadOption(
+                     argc, argv, &index, L"--firefox-import-ca", &text)) {
+            if (firefoxEnterpriseRoots || firefoxImportCa ||
+                    ! text || ! text[0])
+                goto InvalidArguments;
+            firefoxImportCa = TRUE;
+            firefoxProfile = text;
+        }
+        else if (ReadOption(argc, argv, &index, L"--certutil", &text)) {
+            if (! text || ! text[0])
+                goto InvalidArguments;
+            certutilPath = text;
+        }
         else if (_wcsicmp(argv[index], L"--help") == 0 ||
                  _wcsicmp(argv[index], L"-h") == 0) {
             PrintUsage();
@@ -241,6 +271,48 @@ int __cdecl wmain(int argc, WCHAR **argv)
         }
         else {
             goto InvalidArguments;
+        }
+    }
+
+    if (firefoxEnterpriseRoots || firefoxImportCa) {
+        int ffStatus;
+        if (haveSection || haveFile || httpsListen || removeCa)
+            goto InvalidArguments;
+        if (firefoxImportCa && ! importCa)
+            goto InvalidArguments;   /* --firefox-import-ca needs the CA PEM */
+        if (firefoxEnterpriseRoots) {
+            ffStatus = FirefoxTrust_EnableEnterpriseRoots(firefoxProfile);
+            return ffStatus == FIREFOX_TRUST_OK ?
+                CAPTURE_BROKER_OK : CAPTURE_BROKER_ERROR;
+        }
+        {
+            HANDLE file = importHandle;
+            char pem[4096];
+            DWORD readSize = 0;
+            if (importPath) {
+                file = CreateFileW(
+                    importPath, GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE, NULL,
+                    OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+                if (file == INVALID_HANDLE_VALUE)
+                    return CAPTURE_BROKER_ERROR;
+            }
+            if (file == NULL || file == INVALID_HANDLE_VALUE)
+                goto InvalidArguments;
+            SetFilePointer(file, 0, NULL, FILE_BEGIN);
+            if (! ReadFile(file, pem, sizeof(pem) - 1, &readSize, NULL) ||
+                    ! readSize) {
+                if (importPath)
+                    CloseHandle(file);
+                return CAPTURE_BROKER_ERROR;
+            }
+            pem[readSize] = 0;
+            if (importPath)
+                CloseHandle(file);
+            ffStatus = FirefoxTrust_ImportCaToNss(
+                firefoxProfile, pem, readSize, certutilPath);
+            return ffStatus == FIREFOX_TRUST_OK ?
+                CAPTURE_BROKER_OK : CAPTURE_BROKER_ERROR;
         }
     }
 
