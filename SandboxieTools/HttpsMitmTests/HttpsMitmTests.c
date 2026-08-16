@@ -223,6 +223,7 @@ typedef struct _UPSTREAM_SERVER {
     HANDLE thread;
     volatile LONG stop;
     BOOL require_sni;
+    BOOL chunked;
 
 } UPSTREAM_SERVER;
 
@@ -251,6 +252,17 @@ static DWORD WINAPI UpstreamThread(void *param)
             "Set-Cookie: session=abc123\r\n"
             "\r\n"
             "upstream-ok";
+        /* "upstream-ok" split across two chunks */
+        static const char kChunkedResponse[] =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Transfer-Encoding: chunked\r\n"
+            "Set-Cookie: session=abc123\r\n"
+            "\r\n"
+            "7\r\nupstrea\r\n"
+            "4\r\nm-ok\r\n"
+            "0\r\n\r\n";
+        const char *response = server->chunked ? kChunkedResponse : kResponse;
 
         FD_ZERO(&readSet);
         FD_SET(server->listen_socket, &readSet);
@@ -279,7 +291,7 @@ static DWORD WINAPI UpstreamThread(void *param)
             }
             got = SSL_read(ssl, request, sizeof(request) - 1);
             if (got > 0)
-                SSL_write(ssl, kResponse, (int)strlen(kResponse));
+                SSL_write(ssl, response, (int)strlen(response));
         }
         SSL_shutdown(ssl);
         SSL_free(ssl);
@@ -458,6 +470,340 @@ static int ClientGetOnSocket(
     SSL_free(ssl);
     SSL_CTX_free(ctx);
     closesocket(sock);
+    return ok;
+}
+
+
+static int CountOccurrences(const char *haystack, const char *needle)
+{
+    int count = 0;
+    const char *p = haystack;
+    while ((p = strstr(p, needle)) != NULL) {
+        ++count;
+        p += strlen(needle);
+    }
+    return count;
+}
+
+
+/* Send `count` sequential requests over one connection; append each response
+   to `response`. Returns 1 if all `count` exchanges completed. */
+static int ClientGetMultipleOnSocket(
+    SOCKET sock,
+    const char *sessionCaPem,
+    int minVersion,
+    int maxVersion,
+    int count,
+    char *response,
+    ULONG responseCap)
+{
+    SSL_CTX *ctx;
+    SSL *ssl;
+    BIO *trustBio;
+    X509 *trustCert;
+    X509_STORE *store;
+    int total = 0;
+    int i = 0;
+    static const char kRequest[] =
+        "GET / HTTP/1.1\r\n"
+        "Host: example.com\r\n"
+        "Authorization: Bearer secret-token\r\n"
+        "\r\n";
+
+    if (responseCap)
+        response[0] = 0;
+    if (sock == INVALID_SOCKET)
+        return 0;
+
+    ctx = SSL_CTX_new(TLS_client_method());
+    if (! ctx) {
+        closesocket(sock);
+        return 0;
+    }
+    SSL_CTX_set_min_proto_version(ctx, minVersion);
+    SSL_CTX_set_max_proto_version(ctx, maxVersion);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    trustBio = BIO_new_mem_buf(sessionCaPem, -1);
+    trustCert = trustBio ? PEM_read_bio_X509(trustBio, NULL, NULL, NULL) : NULL;
+    store = SSL_CTX_get_cert_store(ctx);
+    if (! trustCert || X509_STORE_add_cert(store, trustCert) != 1) {
+        X509_free(trustCert);
+        BIO_free(trustBio);
+        SSL_CTX_free(ctx);
+        closesocket(sock);
+        return 0;
+    }
+    X509_free(trustCert);
+    BIO_free(trustBio);
+
+    ssl = SSL_new(ctx);
+    if (! ssl) {
+        SSL_CTX_free(ctx);
+        closesocket(sock);
+        return 0;
+    }
+    SSL_set_fd(ssl, (int)sock);
+    SSL_set_tlsext_host_name(ssl, "example.com");
+    if (SSL_connect(ssl) == 1) {
+        for (i = 0; i < count; ++i) {
+            char cycle[512];
+            int ctotal = 0;
+            if (SSL_write(ssl, kRequest, (int)strlen(kRequest)) <= 0)
+                break;
+            cycle[0] = 0;
+            for (;;) {
+                int got = SSL_read(ssl, cycle + ctotal,
+                                   (int)(sizeof(cycle) - 1 - ctotal));
+                if (got <= 0)
+                    break;
+                ctotal += got;
+                cycle[ctotal] = 0;
+                if (strstr(cycle, "upstream-ok") != NULL)
+                    break;
+            }
+            if (strstr(cycle, "upstream-ok") == NULL)
+                break;
+            if ((ULONG)(total + ctotal) >= responseCap)
+                break;
+            memcpy(response + total, cycle, ctotal);
+            total += ctotal;
+            response[total] = 0;
+        }
+    }
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    closesocket(sock);
+    return i == count;
+}
+
+
+static int TestChunkedResponse(void)
+{
+    UPSTREAM_SERVER upstream;
+    CAPTURE_CA *ca;
+    HTTPS_MITM_OPTIONS options;
+    HTTPS_MITM *mitm;
+    HTTPS_REDIRECT_CONTEXT context;
+    SERVE_JOB job;
+    HANDLE thread;
+    SOCKET accepted;
+    SOCKET probe;
+    struct sockaddr_in addr;
+    char sessionPem[4096];
+    ULONG pemLength = 0;
+    char response[1024];
+    WCHAR harPath[MAX_PATH];
+    UCHAR *harBytes = NULL;
+    DWORD harSize = 0;
+    int clientOk;
+    int ok;
+
+    if (! StartUpstream(&upstream)) {
+        StopUpstream(&upstream);
+        return Require(0, "chunked upstream");
+    }
+    upstream.chunked = TRUE;
+
+    ca = CaptureCa_Create();
+    if (! ca || CaptureCa_ExportPublicPem(
+            ca, sessionPem, sizeof(sessionPem), &pemLength) != CAPTURE_CA_OK) {
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "chunked session CA");
+    }
+
+    MakeTempPath(harPath, MAX_PATH, L"sbie-mitm-chunked.har");
+    DeleteFileW(harPath);
+
+    context = MakeContext();
+    memset(&options, 0, sizeof(options));
+    options.ca = ca;
+    options.expected_context = &context;
+    options.upstream_host = "127.0.0.1";
+    options.upstream_port = upstream.port;
+    options.upstream_ca_pem = upstream.ca_pem;
+    options.har_path = harPath;
+    options.redact = TRUE;
+    options.include_bodies = TRUE;
+
+    mitm = HttpsMitm_Listen(&options);
+    if (! mitm) {
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "chunked listen");
+    }
+
+    probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(HttpsMitm_ListenPort(mitm));
+    if (connect(probe, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        closesocket(probe);
+        HttpsMitm_Close(mitm);
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "chunked connect");
+    }
+    accepted = HttpsMitm_Accept(mitm);
+    memset(&job, 0, sizeof(job));
+    job.mitm = mitm;
+    job.client = accepted;
+    job.context = context;
+    job.have_context = 1;
+    job.result = HTTPS_MITM_ERROR;
+    thread = CreateThread(NULL, 0, ServeThread, &job, 0, NULL);
+    if (! thread) {
+        closesocket(probe);
+        closesocket(accepted);
+        HttpsMitm_Close(mitm);
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "chunked serve thread");
+    }
+    clientOk = ClientGetOnSocket(
+        probe, sessionPem, TLS1_2_VERSION, TLS1_2_VERSION,
+        response, sizeof(response));
+    WaitForSingleObject(thread, 10000);
+    CloseHandle(thread);
+    closesocket(probe);
+    HttpsMitm_Close(mitm);
+    CaptureCa_Free(ca);
+    StopUpstream(&upstream);
+
+    ok = Require(clientOk, "chunked client GET") &&
+        Require(strstr(response, "Transfer-Encoding: chunked") != NULL,
+                "chunked response relayed with chunked header") &&
+        Require(job.result == HTTPS_MITM_OK, "chunked MITM serve success");
+    if (! ok) {
+        DeleteFileW(harPath);
+        return 0;
+    }
+
+    if (! Require(ReadAll(harPath, &harBytes, &harSize), "read chunked HAR")) {
+        DeleteFileW(harPath);
+        return 0;
+    }
+    ok = Require(strstr((const char *)harBytes, "upstream-ok") != NULL,
+                 "chunked body decoded in HAR") &&
+        Require(strstr((const char *)harBytes, "upstrea\r\n4") == NULL,
+                "raw chunk framing absent from HAR body");
+    free(harBytes);
+    DeleteFileW(harPath);
+    return ok;
+}
+
+
+static int TestKeepAliveRoundTrip(void)
+{
+    UPSTREAM_SERVER upstream;
+    CAPTURE_CA *ca;
+    HTTPS_MITM_OPTIONS options;
+    HTTPS_MITM *mitm;
+    HTTPS_REDIRECT_CONTEXT context;
+    SERVE_JOB job;
+    HANDLE thread;
+    SOCKET accepted;
+    SOCKET probe;
+    struct sockaddr_in addr;
+    char sessionPem[4096];
+    ULONG pemLength = 0;
+    char response[2048];
+    WCHAR harPath[MAX_PATH];
+    UCHAR *harBytes = NULL;
+    DWORD harSize = 0;
+    int clientOk;
+    int ok;
+
+    if (! StartUpstream(&upstream)) {
+        StopUpstream(&upstream);
+        return Require(0, "keep-alive upstream");
+    }
+    ca = CaptureCa_Create();
+    if (! ca || CaptureCa_ExportPublicPem(
+            ca, sessionPem, sizeof(sessionPem), &pemLength) != CAPTURE_CA_OK) {
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "keep-alive session CA");
+    }
+
+    MakeTempPath(harPath, MAX_PATH, L"sbie-mitm-keepalive.har");
+    DeleteFileW(harPath);
+
+    context = MakeContext();
+    memset(&options, 0, sizeof(options));
+    options.ca = ca;
+    options.expected_context = &context;
+    options.upstream_host = "127.0.0.1";
+    options.upstream_port = upstream.port;
+    options.upstream_ca_pem = upstream.ca_pem;
+    options.har_path = harPath;
+    options.redact = TRUE;
+    options.include_bodies = TRUE;
+
+    mitm = HttpsMitm_Listen(&options);
+    if (! mitm) {
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "keep-alive listen");
+    }
+
+    probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(HttpsMitm_ListenPort(mitm));
+    if (connect(probe, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        closesocket(probe);
+        HttpsMitm_Close(mitm);
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "keep-alive connect");
+    }
+    accepted = HttpsMitm_Accept(mitm);
+    memset(&job, 0, sizeof(job));
+    job.mitm = mitm;
+    job.client = accepted;
+    job.context = context;
+    job.have_context = 1;
+    job.result = HTTPS_MITM_ERROR;
+    thread = CreateThread(NULL, 0, ServeThread, &job, 0, NULL);
+    if (! thread) {
+        closesocket(probe);
+        closesocket(accepted);
+        HttpsMitm_Close(mitm);
+        CaptureCa_Free(ca);
+        StopUpstream(&upstream);
+        return Require(0, "keep-alive serve thread");
+    }
+    clientOk = ClientGetMultipleOnSocket(
+        probe, sessionPem, TLS1_2_VERSION, TLS1_2_VERSION, 2,
+        response, sizeof(response));
+    WaitForSingleObject(thread, 10000);
+    CloseHandle(thread);
+    closesocket(probe);
+    HttpsMitm_Close(mitm);
+    CaptureCa_Free(ca);
+    StopUpstream(&upstream);
+
+    ok = Require(clientOk, "two keep-alive exchanges") &&
+        Require(CountOccurrences(response, "upstream-ok") == 2,
+                "two responses on one connection") &&
+        Require(job.result == HTTPS_MITM_OK, "keep-alive MITM serve success");
+    if (! ok) {
+        DeleteFileW(harPath);
+        return 0;
+    }
+
+    if (! Require(ReadAll(harPath, &harBytes, &harSize), "read keep-alive HAR")) {
+        DeleteFileW(harPath);
+        return 0;
+    }
+    ok = Require(CountOccurrences((const char *)harBytes, "startedDateTime") == 2,
+                 "two HAR entries for two exchanges");
+    free(harBytes);
+    DeleteFileW(harPath);
     return ok;
 }
 
@@ -785,9 +1131,18 @@ static int TestLeafTrustedWithSessionCaExtraStore(void)
     }
     withoutExtra = ChainError(leafCtx, NULL);
     extraTrusted = RelaxAndReadError(leafCtx, extra, &withExtra);
+    //
+    // A leaf signed by the ephemeral session CA must fail default chain
+    // building.  On a clean host this surfaces as UNTRUSTED_ROOT /
+    // PARTIAL_CHAIN; when a same-named persistent CA already sits in the
+    // host Root store, Windows instead reports NOT_SIGNATURE_VALID because
+    // the leaf's issuer name matches but the key does not.  Both mean the
+    // leaf is untrusted until the exact session CA is supplied.
+    //
     ok = Require(
             (withoutExtra & (CERT_TRUST_IS_UNTRUSTED_ROOT |
-                             CERT_TRUST_IS_PARTIAL_CHAIN)) != 0,
+                             CERT_TRUST_IS_PARTIAL_CHAIN |
+                             CERT_TRUST_IS_NOT_SIGNATURE_VALID)) != 0,
             "leaf is untrusted without session CA extra store") &&
         Require(extraTrusted, "relax helper verifies session-CA chain") &&
         Require(
@@ -1641,6 +1996,8 @@ int main(void)
         TestOpenNamedRootsFromRegistry() &&
         TestTls13RoundTrip() &&
         TestTls12RoundTrip() &&
+        TestChunkedResponse() &&
+        TestKeepAliveRoundTrip() &&
         TestMissingContextRejected() &&
         TestQueryRedirectContextOnPlainSocketFails() &&
         TestServeOnceForwardsDownstreamSni() &&

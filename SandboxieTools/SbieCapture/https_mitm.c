@@ -181,45 +181,103 @@ static int HttpsMitm_SslReadSome(SSL *ssl, char *buffer, ULONG capacity, ULONG *
 }
 
 
+typedef struct _MITM_READER {
+
+    SSL *ssl;
+    char pending[HTTPS_MITM_IO_CAP];
+    ULONG pending_len;
+
+} MITM_READER;
+
+
+/* Read one complete HTTP/1.1 message (header + body, chunked or content-length)
+   from the reader's SSL connection. Leftover bytes beyond the message boundary
+   are preserved in reader->pending for the next exchange. Returns 1 on success,
+   0 on EOF / malformed input. */
 static int HttpsMitm_ReadMessage(
-    SSL *ssl,
+    MITM_READER *reader,
     char *buffer,
     ULONG capacity,
-    ULONG *used,
+    ULONG *msg_len,
     int isRequest,
     HTTP11_REQUEST *request,
     HTTP11_RESPONSE *response)
 {
+    ULONG used = 0;
     ULONG headerBytes = 0;
     ULONG contentLength = 0;
+    ULONG bodyLength = 0;
+    BOOL chunked = FALSE;
     int status;
 
-    *used = 0;
-    buffer[0] = 0;
-    while (*used < 4 || strstr(buffer, "\r\n\r\n") == NULL) {
-        if (! HttpsMitm_SslReadSome(ssl, buffer, capacity, used))
+    *msg_len = 0;
+    if (reader->pending_len > 0) {
+        if (reader->pending_len >= capacity)
+            return 0;
+        memcpy(buffer, reader->pending, reader->pending_len);
+        used = reader->pending_len;
+        buffer[used] = 0;
+        reader->pending_len = 0;
+    }
+    else {
+        buffer[0] = 0;
+    }
+
+    while (used < 4 || strstr(buffer, "\r\n\r\n") == NULL) {
+        if (! HttpsMitm_SslReadSome(reader->ssl, buffer, capacity, &used))
             return 0;
     }
 
     if (isRequest) {
-        status = Http11_ParseRequest((const UCHAR *)buffer, *used, request);
+        status = Http11_ParseRequest((const UCHAR *)buffer, used, request);
         if (status != HTTP11_OK)
             return 0;
         headerBytes = request->header_bytes;
         contentLength = request->content_length;
+        chunked = request->chunked;
     }
     else {
-        status = Http11_ParseResponse((const UCHAR *)buffer, *used, response);
+        status = Http11_ParseResponse((const UCHAR *)buffer, used, response);
         if (status != HTTP11_OK)
             return 0;
         headerBytes = response->header_bytes;
         contentLength = response->content_length;
+        chunked = response->chunked;
     }
 
-    while (*used < headerBytes + contentLength) {
-        if (! HttpsMitm_SslReadSome(ssl, buffer, capacity, used))
-            return 0;
+    if (chunked) {
+        for (;;) {
+            ULONG decoded = 0;
+            ULONG total = 0;
+            int r = Http11_DecodeChunked(
+                (const UCHAR *)buffer, used, headerBytes, NULL, 0, &decoded, &total);
+            if (r == HTTP11_OK) {
+                bodyLength = total;
+                break;
+            }
+            if (r == HTTP11_ERROR)
+                return 0;
+            if (! HttpsMitm_SslReadSome(reader->ssl, buffer, capacity, &used))
+                return 0;
+        }
     }
+    else {
+        bodyLength = contentLength;
+        while (used < headerBytes + bodyLength) {
+            if (! HttpsMitm_SslReadSome(reader->ssl, buffer, capacity, &used))
+                return 0;
+        }
+    }
+
+    /* preserve any bytes beyond this message for the next exchange */
+    if (used > headerBytes + bodyLength) {
+        ULONG leftover = used - (headerBytes + bodyLength);
+        if (leftover >= capacity)
+            return 0;
+        memcpy(reader->pending, buffer + headerBytes + bodyLength, leftover);
+        reader->pending_len = leftover;
+    }
+    *msg_len = headerBytes + bodyLength;
     return 1;
 }
 
@@ -310,19 +368,59 @@ static int HttpsMitm_WriteHar(
     }
     HttpsMitm_FormatIpv4(context->original_address, serverIp, sizeof(serverIp));
 
-    if (requestSize > request->header_bytes) {
-        requestBody = requestBytes + request->header_bytes;
-        requestBodyLen = requestSize - request->header_bytes;
-    }
-    else {
-        requestBody = NULL;
-    }
-    if (responseSize > response->header_bytes) {
-        responseBody = responseBytes + response->header_bytes;
-        responseBodyLen = responseSize - response->header_bytes;
-    }
-    else {
-        responseBody = NULL;
+    {
+        char requestBodyScratch[HTTPS_MITM_IO_CAP];
+        char responseBodyScratch[HTTPS_MITM_IO_CAP];
+
+        /* request body: decode chunked framing for HAR, else raw slice */
+        if (request->chunked) {
+            ULONG decoded = 0;
+            ULONG total = 0;
+            if (Http11_DecodeChunked(
+                    (const UCHAR *)requestBytes, requestSize,
+                    request->header_bytes, (UCHAR *)requestBodyScratch,
+                    sizeof(requestBodyScratch), &decoded, &total) == HTTP11_OK) {
+                requestBody = requestBodyScratch;
+                requestBodyLen = decoded;
+            }
+            else {
+                requestBody = NULL;
+                requestBodyLen = 0;
+            }
+        }
+        else if (requestSize > request->header_bytes) {
+            requestBody = requestBytes + request->header_bytes;
+            requestBodyLen = requestSize - request->header_bytes;
+        }
+        else {
+            requestBody = NULL;
+            requestBodyLen = 0;
+        }
+
+        /* response body: decode chunked framing for HAR, else raw slice */
+        if (response->chunked) {
+            ULONG decoded = 0;
+            ULONG total = 0;
+            if (Http11_DecodeChunked(
+                    (const UCHAR *)responseBytes, responseSize,
+                    response->header_bytes, (UCHAR *)responseBodyScratch,
+                    sizeof(responseBodyScratch), &decoded, &total) == HTTP11_OK) {
+                responseBody = responseBodyScratch;
+                responseBodyLen = decoded;
+            }
+            else {
+                responseBody = NULL;
+                responseBodyLen = 0;
+            }
+        }
+        else if (responseSize > response->header_bytes) {
+            responseBody = responseBytes + response->header_bytes;
+            responseBodyLen = responseSize - response->header_bytes;
+        }
+        else {
+            responseBody = NULL;
+            responseBodyLen = 0;
+        }
     }
 
     memset(&exchange, 0, sizeof(exchange));
@@ -340,10 +438,12 @@ static int HttpsMitm_WriteHar(
     exchange.include_bodies = mitm->include_bodies;
     exchange.request_body = (const UCHAR *)requestBody;
     exchange.request_body_len = requestBodyLen;
-    exchange.request_body_original_len = request->content_length;
+    exchange.request_body_original_len = request->chunked
+        ? requestBodyLen : request->content_length;
     exchange.response_body = (const UCHAR *)responseBody;
     exchange.response_body_len = responseBodyLen;
-    exchange.response_body_original_len = response->content_length;
+    exchange.response_body_original_len = response->chunked
+        ? responseBodyLen : response->content_length;
     exchange.body_cap = 64 * 1024;
 
     status = HarWriter_WriteExchange(writer, &exchange);
@@ -626,10 +726,14 @@ int HttpsMitm_ServeOnce(
     SOCKET upstream = INVALID_SOCKET;
     char requestBuf[HTTPS_MITM_IO_CAP];
     char responseBuf[HTTPS_MITM_IO_CAP];
-    ULONG requestSize = 0;
-    ULONG responseSize = 0;
     HTTP11_REQUEST request;
     HTTP11_RESPONSE response;
+    MITM_READER downReader;
+    char host[64];
+    const char *upstreamHost;
+    USHORT upstreamPort;
+    const char *sni;
+    BOOL served = FALSE;
     int status = HTTPS_MITM_ERROR;
 
     if (! mitm || client == INVALID_SOCKET)
@@ -656,17 +760,32 @@ int HttpsMitm_ServeOnce(
     if (SSL_accept(down) != 1)
         goto done;
 
-    {
-        char host[64];
-        const char *upstreamHost = mitm->upstream_host;
-        USHORT upstreamPort = mitm->upstream_port;
-        const char *sni = SSL_get_servername(down, TLSEXT_NAMETYPE_host_name);
-        if ((! upstreamHost[0] || upstreamPort == 0) && context) {
-            HttpsMitm_FormatIpv4(context->original_address, host, sizeof(host));
-            upstreamHost = host;
-            if (upstreamPort == 0)
-                upstreamPort = context->original_port;
+    /* resolve the upstream destination once for the whole connection */
+    upstreamHost = mitm->upstream_host;
+    upstreamPort = mitm->upstream_port;
+    sni = SSL_get_servername(down, TLSEXT_NAMETYPE_host_name);
+    if ((! upstreamHost[0] || upstreamPort == 0) && context) {
+        HttpsMitm_FormatIpv4(context->original_address, host, sizeof(host));
+        upstreamHost = host;
+        if (upstreamPort == 0)
+            upstreamPort = context->original_port;
+    }
+
+    memset(&downReader, 0, sizeof(downReader));
+    downReader.ssl = down;
+
+    for (;;) {
+        MITM_READER upReader;
+        ULONG requestSize = 0;
+        ULONG responseSize = 0;
+
+        /* read one request from the downstream client (EOF ends keep-alive) */
+        if (! HttpsMitm_ReadMessage(&downReader, requestBuf, sizeof(requestBuf),
+                &requestSize, 1, &request, &response)) {
+            break;
         }
+
+        /* open a fresh upstream connection for this request */
         upstream = HttpsMitm_ConnectTcp(upstreamHost, upstreamPort);
         if (upstream == INVALID_SOCKET)
             goto done;
@@ -679,40 +798,52 @@ int HttpsMitm_ServeOnce(
             SSL_set_tlsext_host_name(up, sni);
         if (SSL_connect(up) != 1)
             goto done;
+
+        /* forward the request upstream */
+        if (! HttpsMitm_SslWriteAll(up, requestBuf, requestSize))
+            goto done;
+
+        /* read the response from upstream */
+        memset(&upReader, 0, sizeof(upReader));
+        upReader.ssl = up;
+        if (! HttpsMitm_ReadMessage(&upReader, responseBuf, sizeof(responseBuf),
+                &responseSize, 0, &request, &response)) {
+            goto done;
+        }
+
+        /* forward the response downstream */
+        if (! HttpsMitm_SslWriteAll(down, responseBuf, responseSize))
+            goto done;
+
+        /* record the exchange (best-effort) */
+        HttpsMitm_WriteHar(mitm, context, down, &request, &response,
+            requestBuf, requestSize, responseBuf, responseSize);
+
+        served = TRUE;
+
+        /* release this request's upstream connection */
+        SSL_shutdown(up);
+        SSL_free(up);
+        up = NULL;
+        closesocket(upstream);
+        upstream = INVALID_SOCKET;
     }
 
-    if (! HttpsMitm_ReadMessage(
-            down, requestBuf, sizeof(requestBuf), &requestSize, 1,
-            &request, &response)) {
-        goto done;
-    }
-    if (! HttpsMitm_SslWriteAll(up, requestBuf, requestSize))
-        goto done;
-    if (! HttpsMitm_ReadMessage(
-            up, responseBuf, sizeof(responseBuf), &responseSize, 0,
-            &request, &response)) {
-        goto done;
-    }
-    if (! HttpsMitm_SslWriteAll(down, responseBuf, responseSize))
-        goto done;
-
-    status = HttpsMitm_WriteHar(
-        mitm, context, down, &request, &response,
-        requestBuf, requestSize, responseBuf, responseSize);
+    status = served ? HTTPS_MITM_OK : HTTPS_MITM_ERROR;
 
 done:
-    if (down) {
-        SSL_shutdown(down);
-        SSL_free(down);
-    }
     if (up) {
         SSL_shutdown(up);
         SSL_free(up);
     }
-    SSL_CTX_free(downCtx);
-    SSL_CTX_free(upCtx);
     if (upstream != INVALID_SOCKET)
         closesocket(upstream);
+    if (down) {
+        SSL_shutdown(down);
+        SSL_free(down);
+    }
+    SSL_CTX_free(downCtx);
+    SSL_CTX_free(upCtx);
     return status;
 }
 

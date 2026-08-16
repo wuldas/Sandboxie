@@ -364,3 +364,104 @@ const HTTP11_HEADER *Http11_FindHeader(
     }
     return NULL;
 }
+
+
+static int Http11_HexValue(UCHAR c)
+{
+    if (c >= '0' && c <= '9')
+        return c - '0';
+    if (c >= 'a' && c <= 'f')
+        return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F')
+        return c - 'A' + 10;
+    return -1;
+}
+
+
+int Http11_DecodeChunked(
+    const UCHAR *data,
+    ULONG size,
+    ULONG offset,
+    UCHAR *out,
+    ULONG out_capacity,
+    ULONG *decoded_len,
+    ULONG *total_len)
+{
+    ULONG pos = offset;
+    ULONG out_pos = 0;
+
+    if (! data || ! decoded_len || ! total_len)
+        return HTTP11_ERROR;
+    *decoded_len = 0;
+    *total_len = 0;
+
+    for (;;) {
+        ULONG line_end = pos;
+        ULONG chunk_size = 0;
+        ULONG i;
+        int digits = 0;
+
+        /* locate chunk-size line terminator */
+        while (line_end < size && data[line_end] != '\r' && data[line_end] != '\n')
+            ++line_end;
+        if (line_end >= size)
+            return HTTP11_NEED_MORE;
+        if (line_end + 1 >= size)
+            return HTTP11_NEED_MORE;
+        if (data[line_end] != '\r' || data[line_end + 1] != '\n')
+            return HTTP11_ERROR;
+
+        /* parse hex chunk size (stop at a ';' extension) */
+        for (i = pos; i < line_end && data[i] != ';'; ++i) {
+            int d = Http11_HexValue(data[i]);
+            if (d < 0)
+                return HTTP11_ERROR;
+            if (chunk_size > 0x0ffffffful)
+                return HTTP11_ERROR;   /* would overflow 32-bit size */
+            chunk_size = chunk_size * 16 + (ULONG)d;
+            ++digits;
+        }
+        if (digits == 0)
+            return HTTP11_ERROR;
+        pos = line_end + 2;
+
+        if (chunk_size == 0) {
+            /* zero chunk: consume trailers until an empty line */
+            for (;;) {
+                ULONG t_end = pos;
+                while (t_end < size && data[t_end] != '\r' && data[t_end] != '\n')
+                    ++t_end;
+                if (t_end >= size)
+                    return HTTP11_NEED_MORE;
+                if (t_end + 1 >= size)
+                    return HTTP11_NEED_MORE;
+                if (data[t_end] != '\r' || data[t_end + 1] != '\n')
+                    return HTTP11_ERROR;
+                if (t_end == pos) {
+                    *decoded_len = out_pos;
+                    *total_len = t_end + 2 - offset;
+                    return HTTP11_OK;
+                }
+                pos = t_end + 2;
+            }
+        }
+
+        /* chunk data */
+        if (chunk_size > size - pos)
+            return HTTP11_NEED_MORE;
+        if (out) {
+            if (chunk_size > out_capacity - out_pos)
+                return HTTP11_ERROR;   /* decoded body exceeds output buffer */
+            memcpy(out + out_pos, data + pos, chunk_size);
+        }
+        out_pos += chunk_size;
+        pos += chunk_size;
+
+        /* trailing CRLF after chunk data */
+        if (pos + 1 >= size)
+            return HTTP11_NEED_MORE;
+        if (data[pos] != '\r' || data[pos + 1] != '\n')
+            return HTTP11_ERROR;
+        pos += 2;
+    }
+}

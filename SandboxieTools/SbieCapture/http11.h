@@ -89,6 +89,20 @@ const HTTP11_HEADER *Http11_FindHeader(
     ULONG count,
     const char *name);
 
+/* Decode a chunked transfer-encoded body (RFC 7230 4.1) starting at `offset`.
+   Returns HTTP11_OK when the body is complete (with *decoded_len decoded bytes
+   written to `out` if non-NULL, and *total_len = raw body length consumed),
+   HTTP11_NEED_MORE when more data is required, or HTTP11_ERROR when malformed.
+   Pass out == NULL to scan without decoding. */
+int Http11_DecodeChunked(
+    const UCHAR *data,
+    ULONG size,
+    ULONG offset,
+    UCHAR *out,
+    ULONG out_capacity,
+    ULONG *decoded_len,
+    ULONG *total_len);
+
 #ifdef __cplusplus
 }
 #endif

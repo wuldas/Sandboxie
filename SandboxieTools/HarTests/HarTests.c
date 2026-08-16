@@ -436,6 +436,97 @@ static int TestHarDisableRedactionKeepsSecrets(void)
 }
 
 
+static int TestDecodeChunked(void)
+{
+    /* single chunk */
+    static const char kOne[] = "5\r\nhello\r\n0\r\n\r\n";
+    /* multiple chunks */
+    static const char kMulti[] = "3\r\nabc\r\n5\r\nfghij\r\n0\r\n\r\n";
+    /* chunk extension */
+    static const char kExt[] = "5;foo=bar\r\nhello\r\n0\r\n\r\n";
+    /* trailers */
+    static const char kTrailers[] = "3\r\nabc\r\n0\r\nX-T: v\r\n\r\n";
+    /* uppercase hex + offset (fake header prefix) */
+    static const char kHeader[] = "HTTP/1.1 200 OK\r\n\r\n";
+    static const char kUpper[] = "A\r\n0123456789\r\n0\r\n\r\n";
+    /* incomplete */
+    static const char kPartial[] = "5\r\nhe";
+    /* malformed (non-hex size) */
+    static const char kBad[] = "Z\r\n";
+    UCHAR out[256];
+    ULONG decoded = 0;
+    ULONG total = 0;
+    ULONG headerLen = (ULONG)strlen(kHeader);
+    char full[128];
+    int r;
+
+    r = Http11_DecodeChunked((const UCHAR *)kOne, (ULONG)strlen(kOne), 0,
+                             out, sizeof(out), &decoded, &total);
+    if (! Require(r == HTTP11_OK, "chunked single ok") ||
+            ! Require(decoded == 5 && memcmp(out, "hello", 5) == 0,
+                      "chunked single decoded") ||
+            ! Require(total == (ULONG)strlen(kOne), "chunked single total"))
+        return 0;
+
+    r = Http11_DecodeChunked((const UCHAR *)kMulti, (ULONG)strlen(kMulti), 0,
+                             out, sizeof(out), &decoded, &total);
+    if (! Require(r == HTTP11_OK, "chunked multi ok") ||
+            ! Require(decoded == 8 && memcmp(out, "abcfghij", 8) == 0,
+                      "chunked multi decoded") ||
+            ! Require(total == (ULONG)strlen(kMulti), "chunked multi total"))
+        return 0;
+
+    r = Http11_DecodeChunked((const UCHAR *)kExt, (ULONG)strlen(kExt), 0,
+                             out, sizeof(out), &decoded, &total);
+    if (! Require(r == HTTP11_OK, "chunked extension ok") ||
+            ! Require(decoded == 5 && memcmp(out, "hello", 5) == 0,
+                      "chunked extension decoded"))
+        return 0;
+
+    r = Http11_DecodeChunked((const UCHAR *)kTrailers, (ULONG)strlen(kTrailers),
+                             0, out, sizeof(out), &decoded, &total);
+    if (! Require(r == HTTP11_OK, "chunked trailers ok") ||
+            ! Require(decoded == 3 && memcmp(out, "abc", 3) == 0,
+                      "chunked trailers decoded") ||
+            ! Require(total == (ULONG)strlen(kTrailers),
+                      "chunked trailers total"))
+        return 0;
+
+    /* offset handling: chunked body after a header prefix */
+    memcpy(full, kHeader, headerLen);
+    memcpy(full + headerLen, kUpper, strlen(kUpper) + 1);
+    r = Http11_DecodeChunked((const UCHAR *)full,
+                             headerLen + (ULONG)strlen(kUpper), headerLen,
+                             out, sizeof(out), &decoded, &total);
+    if (! Require(r == HTTP11_OK, "chunked offset ok") ||
+            ! Require(decoded == 10 && memcmp(out, "0123456789", 10) == 0,
+                      "chunked offset decoded") ||
+            ! Require(total == (ULONG)strlen(kUpper), "chunked offset total"))
+        return 0;
+
+    /* scan-only mode (out == NULL) */
+    decoded = 0;
+    total = 0;
+    r = Http11_DecodeChunked((const UCHAR *)kOne, (ULONG)strlen(kOne), 0,
+                             NULL, 0, &decoded, &total);
+    if (! Require(r == HTTP11_OK && decoded == 5 &&
+                  total == (ULONG)strlen(kOne),
+                  "chunked scan-only mode"))
+        return 0;
+
+    /* incomplete */
+    r = Http11_DecodeChunked((const UCHAR *)kPartial, (ULONG)strlen(kPartial), 0,
+                             out, sizeof(out), &decoded, &total);
+    if (! Require(r == HTTP11_NEED_MORE, "chunked partial needs more"))
+        return 0;
+
+    /* malformed */
+    r = Http11_DecodeChunked((const UCHAR *)kBad, (ULONG)strlen(kBad), 0,
+                             out, sizeof(out), &decoded, &total);
+    return Require(r == HTTP11_ERROR, "chunked malformed is an error");
+}
+
+
 int main(void)
 {
     if (! TestParseGetRequest() ||
@@ -443,6 +534,7 @@ int main(void)
             ! TestRejectFoldedHeader() ||
             ! TestRejectOversizeLine() ||
             ! TestNeedMoreIncompleteRequest() ||
+            ! TestDecodeChunked() ||
             ! TestRedactSensitiveHeaders() ||
             ! TestDisableRedactionKeepsValues() ||
             ! TestHarOmitsBodiesAndRedactsByDefault() ||
