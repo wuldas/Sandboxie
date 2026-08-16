@@ -44,6 +44,9 @@ protected:
     MSG_HEADER *GetStatusHandler(MSG_HEADER *msg);
     MSG_HEADER *ListHandler(MSG_HEADER *msg);
     MSG_HEADER *ReadEventsHandler(MSG_HEADER *msg);
+    MSG_HEADER *ReadPayloadHandler(MSG_HEADER *msg, BOOLEAN stream);
+    MSG_HEADER *ReadPacketsHandler(MSG_HEADER *msg);
+    MSG_HEADER *ReadStreamsHandler(MSG_HEADER *msg);
     MSG_HEADER *SetExportHandler(MSG_HEADER *msg);
     MSG_HEADER *SetHarExportHandler(MSG_HEADER *msg);
     void NotifyHandler(HANDLE idProcess, ULONG64 ownerCreateTime);

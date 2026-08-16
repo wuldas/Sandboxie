@@ -726,6 +726,7 @@ CSettingsWindow::CSettingsWindow(QWidget* parent)
 	connect(ui.btnDelWarnProg, SIGNAL(clicked(bool)), this, SLOT(OnDelWarnProg()));
 
 	connect(ui.btnBrowse, SIGNAL(clicked(bool)), this, SLOT(OnBrowse()));
+	connect(ui.btnBrowseCaptureDir, SIGNAL(clicked(bool)), this, SLOT(OnBrowseCaptureDir()));
 	m_WarnProgsChanged = false;
 	//
 
@@ -1748,6 +1749,8 @@ void CSettingsWindow::LoadSettings()
 
 	ui.chkAutoUpdate->setCheckState(CSettingsWindow__Int2Chk(theConf->GetInt("Options/CheckForUpdates", 2)));
 
+	ui.txtCaptureDir->setText(theConf->GetString("Options/CaptureOutputDir"));
+
 	int UpdateInterval = theConf->GetInt("Options/UpdateInterval", UPDATE_INTERVAL);
 	int pos = ui.cmbInterval->findData(UpdateInterval);
 	if (pos == -1)
@@ -2357,6 +2360,8 @@ void CSettingsWindow::SaveSettings()
 
 	theConf->SetValue("Options/CheckForUpdates", CSettingsWindow__Chk2Int(ui.chkAutoUpdate->checkState()));
 
+	theConf->SetValue("Options/CaptureOutputDir", ui.txtCaptureDir->text());
+
 	int UpdateInterval = ui.cmbInterval->currentData().toInt();
 	if (!UpdateInterval)
 		UpdateInterval = ui.cmbInterval->currentText().toInt();
@@ -2497,6 +2502,16 @@ void CSettingsWindow::OnBrowse()
 		return;
 
 	ui.fileRoot->setCurrentText(Value + "\\%SANDBOX%");
+}
+
+void CSettingsWindow::OnBrowseCaptureDir()
+{
+	QString Value = QFileDialog::getExistingDirectory(this, tr("Select Directory")).replace("/", "\\");
+	if (Value.isEmpty())
+		return;
+
+	ui.txtCaptureDir->setText(Value);
+	OnOptChanged();
 }
 
 void CSettingsWindow::OnRootChanged()

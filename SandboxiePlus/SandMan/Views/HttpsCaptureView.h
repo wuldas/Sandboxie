@@ -38,8 +38,7 @@ protected:
     void showEvent(QShowEvent* pEvent) override;
 
 private slots:
-    void OnBrowsePcap();
-    void OnBrowseHar();
+    void OnOpenFolder();
     void OnStart();
     void OnStop();
     void OnClear();
@@ -52,6 +51,7 @@ private:
     void AppendRow(const HTTPS_CAPTURE_ROW& Row);
     void ConsumeHarTail();
     QString PreferredBoxName() const;
+    static QString CaptureOutputDir();
 
     int m_uTimerID;
     quint32 m_CapabilityFlags;
@@ -67,10 +67,7 @@ private:
     quint32 m_TargetProcessId;
 
     QComboBox* m_pBoxCombo;
-    QLineEdit* m_pPcapPath;
-    QLineEdit* m_pHarPath;
-    QPushButton* m_pBrowsePcap;
-    QPushButton* m_pBrowseHar;
+    QPushButton* m_pOpenFolder;
     QPushButton* m_pStart;
     QPushButton* m_pStop;
     QPushButton* m_pClear;

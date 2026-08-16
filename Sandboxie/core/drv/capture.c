@@ -1002,7 +1002,6 @@ static NTSTATUS Capture_Api_Read(PROCESS *proc, ULONG64 *parms)
 }
 
 
-#if 0
 static NTSTATUS Capture_Api_ReadPayload(
     PROCESS *proc, ULONG64 *parms, BOOLEAN stream)
 {
@@ -1149,7 +1148,6 @@ static NTSTATUS Capture_Api_ReadStreams(PROCESS *proc, ULONG64 *parms)
 {
     return Capture_Api_ReadPayload(proc, parms, TRUE);
 }
-#endif
 
 
 //---------------------------------------------------------------------------
@@ -1170,6 +1168,8 @@ BOOLEAN Capture_Init(void)
     Api_SetFunction(API_CAPTURE_CONTROL, Capture_Api_Control);
     Api_SetFunction(API_CAPTURE_READ, Capture_Api_Read);
     Api_SetFunction(API_CAPTURE_MAP, Capture_Api_Map);
+    Api_SetFunction(API_CAPTURE_READ_PACKETS, Capture_Api_ReadPackets);
+    Api_SetFunction(API_CAPTURE_READ_STREAMS, Capture_Api_ReadStreams);
     return TRUE;
 }
 

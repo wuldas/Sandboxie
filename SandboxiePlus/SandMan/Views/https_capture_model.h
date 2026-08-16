@@ -75,10 +75,7 @@ typedef struct _HTTPS_CAPTURE_ROW {
 extern "C" {
 #endif
 
-BOOL HttpsCapture_CanStart(
-    ULONG capabilityFlags,
-    const WCHAR *pcapPath,
-    const WCHAR *harPath);
+BOOL HttpsCapture_CanStart(ULONG capabilityFlags);
 
 int HttpsCapture_ParseEntry(
     const char *json,

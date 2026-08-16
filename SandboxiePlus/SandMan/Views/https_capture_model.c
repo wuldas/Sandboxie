@@ -25,12 +25,6 @@
 #include <string.h>
 
 
-static BOOL HttpsCapture_HasPath(const WCHAR *path)
-{
-    return path && path[0];
-}
-
-
 static const char *HttpsCapture_FindKey(const char *json, const char *key)
 {
     char pattern[64];
@@ -130,15 +124,10 @@ static void HttpsCapture_SplitUrl(
 }
 
 
-BOOL HttpsCapture_CanStart(
-    ULONG capabilityFlags,
-    const WCHAR *pcapPath,
-    const WCHAR *harPath)
+BOOL HttpsCapture_CanStart(ULONG capabilityFlags)
 {
-    if ((capabilityFlags & HTTPS_CAPTURE_CAP_REQUIRED) !=
-            HTTPS_CAPTURE_CAP_REQUIRED)
-        return FALSE;
-    return HttpsCapture_HasPath(pcapPath) && HttpsCapture_HasPath(harPath);
+    return (capabilityFlags & HTTPS_CAPTURE_CAP_REQUIRED) ==
+        HTTPS_CAPTURE_CAP_REQUIRED;
 }
 
 

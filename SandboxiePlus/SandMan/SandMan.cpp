@@ -499,8 +499,6 @@ CSandMan::CSandMan(QWidget *parent)
 
 	m_bOnTop = false;
 	m_bExit = false;
-	m_LastCheckInternetMs = 0;
-	m_bHasInternet = true;
 
 	m_ImDiskReady = true;
 
@@ -830,8 +828,6 @@ void CSandMan::CreateHelpMenu(bool bAdvanced)
 		m_pManual = m_pMenuHelp->addAction(CSandMan::GetIcon("Help"), tr("Online Documentation"), this, SLOT(OnHelp()));
 		m_pForum = m_pMenuHelp->addAction(CSandMan::GetIcon("Forum"), tr("Visit Support Forum"), this, SLOT(OnHelp()));
 		m_pMenuHelp->addSeparator();
-		m_pUpdate = m_pMenuHelp->addAction(CSandMan::GetIcon("Update"), tr("Check for Updates"), this, SLOT(CheckForUpdates()));
-		m_pMenuHelp->addSeparator();
 		m_pAboutQt = m_pMenuHelp->addAction(tr("About the Qt Framework"), this, SLOT(OnAbout()));
 		m_pAbout = m_pMenuHelp->addAction(CSandMan::GetIcon("IconFull", 2), tr("About Sandboxie-Plus"), this, SLOT(OnAbout()));
 }
@@ -946,7 +942,6 @@ void CSandMan::CreateMenus(bool bAdvanced)
 		m_pEnableMonitoring->setCheckable(true);
 		m_pEnableCapture = m_pMenuView->addAction(CSandMan::GetIcon("Connect"), tr("Connection Audit"), this, SLOT(OnConnectionAudit()));
 		m_pEnablePacketCapture = m_pMenuView->addAction(CSandMan::GetIcon("Connect"), tr("Packet Capture"), this, SLOT(OnPacketCapture()));
-		m_pEnableHttpsCapture = m_pMenuView->addAction(CSandMan::GetIcon("Connect"), tr("HTTPS Capture"), this, SLOT(OnHttpsCapture()));
 	if (!bAdvanced)
 		m_pMenuView->addAction(CSandMan::GetIcon("Recover"), tr("Recovery Log"), this, SLOT(OnRecoveryLog()));
 
@@ -1023,7 +1018,6 @@ void CSandMan::CreateOldMenus()
 		m_pEnableMonitoring = m_pMenuFile->addAction(CSandMan::GetIcon("SetLogging"), tr("Resource Access Monitor"), this, SLOT(OnMonitoring()));
 		m_pEnableCapture = m_pMenuFile->addAction(CSandMan::GetIcon("Connect"), tr("Connection Audit"), this, SLOT(OnConnectionAudit()));
 		m_pEnablePacketCapture = m_pMenuFile->addAction(CSandMan::GetIcon("Connect"), tr("Packet Capture"), this, SLOT(OnPacketCapture()));
-		m_pEnableHttpsCapture = m_pMenuFile->addAction(CSandMan::GetIcon("Connect"), tr("HTTPS Capture"), this, SLOT(OnHttpsCapture()));
 
 		m_pMenuFile->addSeparator();
 
@@ -1222,7 +1216,6 @@ QList<ToolBarAction> CSandMan::GetAvailableToolBarActions()
 			// ToolBarAction{"UninstallAll", m_pUninstallAll}, // removed because not always valid in menu system
 			ToolBarAction{ "", nullptr },        // separator
 			ToolBarAction{ "Troubleshooting", m_pBoxAssistant },
-			ToolBarAction{ "CheckForUpdates", m_pUpdate },
 			ToolBarAction{ "About", m_pAbout },
 			ToolBarAction{ "", nullptr },        // separator
 			ToolBarAction{ "RestartAsAdmin", m_pRestart },
@@ -1420,26 +1413,7 @@ void CSandMan::UpdateLabel()
 	QString LabelText;
 	QString LabelTip;
 
-	if (!theConf->GetString("Updater/PendingUpdate").isEmpty())
-	{
-		QString FilePath = theConf->GetString("Updater/InstallerPath");
-		if (!FilePath.isEmpty() && QFile::exists(FilePath)) {
-			LabelText = tr("<a href=\"sbie://update/installer\" style=\"color: red;\">There is a new Sandboxie-Plus release %1 ready</a>").arg(theConf->GetString("Updater/InstallerVersion"));
-			LabelTip = tr("Click to run installer");
-		}
-		else if (!theConf->GetString("Updater/UpdateVersion").isEmpty()){
-			LabelText = tr("<a href=\"sbie://update/apply\" style=\"color: red;\">There is a new Sandboxie-Plus update %1 ready</a>").arg(theConf->GetString("Updater/UpdateVersion"));
-			LabelTip = tr("Click to apply update");
-		}
-		else {
-			LabelText = tr("<a href=\"sbie://update/check\" style=\"color: red;\">There is a new Sandboxie-Plus update v%1 available</a>").arg(theConf->GetString("Updater/PendingUpdate"));
-			LabelTip = tr("Click to download update");
-		}
-
-		//auto neon = new CNeonEffect(10, 4, 180); // 140
-		//m_pLabel->setGraphicsEffect(NULL);
-	}
-	else if (g_Certificate.isEmpty())
+	if (g_Certificate.isEmpty())
 	{
 		LabelText = theConf->GetString("Updater/LabelMessage");
 		if(LabelText.isEmpty())
@@ -1566,8 +1540,6 @@ void CSandMan::CreateView(int iViewMode)
 		m_pCaptureView = NULL;
 		m_pPacketCaptureView = NULL;
 		m_pPacketCaptureWindow = NULL;
-		m_pHttpsCaptureView = NULL;
-		m_pHttpsCaptureWindow = NULL;
 		m_pRecoveryLog = NULL;
 
 		return;
@@ -1643,10 +1615,6 @@ void CSandMan::CreateView(int iViewMode)
 		m_pPacketCaptureView = new CPacketCaptureView(false, this);
 		m_pLogTabs->addTab(m_pPacketCaptureView, tr("Packet Capture"));
 
-		m_pHttpsCaptureView = new CHttpsCaptureView(false, this);
-		m_pLogTabs->addTab(m_pHttpsCaptureView, tr("HTTPS Capture"));
-		m_pHttpsCaptureWindow = NULL;
-
 
 		// Recovery Log
 		m_pRecoveryLog = new CPanelWidgetEx();
@@ -1680,15 +1648,8 @@ void CSandMan::CreateView(int iViewMode)
 		m_pCaptureView = NULL;
 		m_pPacketCaptureView = NULL;
 		m_pPacketCaptureWindow = NULL;
-		m_pHttpsCaptureView = NULL;
-		m_pHttpsCaptureWindow = NULL;
 		m_pRecoveryLog = NULL;
 	}
-}
-
-void CSandMan::CheckForUpdates(bool bManual)
-{
-	m_pUpdater->CheckForUpdates(bManual);
 }
 
 #include "SandManTray.cpp"
@@ -2286,27 +2247,13 @@ void CSandMan::timerEvent(QTimerEvent* pEvent)
 			m_pDisabledForce->setText(m_pDisableForce->isChecked() ? Str1 : QString(Str1.length(), ' '));
 		}
 
-		bool bUpdatePending = !theConf->GetString("Updater/PendingUpdate").isEmpty();
-		if (m_pDismissUpdate) {
-			if (bUpdatePending) {
-				if (m_pDismissUpdate->isChecked())
-					bUpdatePending = false;
-				else if (!m_pDismissUpdate->isVisible())
-					m_pDismissUpdate->setVisible(true);
-			}
-			else if (m_pDismissUpdate->isChecked())
-				m_pDismissUpdate->setChecked(false);
-			if (!bUpdatePending && m_pDismissUpdate->isVisible())
-				m_pDismissUpdate->setVisible(false);
-		}
-
-		if (m_bIconEmpty != (ActiveProcesses == 0) || m_bIconBusy != bIconBusy || m_iIconDisabled != (bForceProcessDisabled ? 1 : 0) || bUpdatePending || m_bIconSun)
+		if (m_bIconEmpty != (ActiveProcesses == 0) || m_bIconBusy != bIconBusy || m_iIconDisabled != (bForceProcessDisabled ? 1 : 0) || m_bIconSun)
 		{
 			m_bIconEmpty = (ActiveProcesses == 0);
 			m_bIconBusy = bIconBusy;
 			m_iIconDisabled = (bForceProcessDisabled ? 1 : 0);
 
-			m_bIconSun = bUpdatePending ? !m_bIconSun : false;
+			m_bIconSun = false;
 			m_pTrayIcon->setIcon(GetTrayIcon(true, m_bIconSun));
 			m_pTrayIcon->setToolTip(GetTrayText());
 		}
@@ -2322,18 +2269,6 @@ void CSandMan::timerEvent(QTimerEvent* pEvent)
 	theAPI->UpdateWindowMap();
 
 	m_pBoxView->Refresh();
-
-	if(!IsSilentMode()) // do not check for updates when in presentation/game mode
-	{
-		quint64 CurrentTimeMs = QDateTime::currentMSecsSinceEpoch();
-		if (CurrentTimeMs - m_LastCheckInternetMs >= 60000) // check internet every 60 seconds
-		{
-			m_LastCheckInternetMs = CurrentTimeMs;
-			m_bHasInternet = CheckInternet();
-		}
-		if (m_bHasInternet)
-			m_pUpdater->Process();
-	}
 
 	if (!m_MissingTemplates.isEmpty())
 	{
@@ -3136,7 +3071,6 @@ void CSandMan::UpdateState()
 	if(m_pEnableMonitoring) m_pEnableMonitoring->setEnabled(isConnected);
 	if(m_pEnableCapture) m_pEnableCapture->setEnabled(isConnected);
 	if(m_pEnablePacketCapture) m_pEnablePacketCapture->setEnabled(isConnected);
-	if(m_pEnableHttpsCapture) m_pEnableHttpsCapture->setEnabled(isConnected);
 
 	if (m_pNewBoxButton) m_pNewBoxButton->setEnabled(isConnected);
 	if (m_pEditIniButton) m_pEditIniButton->setEnabled(isConnected);
@@ -4587,74 +4521,6 @@ void CSandMan::OnPacketCapture()
 }
 
 
-void CSandMan::OnHttpsCapture()
-{
-    if (m_pHttpsCaptureView) {
-        m_pHttpsCaptureView->RefreshBoxes();
-        m_pHttpsCaptureView->RefreshCapabilities();
-        if (m_pLogTabs) {
-            if (!m_pToolBar->isVisible())
-                m_pLogTabs->show();
-            int index = m_pLogTabs->indexOf(m_pHttpsCaptureView);
-            if (index >= 0)
-                m_pLogTabs->setCurrentIndex(index);
-        }
-        return;
-    }
-
-    if (m_pHttpsCaptureWindow) {
-        SafeShow(m_pHttpsCaptureWindow);
-        return;
-    }
-
-    m_pHttpsCaptureWindow = new CHttpsCaptureWindow();
-    connect(this, SIGNAL(Closed()), m_pHttpsCaptureWindow, SLOT(close()));
-    connect(m_pHttpsCaptureWindow, &CHttpsCaptureWindow::Closed, this, [this]() {
-        m_pHttpsCaptureWindow = NULL;
-    });
-    SafeShow(m_pHttpsCaptureWindow);
-}
-
-
-void CSandMan::OnBoxHttpsCapture()
-{
-    QString BoxName;
-    if (m_pBoxView) {
-        QList<CSandBoxPtr> Boxes = m_pBoxView->GetSelectedBoxes();
-        if (Boxes.count() == 1 && !Boxes.first().isNull())
-            BoxName = Boxes.first()->GetName();
-    }
-
-    OnHttpsCapture();
-
-    CHttpsCaptureView* pView = m_pHttpsCaptureView;
-    if (!pView && m_pHttpsCaptureWindow)
-        pView = m_pHttpsCaptureWindow->findChild<CHttpsCaptureView*>();
-    if (pView)
-        pView->SetPreferredBox(BoxName);
-}
-
-
-void CSandMan::OnProcessHttpsCapture()
-{
-    if (!m_pBoxView)
-        return;
-
-    QList<CBoxedProcessPtr> Processes = m_pBoxView->GetSelectedProcesses();
-    if (Processes.count() != 1 || Processes.first().isNull())
-        return;
-
-    const CBoxedProcessPtr Process = Processes.first();
-    OnHttpsCapture();
-
-    CHttpsCaptureView* pView = m_pHttpsCaptureView;
-    if (!pView && m_pHttpsCaptureWindow)
-        pView = m_pHttpsCaptureWindow->findChild<CHttpsCaptureView*>();
-    if (pView)
-        pView->SetPreferredProcess(
-            Process->GetBoxName(), Process->GetProcessId());
-}
-
 void CSandMan::OnBoxPacketCapture()
 {
     QString BoxName;
@@ -4966,14 +4832,7 @@ void CSandMan::OpenUrl(QUrl url)
 	}
 
 	if (scheme == "sbie") {
-		if (path == "/check")
-			m_pUpdater->CheckForUpdates(true);
-		else if (path == "/installer")
-			m_pUpdater->RunInstaller(false);
-		else if (path == "/apply")
-			m_pUpdater->ApplyUpdate(COnlineUpdater::eFull, false);
-		else
-			OpenUrl("https://sandboxie-plus.com/sandboxie" + path);
+		OpenUrl("https://sandboxie-plus.com/sandboxie" + path);
 		return;
 	}
 

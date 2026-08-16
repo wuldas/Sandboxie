@@ -3657,7 +3657,6 @@ SB_RESULT(SSbieCaptureEvents) CSbieAPI::ReadCaptureEvents(
 	return Result;
 }
 
-#if 0
 SB_RESULT(SSbieCaptureRecords) CSbieAPI::ReadCapturePayload(
 	const SSbieCaptureId& CaptureId, quint32 MaxRecords, bool Stream)
 {
@@ -3779,7 +3778,6 @@ SB_RESULT(SSbieCaptureStreams) CSbieAPI::ReadCaptureStreams(
 {
 	return ReadCapturePayload(CaptureId, MaxRecords, true);
 }
-#endif
 
 
 const QVector<CTraceEntryPtr>& CSbieAPI::GetTrace()

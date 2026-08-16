@@ -674,7 +674,6 @@ static ULONG CaptureServer_ValidateVersion(
 }
 
 
-#if 0
 static ULONG CaptureServer_ReadDriverPayload(
     CAPTURE_SESSION_OBJ *session,
     BOOLEAN stream,
@@ -772,7 +771,6 @@ static ULONG CaptureServer_ReadDriverPayload(
     HeapFree(GetProcessHeap(), 0, read);
     return status;
 }
-#endif
 
 
 //---------------------------------------------------------------------------
@@ -843,6 +841,10 @@ MSG_HEADER *CaptureServer::Handler(void *_this, MSG_HEADER *msg)
         return pThis->ListHandler(msg);
     if (msg->msgid == MSGID_CAPTURE_READ_EVENTS)
         return pThis->ReadEventsHandler(msg);
+    if (msg->msgid == MSGID_CAPTURE_READ_PACKETS)
+        return pThis->ReadPacketsHandler(msg);
+    if (msg->msgid == MSGID_CAPTURE_READ_STREAMS)
+        return pThis->ReadStreamsHandler(msg);
     if (msg->msgid == MSGID_CAPTURE_SET_EXPORT)
         return pThis->SetExportHandler(msg);
     if (msg->msgid == MSGID_CAPTURE_SET_HAR_EXPORT)
@@ -1575,13 +1577,8 @@ MSG_HEADER *CaptureServer::ReadEventsHandler(MSG_HEADER *msg)
 }
 
 
-#if 0
 MSG_HEADER *CaptureServer::ReadPayloadHandler(MSG_HEADER *msg, BOOLEAN stream)
 {
-    UNREFERENCED_PARAMETER(msg);
-    UNREFERENCED_PARAMETER(stream);
-    return SHORT_REPLY(STATUS_NOT_SUPPORTED);
-#if 0
     const ULONG requestSize = stream ?
         sizeof(CAPTURE_READ_STREAMS_REQ) : sizeof(CAPTURE_READ_PACKETS_REQ);
     CAPTURE_VERSIONED_REQUEST *versioned =
@@ -1721,7 +1718,6 @@ MSG_HEADER *CaptureServer::ReadPayloadHandler(MSG_HEADER *msg, BOOLEAN stream)
 
     LeaveCriticalSection(&m_lock);
     return &rpl->h;
-#endif
 }
 
 
@@ -1735,7 +1731,6 @@ MSG_HEADER *CaptureServer::ReadStreamsHandler(MSG_HEADER *msg)
 {
     return ReadPayloadHandler(msg, TRUE);
 }
-#endif
 
 
 //---------------------------------------------------------------------------

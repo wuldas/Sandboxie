@@ -89,6 +89,8 @@ private slots:
 
 	void OnRootChanged();
 
+	void OnBrowseCaptureDir();
+
 	void OnBrowsePath();
 	void OnAddCommand();
 	void OnCommandUp();

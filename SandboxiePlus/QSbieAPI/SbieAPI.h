@@ -162,6 +162,8 @@ public:
 	SB_RESULT(SSbieCaptureSession) GetCaptureStatus(const SSbieCaptureId& CaptureId);
 	SB_RESULT(SSbieCaptureList) ListCaptures(quint32 StartIndex = 0, quint32 MaxEntries = 0);
 	SB_RESULT(SSbieCaptureEvents) ReadCaptureEvents(const SSbieCaptureId& CaptureId, quint32 MaxEvents = 0);
+	SB_RESULT(SSbieCapturePackets) ReadCapturePackets(const SSbieCaptureId& CaptureId, quint32 MaxRecords = 0);
+	SB_RESULT(SSbieCaptureStreams) ReadCaptureStreams(const SSbieCaptureId& CaptureId, quint32 MaxRecords = 0);
 
 	// Other
 	virtual quint64			QueryProcessInfo(quint32 ProcessId, quint32 InfoClass = 0);
@@ -350,6 +352,8 @@ private:
 	mutable QMutex			m_ThreadMutex;
 	mutable QWaitCondition	m_ThreadWait;
 
+	SB_RESULT(SSbieCaptureRecords) ReadCapturePayload(
+		const SSbieCaptureId& CaptureId, quint32 MaxRecords, bool Stream);
 	SB_STATUS CallServer(void* req, SScopedVoid* prpl) const;
 	SB_STATUS SbieIniSet(void *RequestBuf, void *pPasswordWithinRequestBuf, const QString& SectionName, const QString& SettingName);
 	struct SSbieAPI* m;

@@ -7,8 +7,12 @@
 
 #include <QCheckBox>
 #include <QComboBox>
+#include <QDateTime>
+#include <QDesktopServices>
+#include <QDir>
 #include <QFile>
 #include <QFileDialog>
+#include <QFileInfo>
 #include <QGridLayout>
 #include <QHBoxLayout>
 #include <QLabel>
@@ -18,12 +22,6 @@
 #include <QTableWidget>
 #include <QVBoxLayout>
 #include <QHeaderView>
-
-
-static QString HttpsCapture_ToNative(const QString& Path)
-{
-    return QString(Path).replace('/', '\\');
-}
 
 
 static int HttpsCapture_FindEntry(
@@ -116,36 +114,16 @@ CHttpsCaptureView::CHttpsCaptureView(bool bStandAlone, QWidget* parent)
     pOptions->setColumnStretch(6, 1);
     pMainLayout->addLayout(pOptions);
 
-    QHBoxLayout* pPcapLayout = new QHBoxLayout();
-    pPcapLayout->setContentsMargins(4, 0, 4, 0);
-    pPcapLayout->addWidget(new QLabel(tr("PCAPNG")));
-    m_pPcapPath = new QLineEdit();
-    m_pPcapPath->setReadOnly(true);
-    m_pPcapPath->setPlaceholderText(tr("Choose the PCAPNG output before starting"));
-    pPcapLayout->addWidget(m_pPcapPath, 1);
-    m_pBrowsePcap = new QPushButton(tr("Browse..."));
-    pPcapLayout->addWidget(m_pBrowsePcap);
-    pMainLayout->addLayout(pPcapLayout);
-
-    QHBoxLayout* pHarLayout = new QHBoxLayout();
-    pHarLayout->setContentsMargins(4, 0, 4, 0);
-    pHarLayout->addWidget(new QLabel(tr("HAR")));
-    m_pHarPath = new QLineEdit();
-    m_pHarPath->setReadOnly(true);
-    m_pHarPath->setPlaceholderText(tr("Choose the HAR output before starting"));
-    pHarLayout->addWidget(m_pHarPath, 1);
-    m_pBrowseHar = new QPushButton(tr("Browse..."));
-    pHarLayout->addWidget(m_pBrowseHar);
-    pMainLayout->addLayout(pHarLayout);
-
     QHBoxLayout* pButtons = new QHBoxLayout();
     pButtons->setContentsMargins(4, 0, 4, 0);
     m_pStart = new QPushButton(tr("Start"));
     m_pStop = new QPushButton(tr("Stop"));
     m_pClear = new QPushButton(tr("Clear"));
+    m_pOpenFolder = new QPushButton(tr("Open Folder"));
     pButtons->addWidget(m_pStart);
     pButtons->addWidget(m_pStop);
     pButtons->addWidget(m_pClear);
+    pButtons->addWidget(m_pOpenFolder);
     pButtons->addStretch(1);
     pMainLayout->addLayout(pButtons);
 
@@ -166,8 +144,7 @@ CHttpsCaptureView::CHttpsCaptureView(bool bStandAlone, QWidget* parent)
     m_pEntries->verticalHeader()->setVisible(false);
     pMainLayout->addWidget(m_pEntries, 1);
 
-    connect(m_pBrowsePcap, &QPushButton::clicked, this, &CHttpsCaptureView::OnBrowsePcap);
-    connect(m_pBrowseHar, &QPushButton::clicked, this, &CHttpsCaptureView::OnBrowseHar);
+    connect(m_pOpenFolder, &QPushButton::clicked, this, &CHttpsCaptureView::OnOpenFolder);
     connect(m_pStart, &QPushButton::clicked, this, &CHttpsCaptureView::OnStart);
     connect(m_pStop, &QPushButton::clicked, this, &CHttpsCaptureView::OnStop);
     connect(m_pClear, &QPushButton::clicked, this, &CHttpsCaptureView::OnClear);
@@ -253,10 +230,7 @@ void CHttpsCaptureView::RefreshCapabilities()
 
 bool CHttpsCaptureView::HttpsBackendReady() const
 {
-    return HttpsCapture_CanStart(
-        m_CapabilityFlags,
-        (const WCHAR*)m_PcapPath.utf16(),
-        (const WCHAR*)m_HarPath.utf16());
+    return HttpsCapture_CanStart(m_CapabilityFlags);
 }
 
 
@@ -277,8 +251,7 @@ void CHttpsCaptureView::UpdateControls()
     const bool ready = HttpsBackendReady();
     m_pStart->setEnabled(ready && !capturing);
     m_pStop->setEnabled(capturing);
-    m_pBrowsePcap->setEnabled(!capturing);
-    m_pBrowseHar->setEnabled(!capturing);
+    m_pOpenFolder->setEnabled(true);
     m_pBoxCombo->setEnabled(!capturing);
     m_pMaxFileBytes->setEnabled(!capturing);
     m_pMaxSeconds->setEnabled(!capturing);
@@ -321,35 +294,22 @@ void CHttpsCaptureView::UpdateStatus(const QString& Message)
 }
 
 
-void CHttpsCaptureView::OnBrowsePcap()
+QString CHttpsCaptureView::CaptureOutputDir()
 {
-    QString defaultName = m_PcapPath;
-    if (defaultName.isEmpty())
-        defaultName = QStringLiteral("https-capture.pcapng");
-    QString path = QFileDialog::getSaveFileName(
-        this, tr("Choose PCAPNG output"), defaultName,
-        tr("PCAPNG files (*.pcapng);;All files (*.*)"));
-    if (path.isEmpty())
-        return;
-    m_PcapPath = HttpsCapture_ToNative(path);
-    m_pPcapPath->setText(m_PcapPath);
-    UpdateControls();
+    QString Dir = theConf->GetString("Options/CaptureOutputDir");
+    if (Dir.isEmpty())
+        Dir = QStandardPaths::writableLocation(
+            QStandardPaths::DocumentsLocation) + "/Sandboxie-Plus/Captures";
+    QDir().mkpath(Dir);
+    return Dir;
 }
 
 
-void CHttpsCaptureView::OnBrowseHar()
+void CHttpsCaptureView::OnOpenFolder()
 {
-    QString defaultName = m_HarPath;
-    if (defaultName.isEmpty())
-        defaultName = QStringLiteral("https-capture.har");
-    QString path = QFileDialog::getSaveFileName(
-        this, tr("Choose HAR output"), defaultName,
-        tr("HAR files (*.har);;All files (*.*)"));
-    if (path.isEmpty())
-        return;
-    m_HarPath = HttpsCapture_ToNative(path);
-    m_pHarPath->setText(m_HarPath);
-    UpdateControls();
+    const QString Dir = m_PcapPath.isEmpty() ? CaptureOutputDir() :
+        QFileInfo(m_PcapPath).absolutePath();
+    QDesktopServices::openUrl(QUrl::fromLocalFile(Dir));
 }
 
 
@@ -376,11 +336,19 @@ void CHttpsCaptureView::OnStart()
         UpdateStatus(tr("Not connected to Sandboxie."));
         return;
     }
-    if (m_pBoxCombo->currentText().isEmpty() ||
-            m_PcapPath.isEmpty() || m_HarPath.isEmpty()) {
-        UpdateStatus(tr("Choose a sandbox plus PCAPNG and HAR output files first."));
+    if (m_pBoxCombo->currentText().isEmpty()) {
+        UpdateStatus(tr("Choose a sandbox first."));
         return;
     }
+
+    QString BoxName = m_pBoxCombo->currentText();
+    for (QChar c : QStringLiteral("<>:\"/\\|?*"))
+        BoxName.replace(c, QLatin1Char('_'));
+    const QString BaseName = QStringLiteral("https-capture_%1_%2")
+        .arg(BoxName)
+        .arg(QDateTime::currentDateTime().toString("yyyyMMdd-hhmmss"));
+    m_PcapPath = CaptureOutputDir() + "/" + BaseName + ".pcapng";
+    m_HarPath = CaptureOutputDir() + "/" + BaseName + ".har";
 
     std::wstring pcapPath = m_PcapPath.toStdWString();
     std::wstring harPath = m_HarPath.toStdWString();
