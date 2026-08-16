@@ -23,6 +23,12 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 - added a persistent SbieCapture session CA (10-year, stored under `%LOCALAPPDATA%\SbieCapture\`) so the host Root trust is granted once and reused across capture sessions instead of re-prompting per session
 - verified the HTTPS capture pipeline on a personal host: boxed curl (no `-k`) and WinHTTP decode into HAR, pinning fails closed with PCAPNG retained, broker kill fails closed, direct loopback connects are refused, `NetworkAccess` deny is not bypassed, and cross-SID/cross-session starts are denied
 - enabled `httpsInspection`/`harExport` capability bits after the Slice 8 live isolation suite passed 11/11 (connection-audit/packet-capture regressions, box/process scoping, curl+WinHTTP HTTP/1.1, pinning, broker-kill fail-closed, direct-listener refusal, `NetworkAccess` deny, store isolation, and process-scoped cross-SID denial)
+- extended SbieCapture HTTPS inspection to HTTP/2: hand-rolled HPACK (RFC 7541) and HTTP/2 frame codecs with unit tests terminate downstream h2 into the existing logical request/response model and HAR (one entry per stream); upstream stays HTTP/1.1 unless the origin negotiates h2, in which case h2→h2 relaying preserves gRPC
+- added WebSocket upgrade tunneling over HTTP/1.1: after a valid 101 the broker switches to a transparent byte relay and records the tunneled byte counts in HAR without decoding messages
+- added gRPC stream recording as HAR metadata (method from :path, grpc-status/grpc-message trailers, and a message count) without protobuf decoding
+- hardened the HTTP/1.1 relay with chunked transfer decoding and keep-alive multi-exchange support
+- added an opt-in TLS key-log export through a caller-opened handle (SSLKEYLOGFILE CLIENT_RANDOM and TLS 1.3 secrets) so Wireshark can decrypt the captured PCAPNG; off by default
+- added opt-in, boxed-profile-only Firefox/NSS trust: --firefox-enterprise-roots enables security.enterprise_roots.enabled in a boxed profile, and --firefox-import-ca injects the session CA into cert9.db via NSS certutil
 - made sandboxed Schannel outbound credentials tolerate "revocation could not be checked" soft failures (`SCH_CRED_IGNORE_NO_REVOCATION_CHECK | SCH_CRED_IGNORE_REVOCATION_OFFLINE`) so the MITM leaf, which has no CRL/OCSP endpoint, does not fail with `CRYPT_E_NO_REVOCATION_CHECK`; this never suppresses `CRYPT_E_REVOKED` and does not change trust anchors
 - added driver-owned ring overwrite counting so a stalled broker reports public `droppedCount` instead of stopping at ring capacity
 - verified packet-capture isolation on a personal host: Box A / Box B / host traffic stay separate, process-scope excludes later children, box-scope includes them, broker kill fails the session, and cross-SID / cross-session starts are denied
@@ -40,6 +46,7 @@ This project adheres to [Semantic Versioning](http://semver.org/).
 - fixed driver incompatibility with latest Windows Insider build
 - fixed SandMan File Panel treating registry hive log files such as `RegHive.LOG1` and `RegHive.LOG2` as descendants of `RegHive` because of their shared filename prefix, causing them to be omitted when deleting the selection together [#4788](https://github.com/sandboxie-plus/Sandboxie/issues/4788)
 - fixed Connection Audit Start returning access denied when the box combo sent the lowercase map key (`defaultbox`) instead of the canonical section name (`DefaultBox`)
+- fixed a Phase 5 regression where the HTTP/1.1 relay leg offered `h2` on the upstream ALPN, so an h2-capable origin negotiated h2 while the relay still sent an HTTP/1.1 request, breaking boxed HTTP/1.1 clients with an empty reply; upstream h2 is now offered only on the h2 downstream leg
 
 
 

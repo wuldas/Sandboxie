@@ -193,6 +193,13 @@ static SSL_CTX *HttpsMitm_NewDownstreamCtx(CAPTURE_CA *ca)
 }
 
 
+/* upstream ALPN list offered on the h2-upstream leg only (Slice 6).  The
+   HTTP/1.1 relay leg deliberately offers no ALPN so the origin stays on h1. */
+static const unsigned char kUpstreamAlpnH2[] = {
+    2, 'h', '2',
+    8, 'h', 't', 't', 'p', '/', '1', '.', '1'
+};
+
 static SSL_CTX *HttpsMitm_NewUpstreamCtx(const char *caPem, BOOL allowUnverified)
 {
     SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
@@ -204,14 +211,6 @@ static SSL_CTX *HttpsMitm_NewUpstreamCtx(const char *caPem, BOOL allowUnverified
         return NULL;
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
     SSL_CTX_set_keylog_callback(ctx, HttpsMitm_KeylogCallback);
-    {
-        /* offer h2 first so an h2-capable origin uses it (Slice 6) */
-        static const unsigned char kUpstreamAlpn[] = {
-            2, 'h', '2',
-            8, 'h', 't', 't', 'p', '/', '1', '.', '1'
-        };
-        SSL_CTX_set_alpn_protos(ctx, kUpstreamAlpn, sizeof(kUpstreamAlpn));
-    }
     if (allowUnverified || ! caPem || ! caPem[0]) {
         SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
         return ctx;
@@ -1754,6 +1753,7 @@ static int HttpsMitm_H2RelayStream(
         goto done;
     SSL_set_fd(up, (int)upstream);
     HttpsMitm_AttachKeylog(mitm, up);
+    SSL_set_alpn_protos(up, kUpstreamAlpnH2, sizeof(kUpstreamAlpnH2));
     if (sni && sni[0])
         SSL_set_tlsext_host_name(up, sni);
     if (SSL_connect(up) != 1)

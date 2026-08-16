@@ -320,15 +320,16 @@ blocked while that fallback is active.
 | --- | --- |
 | TLS 1.2 over TCP | HTTPS MVP |
 | TLS 1.3 over TCP | HTTPS MVP with bundled OpenSSL version from build variables |
-| HTTP/1.1 | HTTPS MVP |
-| HTTP/2 and HPACK | Later protocol phase |
-| WebSocket over HTTP/1.1 | Later protocol phase |
-| gRPC framing | Later protocol phase; protobuf decoding needs descriptors |
+| HTTP/1.1 | HTTPS MVP (chunked + keep-alive) |
+| HTTP/2 and HPACK | Phase 5 (hand-rolled codec; downstream terminate, h1 or h2 upstream) |
+| WebSocket over HTTP/1.1 | Phase 5 (upgrade detect + transparent byte tunnel) |
+| gRPC framing | Phase 5 (metadata + trailers + message count); protobuf decoding needs descriptors |
 | HTTP/3 and QUIC decryption | Not in the first release; passive UDP capture only |
+| TLS key-log (SSLKEYLOGFILE) | Phase 5 (opt-in, caller-opened handle) |
 | Certificate pinning | Expected MITM failure; retain passive capture |
 | ECH without another trusted hostname source | Not guaranteed |
 | Mutual TLS | Not guaranteed for transparent MITM |
-| Firefox/NSS trust | Separate compatibility phase |
+| Firefox/NSS trust | Phase 5 (boxed-profile opt-in: enterprise roots or certutil) |
 
 ## Data Retention and Redaction
 
