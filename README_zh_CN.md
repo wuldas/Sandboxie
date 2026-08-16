@@ -88,6 +88,23 @@ Sandboxie 的功能可以通过以下专业工具进行增强：
   * [Sbiextra](https://github.com/sandboxie-plus/sbiextra) - 对沙盒进程添加额外的用户模式限制
   * [WrapLocale](https://github.com/UserUnknownFactor/WrapLocale) - 提供比原生 LangId 功能更灵活的区域设置伪装选项
 
+## 🔬 SbieCapture（SandboxCaptureMcp）
+
+本 fork 内置的沙箱级网络捕获与 HTTPS 检查套件（`SandboxieTools/SbieCapture` 代理 + `SandboxieTools/SbieMcp` MCP 服务器）。只捕获归属于选定沙箱或进程的流量——绝不收集宿主或其他沙箱的流量——并通过 SandMan 与本地 MCP（Model Context Protocol）服务器暴露捕获操作。
+
+已实现能力（Phase 1–5）：
+
+  * 连接审计与被动包捕获，支持 PCAPNG 导出
+  * HTTPS 检查，使用每会话独立、仅限沙箱的 CA（TLS 1.2 / 1.3）
+  * HTTP/1.1 解码（chunked + keep-alive），支持 HAR 导出及 `Authorization` / `Cookie` / API 密钥等头的默认脱敏
+  * HTTP/2 与 HPACK（手写编解码器；下游终止，上游支持 h1 或 h2 中继）
+  * WebSocket 透明字节隧道，带字节计数
+  * gRPC 帧：元数据 + trailers（`grpc-status` / `grpc-message`）+ 消息计数（不解码 protobuf）
+  * 可选的 TLS key-log（SSLKEYLOGFILE）导出，用于证书固定类应用
+  * boxed profile 的 Firefox/NSS 信任（enterprise roots 或 certutil），绝不触碰宿主 profile
+
+设计上 fail-closed：代理故障不会静默恢复直连，CA 私钥始终留在沙箱之外，宿主证书存储保持不变。架构、协议矩阵与安全不变量见 [Docs/SandboxCaptureMcp.md](./Docs/SandboxCaptureMcp.md)。
+
 <a id="project-history"></a>
 ## 📌 项目历史
 

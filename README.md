@@ -88,6 +88,23 @@ Sandboxie's functionality can be enhanced with specialized tools like the follow
   * [Sbiextra](https://github.com/sandboxie-plus/sbiextra) - adds additional user mode restrictions to sandboxed processes
   * [WrapLocale](https://github.com/UserUnknownFactor/WrapLocale) - provide more flexible locale pretending options than native LangId feature
 
+## 🔬 SbieCapture (SandboxCaptureMcp)
+
+A sandbox-scoped network capture and HTTPS inspection suite built into this fork (`SandboxieTools/SbieCapture` broker + `SandboxieTools/SbieMcp` MCP server). It captures only traffic attributed to a selected sandbox or process — never host or other-sandbox traffic — and exposes capture operations through SandMan and a local MCP (Model Context Protocol) server.
+
+Implemented capabilities (Phases 1–5):
+
+  * Connection audit and passive packet capture with PCAPNG export
+  * HTTPS inspection with a per-session sandbox-only CA (TLS 1.2 / 1.3)
+  * HTTP/1.1 decoding (chunked + keep-alive) with HAR export and default redaction of `Authorization` / `Cookie` / API-key headers
+  * HTTP/2 and HPACK (hand-rolled codec; downstream termination, h1 or h2 upstream relay)
+  * WebSocket transparent byte tunnel with byte accounting
+  * gRPC framing: metadata + trailers (`grpc-status` / `grpc-message`) + message count (no protobuf decoding)
+  * Optional TLS key-log (SSLKEYLOGFILE) export for pinned applications
+  * Firefox/NSS trust for boxed profiles (enterprise roots or certutil), never touching the host profile
+
+Fail-closed by design: broker failure cannot silently restore direct network access, CA private keys stay outside the sandbox, and host certificate stores remain untouched. See [Docs/SandboxCaptureMcp.md](./Docs/SandboxCaptureMcp.md) for the architecture, protocol matrix, and security invariants.
+
 <a id="project-history"></a>
 ## 📌 Project history
 
