@@ -484,6 +484,16 @@ int HarWriter_WriteExchange(HAR_WRITER *writer, const HAR_EXCHANGE *exchange)
             ! Har_WriteULong64(writer, exchange->ws_tunnel_bytes_in) ||
             ! Har_WriteText(writer, ",\n          \"wsTunnelBytesOut\": ") ||
             ! Har_WriteULong64(writer, exchange->ws_tunnel_bytes_out) ||
+            ! Har_WriteText(writer, ",\n          \"streamId\": ") ||
+            ! Har_WriteULong(writer, exchange->stream_id) ||
+            ! Har_WriteText(writer, ",\n          \"grpcStatus\": ") ||
+            ! Har_WriteJsonString(
+                writer, exchange->grpc_status ? exchange->grpc_status : "") ||
+            ! Har_WriteText(writer, ",\n          \"grpcMessage\": ") ||
+            ! Har_WriteJsonString(
+                writer, exchange->grpc_message ? exchange->grpc_message : "") ||
+            ! Har_WriteText(writer, ",\n          \"grpcMessageCount\": ") ||
+            ! Har_WriteULong(writer, exchange->grpc_message_count) ||
             ! Har_WriteText(writer, "\n        }\n      }")) {
         return HAR_ERROR;
     }

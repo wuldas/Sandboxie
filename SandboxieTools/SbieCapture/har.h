@@ -54,6 +54,10 @@ typedef struct _HAR_EXCHANGE {
     ULONG body_cap;
     ULONG64 ws_tunnel_bytes_in;
     ULONG64 ws_tunnel_bytes_out;
+    ULONG stream_id;
+    const char *grpc_status;
+    const char *grpc_message;
+    ULONG grpc_message_count;
 
 } HAR_EXCHANGE;
 

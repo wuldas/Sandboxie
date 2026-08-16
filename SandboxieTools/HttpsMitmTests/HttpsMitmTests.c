@@ -990,6 +990,460 @@ out:
 }
 
 
+/* --- HTTP/2 upstream (gRPC echo) fixture --- */
+
+static int UpstreamH2AlpnSelect(
+    SSL *ssl,
+    const unsigned char **out,
+    unsigned char *outlen,
+    const unsigned char *in,
+    unsigned int inlen,
+    void *arg)
+{
+    static const unsigned char kH2[] = { 2, 'h', '2' };
+    unsigned char *sel = NULL;
+    unsigned char selLen = 0;
+
+    UNREFERENCED_PARAMETER(ssl);
+    UNREFERENCED_PARAMETER(arg);
+    if (SSL_select_next_proto(
+            &sel, &selLen, kH2, sizeof(kH2), in, inlen) !=
+            OPENSSL_NPN_NEGOTIATED) {
+        return SSL_TLSEXT_ERR_ALERT_FATAL;
+    }
+    *out = sel;
+    *outlen = selLen;
+    return SSL_TLSEXT_ERR_OK;
+}
+
+
+typedef struct _H2_UPSTREAM_SERVER {
+
+    SOCKET listen_socket;
+    USHORT port;
+    EVP_PKEY *key;
+    X509 *cert;
+    char *ca_pem;
+    HANDLE thread;
+    volatile LONG stop;
+
+} H2_UPSTREAM_SERVER;
+
+
+/* An HTTP/2 origin that answers gRPC calls (echo + grpc-status trailers) and
+   plain h2 GETs ("upstream-ok"). */
+static DWORD WINAPI H2UpstreamThread(void *param)
+{
+    H2_UPSTREAM_SERVER *server = (H2_UPSTREAM_SERVER *)param;
+    SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+
+    if (! ctx)
+        return 1;
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_use_certificate(ctx, server->cert);
+    SSL_CTX_use_PrivateKey(ctx, server->key);
+    SSL_CTX_set_alpn_select_cb(ctx, UpstreamH2AlpnSelect, NULL);
+
+    while (! server->stop) {
+        fd_set readSet;
+        struct timeval timeout;
+        SOCKET client;
+        SSL *ssl;
+
+        FD_ZERO(&readSet);
+        FD_SET(server->listen_socket, &readSet);
+        timeout.tv_sec = 0;
+        timeout.tv_usec = 100000;
+        if (select(0, &readSet, NULL, NULL, &timeout) <= 0)
+            continue;
+        client = accept(server->listen_socket, NULL, NULL);
+        if (client == INVALID_SOCKET)
+            continue;
+        ssl = SSL_new(ctx);
+        if (! ssl) {
+            closesocket(client);
+            continue;
+        }
+        SSL_set_fd(ssl, (int)client);
+        if (SSL_accept(ssl) == 1) {
+            HTTP2_SESSION session;
+            HPACK_DECODER decoder;
+            UCHAR body[1024];
+            ULONG bodyLen = 0;
+            BOOL isGrpc = FALSE;
+            BOOL done = FALSE;
+            int prefaceGot = 0;
+
+            Http2_SessionInit(&session);
+            Hpack_DecoderInit(&decoder, HTTP2_DEFAULT_HEADER_TABLE_SIZE);
+
+            {
+                char preface[24];
+                while (prefaceGot < (int)sizeof(preface)) {
+                    int n = SSL_read(ssl, preface + prefaceGot,
+                                     (int)sizeof(preface) - prefaceGot);
+                    if (n <= 0)
+                        break;
+                    prefaceGot += n;
+                }
+            }
+            if (prefaceGot < 24) {
+                SSL_shutdown(ssl);
+                SSL_free(ssl);
+                closesocket(client);
+                continue;
+            }
+            ClientH2_SendFrame(ssl, HTTP2_FRAME_SETTINGS, 0, 0, NULL, 0);
+
+            while (! done) {
+                HTTP2_FRAME_HEADER fh;
+                UCHAR payload[HTTP2_MAX_HEADER_BLOCK];
+
+                if (! ClientH2_ReadFrame(ssl, &fh, payload, sizeof(payload)))
+                    break;
+                if (fh.type == HTTP2_FRAME_SETTINGS &&
+                        ! (fh.flags & HTTP2_FLAG_ACK)) {
+                    ClientH2_SendFrame(
+                        ssl, HTTP2_FRAME_SETTINGS, HTTP2_FLAG_ACK, 0, NULL, 0);
+                }
+                else if (fh.type == HTTP2_FRAME_HEADERS &&
+                        (fh.flags & HTTP2_FLAG_END_HEADERS)) {
+                    HPACK_HEADER *headers = (HPACK_HEADER *)malloc(
+                        HPACK_MAX_HEADERS * sizeof(*headers));
+                    ULONG count = 0;
+                    ULONG consumed = 0;
+                    ULONG i;
+
+                    if (headers &&
+                            Hpack_DecodeBlock(&decoder, payload, fh.length,
+                                headers, HPACK_MAX_HEADERS, &count,
+                                &consumed) == HPACK_OK) {
+                        for (i = 0; i < count; ++i) {
+                            if (_stricmp(headers[i].name, "content-type") == 0 &&
+                                    _strnicmp(headers[i].value,
+                                        "application/grpc", 16) == 0)
+                                isGrpc = TRUE;
+                        }
+                    }
+                    free(headers);
+                    if (fh.flags & HTTP2_FLAG_END_STREAM)
+                        done = TRUE;
+                }
+                else if (fh.type == HTTP2_FRAME_DATA) {
+                    if (bodyLen + fh.length < sizeof(body)) {
+                        memcpy(body + bodyLen, payload, fh.length);
+                        bodyLen += fh.length;
+                    }
+                    if (fh.flags & HTTP2_FLAG_END_STREAM)
+                        done = TRUE;
+                }
+            }
+
+            {
+                HPACK_ENCODER enc;
+                UCHAR block[512];
+                ULONG blockLen = 0;
+
+                Hpack_EncoderInit(&enc, HTTP2_DEFAULT_HEADER_TABLE_SIZE, FALSE);
+                if (isGrpc) {
+                    ClientH2_Encode(&enc, ":status", "200",
+                        block, sizeof(block), &blockLen);
+                    ClientH2_Encode(&enc, "content-type", "application/grpc",
+                        block, sizeof(block), &blockLen);
+                    ClientH2_SendFrame(ssl, HTTP2_FRAME_HEADERS,
+                        HTTP2_FLAG_END_HEADERS, 1, block, blockLen);
+                    if (bodyLen > 0)
+                        ClientH2_SendFrame(ssl, HTTP2_FRAME_DATA, 0, 1,
+                            body, bodyLen);
+                    blockLen = 0;
+                    ClientH2_Encode(&enc, "grpc-status", "0",
+                        block, sizeof(block), &blockLen);
+                    ClientH2_SendFrame(ssl, HTTP2_FRAME_HEADERS,
+                        HTTP2_FLAG_END_HEADERS | HTTP2_FLAG_END_STREAM, 1,
+                        block, blockLen);
+                }
+                else {
+                    static const char kBody[] = "upstream-ok";
+                    ClientH2_Encode(&enc, ":status", "200",
+                        block, sizeof(block), &blockLen);
+                    ClientH2_Encode(&enc, "content-type", "text/plain",
+                        block, sizeof(block), &blockLen);
+                    ClientH2_SendFrame(ssl, HTTP2_FRAME_HEADERS,
+                        HTTP2_FLAG_END_HEADERS, 1, block, blockLen);
+                    ClientH2_SendFrame(ssl, HTTP2_FRAME_DATA,
+                        HTTP2_FLAG_END_STREAM, 1, (const UCHAR *)kBody,
+                        (ULONG)strlen(kBody));
+                }
+            }
+        }
+        /* bidirectional shutdown so the peer has fully read our response
+           before the socket closes (a hard close can discard buffered data) */
+        {
+            int s;
+            for (s = 0; s < 2; ++s) {
+                if (SSL_shutdown(ssl) == 1)
+                    break;
+            }
+        }
+        SSL_free(ssl);
+        closesocket(client);
+    }
+
+    SSL_CTX_free(ctx);
+    return 0;
+}
+
+
+static int StartH2Upstream(H2_UPSTREAM_SERVER *server)
+{
+    struct sockaddr_in addr;
+    int addrLen = sizeof(addr);
+
+    memset(server, 0, sizeof(*server));
+    server->listen_socket = INVALID_SOCKET;
+    server->key = MakeRsaKey();
+    server->cert = server->key ? MakeSelfSigned(
+        server->key, "upstream.test", 1) : NULL;
+    if (! server->cert)
+        return 0;
+    server->ca_pem = PemFromX509(server->cert);
+    if (! server->ca_pem)
+        return 0;
+
+    server->listen_socket = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if (server->listen_socket == INVALID_SOCKET)
+        return 0;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = 0;
+    if (bind(server->listen_socket, (struct sockaddr *)&addr, sizeof(addr)) != 0)
+        return 0;
+    if (listen(server->listen_socket, 8) != 0)
+        return 0;
+    if (getsockname(
+            server->listen_socket, (struct sockaddr *)&addr, &addrLen) != 0)
+        return 0;
+    server->port = ntohs(addr.sin_port);
+    server->thread = CreateThread(NULL, 0, H2UpstreamThread, server, 0, NULL);
+    return server->thread != NULL;
+}
+
+
+static void StopH2Upstream(H2_UPSTREAM_SERVER *server)
+{
+    if (! server)
+        return;
+    server->stop = 1;
+    if (server->thread) {
+        WaitForSingleObject(server->thread, 5000);
+        CloseHandle(server->thread);
+    }
+    if (server->listen_socket != INVALID_SOCKET)
+        closesocket(server->listen_socket);
+    EVP_PKEY_free(server->key);
+    X509_free(server->cert);
+    free(server->ca_pem);
+}
+
+
+/* Build a gRPC length-prefixed message (1-byte flag + 4-byte big-endian len). */
+static ULONG GrpcFrameMessage(
+    const char *payload,
+    ULONG payloadLen,
+    UCHAR *out,
+    ULONG outCap)
+{
+    if (outCap < payloadLen + 5)
+        return 0;
+    out[0] = 0;
+    out[1] = (UCHAR)(payloadLen >> 24);
+    out[2] = (UCHAR)(payloadLen >> 16);
+    out[3] = (UCHAR)(payloadLen >> 8);
+    out[4] = (UCHAR)payloadLen;
+    memcpy(out + 5, payload, payloadLen);
+    return payloadLen + 5;
+}
+
+
+/* gRPC client: one unary call to /test.Echo/Echo, echo payload + grpc-status
+   returned. */
+static int ClientGrpcOnSocket(
+    SOCKET sock,
+    const char *sessionCaPem,
+    char *response,
+    ULONG responseCap,
+    char *grpcStatusOut,
+    ULONG grpcStatusCap)
+{
+    SSL_CTX *ctx;
+    SSL *ssl;
+    BIO *trustBio;
+    X509 *trustCert;
+    X509_STORE *store;
+    HPACK_ENCODER encoder;
+    HPACK_DECODER decoder;
+    UCHAR block[512];
+    ULONG blockLen = 0;
+    UCHAR framed[16];
+    ULONG framedLen;
+    static const char kPath[] = "/test.Echo/Echo";
+    static const char kPayload[] = "hello";
+    int gotStatus = 0;
+    int gotEcho = 0;
+    int ok = 0;
+
+    if (responseCap)
+        response[0] = 0;
+    if (grpcStatusCap)
+        grpcStatusOut[0] = 0;
+    if (sock == INVALID_SOCKET)
+        return 0;
+
+    ctx = SSL_CTX_new(TLS_client_method());
+    if (! ctx) {
+        closesocket(sock);
+        return 0;
+    }
+    SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_max_proto_version(ctx, TLS1_2_VERSION);
+    SSL_CTX_set_verify(ctx, SSL_VERIFY_PEER, NULL);
+    {
+        static const unsigned char kAlpn[] = { 2, 'h', '2' };
+        SSL_CTX_set_alpn_protos(ctx, kAlpn, sizeof(kAlpn));
+    }
+    trustBio = BIO_new_mem_buf(sessionCaPem, -1);
+    trustCert = trustBio ? PEM_read_bio_X509(trustBio, NULL, NULL, NULL) : NULL;
+    store = SSL_CTX_get_cert_store(ctx);
+    if (! trustCert || X509_STORE_add_cert(store, trustCert) != 1) {
+        X509_free(trustCert);
+        BIO_free(trustBio);
+        SSL_CTX_free(ctx);
+        closesocket(sock);
+        return 0;
+    }
+    X509_free(trustCert);
+    BIO_free(trustBio);
+
+    ssl = SSL_new(ctx);
+    if (! ssl) {
+        SSL_CTX_free(ctx);
+        closesocket(sock);
+        return 0;
+    }
+    SSL_set_fd(ssl, (int)sock);
+    SSL_set_tlsext_host_name(ssl, "example.com");
+    if (SSL_connect(ssl) != 1)
+        goto out;
+
+    {
+        static const char kMagic[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        if (SSL_write(ssl, kMagic, (int)strlen(kMagic)) <= 0)
+            goto out;
+        if (! ClientH2_SendFrame(ssl, HTTP2_FRAME_SETTINGS, 0, 0, NULL, 0))
+            goto out;
+    }
+
+    Hpack_EncoderInit(&encoder, HTTP2_DEFAULT_HEADER_TABLE_SIZE, FALSE);
+    blockLen = 0;
+    if (! ClientH2_Encode(&encoder, ":method", "POST", block,
+            sizeof(block), &blockLen) ||
+            ! ClientH2_Encode(&encoder, ":scheme", "https", block,
+                sizeof(block), &blockLen) ||
+            ! ClientH2_Encode(&encoder, ":path", kPath, block,
+                sizeof(block), &blockLen) ||
+            ! ClientH2_Encode(&encoder, ":authority", "example.com", block,
+                sizeof(block), &blockLen) ||
+            ! ClientH2_Encode(&encoder, "content-type", "application/grpc",
+                block, sizeof(block), &blockLen))
+        goto out;
+    if (! ClientH2_SendFrame(ssl, HTTP2_FRAME_HEADERS,
+            HTTP2_FLAG_END_HEADERS, 1, block, blockLen))
+        goto out;
+    framedLen = GrpcFrameMessage(kPayload, (ULONG)strlen(kPayload),
+        framed, sizeof(framed));
+    if (! ClientH2_SendFrame(ssl, HTTP2_FRAME_DATA, HTTP2_FLAG_END_STREAM, 1,
+            framed, framedLen))
+        goto out;
+
+    Hpack_DecoderInit(&decoder, HTTP2_DEFAULT_HEADER_TABLE_SIZE);
+    {
+        UCHAR body[64];
+        ULONG bodyLen = 0;
+        int done = 0;
+
+        while (! done) {
+            HTTP2_FRAME_HEADER fh;
+            UCHAR payload[HTTP2_MAX_HEADER_BLOCK];
+
+            if (! ClientH2_ReadFrame(ssl, &fh, payload, sizeof(payload)))
+                goto out;
+
+            if (fh.type == HTTP2_FRAME_HEADERS &&
+                    (fh.flags & HTTP2_FLAG_END_HEADERS)) {
+                HPACK_HEADER *headers = (HPACK_HEADER *)malloc(
+                    HPACK_MAX_HEADERS * sizeof(*headers));
+                ULONG count = 0;
+                ULONG consumed = 0;
+                ULONG i;
+
+                if (! headers)
+                    goto out;
+                if (Hpack_DecodeBlock(&decoder, payload, fh.length, headers,
+                        HPACK_MAX_HEADERS, &count, &consumed) != HPACK_OK) {
+                    free(headers);
+                    goto out;
+                }
+                for (i = 0; i < count; ++i) {
+                    if (_stricmp(headers[i].name, "grpc-status") == 0) {
+                        strcpy_s(grpcStatusOut, grpcStatusCap,
+                                 headers[i].value);
+                        gotStatus = 1;
+                    }
+                }
+                free(headers);
+                if (fh.flags & HTTP2_FLAG_END_STREAM)
+                    done = 1;
+            }
+            else if (fh.type == HTTP2_FRAME_DATA) {
+                if (bodyLen + fh.length < sizeof(body)) {
+                    memcpy(body + bodyLen, payload, fh.length);
+                    bodyLen += fh.length;
+                }
+                if (fh.flags & HTTP2_FLAG_END_STREAM)
+                    done = 1;
+            }
+            else if (fh.type == HTTP2_FRAME_SETTINGS &&
+                    ! (fh.flags & HTTP2_FLAG_ACK)) {
+                ClientH2_SendFrame(
+                    ssl, HTTP2_FRAME_SETTINGS, HTTP2_FLAG_ACK, 0, NULL, 0);
+            }
+        }
+
+        /* unframe the echoed gRPC message */
+        if (bodyLen >= 5) {
+            ULONG msgLen = ((ULONG)body[1] << 24) | ((ULONG)body[2] << 16) |
+                           ((ULONG)body[3] << 8) | body[4];
+            if (5 + msgLen <= bodyLen && msgLen < responseCap) {
+                memcpy(response, body + 5, msgLen);
+                response[msgLen] = 0;
+                gotEcho = 1;
+            }
+        }
+    }
+
+    if (gotStatus && gotEcho)
+        ok = 1;
+
+out:
+    SSL_shutdown(ssl);
+    SSL_free(ssl);
+    SSL_CTX_free(ctx);
+    closesocket(sock);
+    return ok;
+}
+
+
 static int TestChunkedResponse(void)
 {
     UPSTREAM_SERVER upstream;
@@ -1451,6 +1905,246 @@ static int TestHttp2Relay(void)
                 "h2 HAR alpn") &&
         Require(strstr((const char *)harBytes, "upstream-ok") != NULL,
                 "h2 HAR body");
+    free(harBytes);
+    DeleteFileW(harPath);
+    return ok;
+}
+
+
+static int TestGrpcRelay(void)
+{
+    H2_UPSTREAM_SERVER upstream;
+    CAPTURE_CA *ca;
+    HTTPS_MITM_OPTIONS options;
+    HTTPS_MITM *mitm;
+    HTTPS_REDIRECT_CONTEXT context;
+    SERVE_JOB job;
+    HANDLE thread;
+    SOCKET accepted;
+    SOCKET probe;
+    struct sockaddr_in addr;
+    char sessionPem[4096];
+    ULONG pemLength = 0;
+    char response[64];
+    char grpcStatus[16];
+    WCHAR harPath[MAX_PATH];
+    UCHAR *harBytes = NULL;
+    DWORD harSize = 0;
+    int clientOk;
+    int ok;
+
+    if (! StartH2Upstream(&upstream)) {
+        StopH2Upstream(&upstream);
+        return Require(0, "grpc h2 upstream");
+    }
+
+    ca = CaptureCa_Create();
+    if (! ca || CaptureCa_ExportPublicPem(
+            ca, sessionPem, sizeof(sessionPem), &pemLength) != CAPTURE_CA_OK) {
+        CaptureCa_Free(ca);
+        StopH2Upstream(&upstream);
+        return Require(0, "grpc session CA");
+    }
+
+    MakeTempPath(harPath, MAX_PATH, L"sbie-mitm-grpc.har");
+    DeleteFileW(harPath);
+
+    context = MakeContext();
+    memset(&options, 0, sizeof(options));
+    options.ca = ca;
+    options.expected_context = &context;
+    options.upstream_host = "127.0.0.1";
+    options.upstream_port = upstream.port;
+    options.upstream_ca_pem = upstream.ca_pem;
+    options.har_path = harPath;
+    options.redact = TRUE;
+    options.include_bodies = TRUE;
+
+    mitm = HttpsMitm_Listen(&options);
+    if (! mitm) {
+        CaptureCa_Free(ca);
+        StopH2Upstream(&upstream);
+        return Require(0, "grpc listen");
+    }
+
+    probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(HttpsMitm_ListenPort(mitm));
+    if (connect(probe, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        closesocket(probe);
+        HttpsMitm_Close(mitm);
+        CaptureCa_Free(ca);
+        StopH2Upstream(&upstream);
+        return Require(0, "grpc connect");
+    }
+    accepted = HttpsMitm_Accept(mitm);
+    memset(&job, 0, sizeof(job));
+    job.mitm = mitm;
+    job.client = accepted;
+    job.context = context;
+    job.have_context = 1;
+    job.result = HTTPS_MITM_ERROR;
+    thread = CreateThread(NULL, 4 * 1024 * 1024, ServeThread, &job, 0, NULL);
+    if (! thread) {
+        closesocket(probe);
+        closesocket(accepted);
+        HttpsMitm_Close(mitm);
+        CaptureCa_Free(ca);
+        StopH2Upstream(&upstream);
+        return Require(0, "grpc serve thread");
+    }
+    clientOk = ClientGrpcOnSocket(
+        probe, sessionPem, response, sizeof(response),
+        grpcStatus, sizeof(grpcStatus));
+    WaitForSingleObject(thread, 10000);
+    CloseHandle(thread);
+    closesocket(probe);
+    HttpsMitm_Close(mitm);
+    CaptureCa_Free(ca);
+    StopH2Upstream(&upstream);
+
+    ok = Require(clientOk, "grpc echo round trip") &&
+        Require(strcmp(response, "hello") == 0, "grpc echo payload") &&
+        Require(strcmp(grpcStatus, "0") == 0, "grpc-status 0") &&
+        Require(job.result == HTTPS_MITM_OK, "grpc MITM serve success");
+    if (! ok) {
+        DeleteFileW(harPath);
+        return 0;
+    }
+
+    if (! Require(ReadAll(harPath, &harBytes, &harSize), "read grpc HAR")) {
+        DeleteFileW(harPath);
+        return 0;
+    }
+    ok = Require(strstr((const char *)harBytes, "\"grpcStatus\": \"0\"") != NULL,
+                 "grpc HAR grpcStatus") &&
+        Require(strstr((const char *)harBytes, "/test.Echo/Echo") != NULL,
+                "grpc HAR method path") &&
+        Require(strstr((const char *)harBytes,
+                       "\"grpcMessageCount\": 1") != NULL,
+                "grpc HAR message count") &&
+        Require(strstr((const char *)harBytes, "\"alpn\": \"h2\"") != NULL,
+                "grpc HAR alpn");
+    free(harBytes);
+    DeleteFileW(harPath);
+    return ok;
+}
+
+
+static int TestH2UpstreamNonGrpc(void)
+{
+    H2_UPSTREAM_SERVER upstream;
+    CAPTURE_CA *ca;
+    HTTPS_MITM_OPTIONS options;
+    HTTPS_MITM *mitm;
+    HTTPS_REDIRECT_CONTEXT context;
+    SERVE_JOB job;
+    HANDLE thread;
+    SOCKET accepted;
+    SOCKET probe;
+    struct sockaddr_in addr;
+    char sessionPem[4096];
+    ULONG pemLength = 0;
+    char response[512];
+    ULONG status = 0;
+    WCHAR harPath[MAX_PATH];
+    UCHAR *harBytes = NULL;
+    DWORD harSize = 0;
+    int clientOk;
+    int ok;
+
+    if (! StartH2Upstream(&upstream)) {
+        StopH2Upstream(&upstream);
+        return Require(0, "h2 upstream (non-grpc)");
+    }
+
+    ca = CaptureCa_Create();
+    if (! ca || CaptureCa_ExportPublicPem(
+            ca, sessionPem, sizeof(sessionPem), &pemLength) != CAPTURE_CA_OK) {
+        CaptureCa_Free(ca);
+        StopH2Upstream(&upstream);
+        return Require(0, "h2 session CA (non-grpc)");
+    }
+
+    MakeTempPath(harPath, MAX_PATH, L"sbie-mitm-h2up.har");
+    DeleteFileW(harPath);
+
+    context = MakeContext();
+    memset(&options, 0, sizeof(options));
+    options.ca = ca;
+    options.expected_context = &context;
+    options.upstream_host = "127.0.0.1";
+    options.upstream_port = upstream.port;
+    options.upstream_ca_pem = upstream.ca_pem;
+    options.har_path = harPath;
+    options.redact = TRUE;
+    options.include_bodies = TRUE;
+
+    mitm = HttpsMitm_Listen(&options);
+    if (! mitm) {
+        CaptureCa_Free(ca);
+        StopH2Upstream(&upstream);
+        return Require(0, "h2 listen (non-grpc)");
+    }
+
+    probe = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+    addr.sin_port = htons(HttpsMitm_ListenPort(mitm));
+    if (connect(probe, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        closesocket(probe);
+        HttpsMitm_Close(mitm);
+        CaptureCa_Free(ca);
+        StopH2Upstream(&upstream);
+        return Require(0, "h2 connect (non-grpc)");
+    }
+    accepted = HttpsMitm_Accept(mitm);
+    memset(&job, 0, sizeof(job));
+    job.mitm = mitm;
+    job.client = accepted;
+    job.context = context;
+    job.have_context = 1;
+    job.result = HTTPS_MITM_ERROR;
+    thread = CreateThread(NULL, 4 * 1024 * 1024, ServeThread, &job, 0, NULL);
+    if (! thread) {
+        closesocket(probe);
+        closesocket(accepted);
+        HttpsMitm_Close(mitm);
+        CaptureCa_Free(ca);
+        StopH2Upstream(&upstream);
+        return Require(0, "h2 serve thread (non-grpc)");
+    }
+    clientOk = ClientHttpGet2OnSocket(
+        probe, sessionPem, response, sizeof(response), &status);
+    WaitForSingleObject(thread, 10000);
+    CloseHandle(thread);
+    closesocket(probe);
+    HttpsMitm_Close(mitm);
+    CaptureCa_Free(ca);
+    StopH2Upstream(&upstream);
+
+    ok = Require(clientOk, "h2->h2 non-grpc round trip") &&
+        Require(status == 200, "h2->h2 :status 200") &&
+        Require(strstr(response, "upstream-ok") != NULL, "h2->h2 body") &&
+        Require(job.result == HTTPS_MITM_OK, "h2->h2 MITM serve success");
+    if (! ok) {
+        DeleteFileW(harPath);
+        return 0;
+    }
+
+    if (! Require(ReadAll(harPath, &harBytes, &harSize), "read h2->h2 HAR")) {
+        DeleteFileW(harPath);
+        return 0;
+    }
+    ok = Require(strstr((const char *)harBytes, "\"alpn\": \"h2\"") != NULL,
+                 "h2->h2 HAR alpn") &&
+        Require(strstr((const char *)harBytes, "\"grpcStatus\": \"\"") != NULL,
+                "h2->h2 HAR has no grpc status") &&
+        Require(strstr((const char *)harBytes, "upstream-ok") != NULL,
+                "h2->h2 HAR body");
     free(harBytes);
     DeleteFileW(harPath);
     return ok;
@@ -2649,6 +3343,8 @@ int main(void)
         TestKeepAliveRoundTrip() &&
         TestWebSocketTunnel() &&
         TestHttp2Relay() &&
+        TestGrpcRelay() &&
+        TestH2UpstreamNonGrpc() &&
         TestMissingContextRejected() &&
         TestQueryRedirectContextOnPlainSocketFails() &&
         TestServeOnceForwardsDownstreamSni() &&

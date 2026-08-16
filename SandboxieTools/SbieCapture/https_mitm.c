@@ -150,6 +150,14 @@ static SSL_CTX *HttpsMitm_NewUpstreamCtx(const char *caPem, BOOL allowUnverified
     if (! ctx)
         return NULL;
     SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+    {
+        /* offer h2 first so an h2-capable origin uses it (Slice 6) */
+        static const unsigned char kUpstreamAlpn[] = {
+            2, 'h', '2',
+            8, 'h', 't', 't', 'p', '/', '1', '.', '1'
+        };
+        SSL_CTX_set_alpn_protos(ctx, kUpstreamAlpn, sizeof(kUpstreamAlpn));
+    }
     if (allowUnverified || ! caPem || ! caPem[0]) {
         SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
         return ctx;
@@ -470,6 +478,19 @@ static void HttpsMitm_FormatIpv4(const UCHAR address[16], char *out, ULONG cap)
 }
 
 
+/* Extra per-exchange metadata the broker records alongside the HAR entry. */
+typedef struct _MITM_HAR_META {
+
+    ULONG64 ws_tunnel_bytes_in;
+    ULONG64 ws_tunnel_bytes_out;
+    ULONG stream_id;
+    const char *grpc_status;
+    const char *grpc_message;
+    ULONG grpc_message_count;
+
+} MITM_HAR_META;
+
+
 static int HttpsMitm_WriteHar(
     HTTPS_MITM *mitm,
     const HTTPS_REDIRECT_CONTEXT *context,
@@ -480,8 +501,7 @@ static int HttpsMitm_WriteHar(
     ULONG requestSize,
     const char *responseBytes,
     ULONG responseSize,
-    ULONG64 wsTunnelBytesIn,
-    ULONG64 wsTunnelBytesOut)
+    const MITM_HAR_META *meta)
 {
     HAR_WRITER *writer;
     HAR_EXCHANGE exchange;
@@ -589,8 +609,14 @@ static int HttpsMitm_WriteHar(
     exchange.response_body_original_len = response->chunked
         ? responseBodyLen : response->content_length;
     exchange.body_cap = 64 * 1024;
-    exchange.ws_tunnel_bytes_in = wsTunnelBytesIn;
-    exchange.ws_tunnel_bytes_out = wsTunnelBytesOut;
+    if (meta) {
+        exchange.ws_tunnel_bytes_in = meta->ws_tunnel_bytes_in;
+        exchange.ws_tunnel_bytes_out = meta->ws_tunnel_bytes_out;
+        exchange.stream_id = meta->stream_id;
+        exchange.grpc_status = meta->grpc_status;
+        exchange.grpc_message = meta->grpc_message;
+        exchange.grpc_message_count = meta->grpc_message_count;
+    }
 
     status = HarWriter_WriteExchange(writer, &exchange);
     return status == HAR_OK ? HTTPS_MITM_OK : HTTPS_MITM_ERROR;
@@ -1235,6 +1261,394 @@ done:
 }
 
 
+/* Count complete gRPC messages in a length-prefixed body (1-byte compressed
+   flag + 4-byte big-endian length per message, repeated). */
+static ULONG HttpsMitm_GrpcMessageCount(const UCHAR *data, ULONG len)
+{
+    ULONG pos = 0;
+    ULONG count = 0;
+
+    while (pos + 5 <= len) {
+        ULONG msgLen = ((ULONG)data[pos + 1] << 24) |
+                       ((ULONG)data[pos + 2] << 16) |
+                       ((ULONG)data[pos + 3] << 8) |
+                       data[pos + 4];
+        pos += 5;
+        if (msgLen > len - pos)
+            break;   /* truncated message */
+        pos += msgLen;
+        ++count;
+    }
+    return count;
+}
+
+
+/* Returns TRUE when the request is a gRPC call (content-type: application/grpc). */
+static int HttpsMitm_IsGrpc(const H2_RELAY_STREAM *stream)
+{
+    const HTTP11_HEADER *ct = Http11_FindHeader(
+        stream->headers, stream->header_count, "content-type");
+
+    if (! ct)
+        return 0;
+    return _strnicmp(ct->value, "application/grpc", 16) == 0;
+}
+
+
+/* Build an HTTP/1.1-shaped response struct from decoded h2 response headers
+   (for HAR).  header_bytes stays 0; the body is passed separately. */
+static void HttpsMitm_H2BuildH1Response(
+    const HPACK_HEADER *headers,
+    ULONG count,
+    ULONG status,
+    HTTP11_RESPONSE *out)
+{
+    ULONG i;
+    ULONG hc = 0;
+
+    memset(out, 0, sizeof(*out));
+    strcpy_s(out->version, sizeof(out->version), "HTTP/2");
+    out->status = status;
+    strcpy_s(out->reason, sizeof(out->reason), "OK");
+    for (i = 0; i < count; ++i) {
+        if (headers[i].name[0] == ':')
+            continue;   /* pseudo-headers */
+        if (HttpsMitm_H2IsConnectionHeader(headers[i].name))
+            continue;
+        if (hc >= HTTP11_MAX_HEADERS)
+            continue;
+        strcpy_s(out->headers[hc].name,
+                 sizeof(out->headers[hc].name), headers[i].name);
+        strcpy_s(out->headers[hc].value,
+                 sizeof(out->headers[hc].value), headers[i].value);
+        ++hc;
+    }
+    out->header_count = hc;
+    out->content_length = 0;
+    out->chunked = FALSE;
+}
+
+
+/* Decode one h2 header block into a heap array (caller frees). */
+static HPACK_HEADER *HttpsMitm_H2DecodeHeaders(
+    HPACK_DECODER *decoder,
+    const UCHAR *block,
+    ULONG block_len,
+    ULONG *out_count)
+{
+    HPACK_HEADER *headers = (HPACK_HEADER *)malloc(
+        HPACK_MAX_HEADERS * sizeof(*headers));
+    ULONG count = 0;
+    ULONG consumed = 0;
+
+    if (! headers)
+        return NULL;
+    if (Hpack_DecodeBlock(decoder, block, block_len, headers,
+            HPACK_MAX_HEADERS, &count, &consumed) != HPACK_OK) {
+        free(headers);
+        return NULL;
+    }
+    *out_count = count;
+    return headers;
+}
+
+
+static const char *HttpsMitm_H2FindHeaderValue(
+    const HPACK_HEADER *headers,
+    ULONG count,
+    const char *name)
+{
+    ULONG i;
+
+    for (i = 0; i < count; ++i) {
+        if (_stricmp(headers[i].name, name) == 0)
+            return headers[i].value;
+    }
+    return NULL;
+}
+
+
+/* Fill an HTTP/1.1-shaped request struct directly from a translated h2 stream
+   (no h1 bytes are built; the body is passed to the HAR separately). */
+static void HttpsMitm_H2BuildH1RequestStruct(
+    const H2_RELAY_STREAM *stream,
+    HTTP11_REQUEST *out)
+{
+    ULONG i;
+
+    memset(out, 0, sizeof(*out));
+    strcpy_s(out->method, sizeof(out->method),
+             stream->method[0] ? stream->method : "GET");
+    strcpy_s(out->target, sizeof(out->target),
+             stream->target[0] ? stream->target : "/");
+    strcpy_s(out->version, sizeof(out->version), "HTTP/2");
+    for (i = 0; i < stream->header_count && i < HTTP11_MAX_HEADERS; ++i) {
+        strcpy_s(out->headers[i].name, sizeof(out->headers[i].name),
+                 stream->headers[i].name);
+        strcpy_s(out->headers[i].value, sizeof(out->headers[i].value),
+                 stream->headers[i].value);
+    }
+    out->header_count = stream->header_count;
+    out->content_length = stream->body_len;
+    out->chunked = FALSE;
+}
+
+
+/* Relay one completed downstream h2 stream over an HTTP/2 upstream leg.  The
+   upstream TLS connection is already established and negotiated "h2". */
+static int HttpsMitm_H2RelayStreamH2(
+    HTTPS_MITM *mitm,
+    SSL *down,
+    SSL *up,
+    const HTTPS_REDIRECT_CONTEXT *context,
+    HPACK_ENCODER *downEncoder,
+    H2_RELAY_STREAM *stream)
+{
+    HTTP2_SESSION upSession;
+    HPACK_ENCODER upEncoder;
+    HPACK_DECODER upDecoder;
+    UCHAR payload[HTTP2_MAX_HEADER_BLOCK];
+    UCHAR reqBlock[HTTP2_MAX_HEADER_BLOCK];
+    ULONG reqBlockLen = 0;
+    HPACK_HEADER *respHeaders = NULL;
+    ULONG respHeaderCount = 0;
+    UCHAR *respBody = NULL;
+    ULONG respBodyLen = 0;
+    char grpcStatus[32];
+    char grpcMessage[256];
+    ULONG grpcMsgCount = 0;
+    ULONG respStatus = 0;
+    BOOL isGrpc;
+    BOOL gotInitialHeaders = FALSE;
+    int ok = 0;
+    ULONG i;
+
+    grpcStatus[0] = 0;
+    grpcMessage[0] = 0;
+    isGrpc = HttpsMitm_IsGrpc(stream);
+
+    Http2_SessionInit(&upSession);
+    Hpack_EncoderInit(&upEncoder, HTTP2_DEFAULT_HEADER_TABLE_SIZE, FALSE);
+    Hpack_DecoderInit(&upDecoder, HTTP2_DEFAULT_HEADER_TABLE_SIZE);
+
+    /* 1. client preface + SETTINGS */
+    {
+        static const char kMagic[] = "PRI * HTTP/2.0\r\n\r\nSM\r\n\r\n";
+        if (! HttpsMitm_SslWriteAll(up, kMagic, (ULONG)strlen(kMagic)))
+            goto done;
+        if (! HttpsMitm_H2WriteFrame(up, HTTP2_FRAME_SETTINGS, 0, 0, NULL, 0))
+            goto done;
+    }
+
+    /* 2. request HEADERS + DATA on stream 1 */
+    if (! HttpsMitm_H2EncodeOne(&upEncoder, ":method",
+            stream->method[0] ? stream->method : "GET",
+            reqBlock, sizeof(reqBlock), &reqBlockLen) ||
+            ! HttpsMitm_H2EncodeOne(&upEncoder, ":scheme", "https",
+                reqBlock, sizeof(reqBlock), &reqBlockLen) ||
+            ! HttpsMitm_H2EncodeOne(&upEncoder, ":path",
+                stream->target[0] ? stream->target : "/",
+                reqBlock, sizeof(reqBlock), &reqBlockLen) ||
+            ! HttpsMitm_H2EncodeOne(&upEncoder, ":authority",
+                stream->authority[0] ? stream->authority : "example.com",
+                reqBlock, sizeof(reqBlock), &reqBlockLen))
+        goto done;
+    for (i = 0; i < stream->header_count; ++i) {
+        if (! HttpsMitm_H2EncodeOne(&upEncoder,
+                stream->headers[i].name, stream->headers[i].value,
+                reqBlock, sizeof(reqBlock), &reqBlockLen))
+            goto done;
+    }
+    {
+        UCHAR flags = (UCHAR)(stream->body_len == 0
+            ? HTTP2_FLAG_END_HEADERS | HTTP2_FLAG_END_STREAM
+            : HTTP2_FLAG_END_HEADERS);
+        if (! HttpsMitm_H2WriteFrame(up, HTTP2_FRAME_HEADERS, flags, 1,
+                reqBlock, reqBlockLen))
+            goto done;
+    }
+    if (stream->body_len > 0 &&
+            ! HttpsMitm_H2WriteFrame(up, HTTP2_FRAME_DATA,
+                HTTP2_FLAG_END_STREAM, 1, stream->body, stream->body_len))
+        goto done;
+
+    /* 3. read the upstream response until END_STREAM */
+    respBody = (UCHAR *)malloc(HTTPS_MITM_IO_CAP);
+    if (! respBody)
+        goto done;
+    {
+        BOOL doneReading = FALSE;
+
+        while (! doneReading) {
+            HTTP2_FRAME_HEADER fh;
+            HTTP2_FRAME_RESULT result;
+            int rc;
+
+            if (! HttpsMitm_H2ReadFrame(up, &fh, payload, sizeof(payload)))
+                goto done;
+
+            rc = Http2_ProcessFrame(&upSession, &fh, payload, &result);
+            if (rc != HTTP2_OK)
+                goto done;
+
+            switch (fh.type) {
+            case HTTP2_FRAME_SETTINGS:
+                if (! (fh.flags & HTTP2_FLAG_ACK))
+                    HttpsMitm_H2WriteFrame(
+                        up, HTTP2_FRAME_SETTINGS, HTTP2_FLAG_ACK, 0, NULL, 0);
+                break;
+            case HTTP2_FRAME_PING:
+                if (! (fh.flags & HTTP2_FLAG_ACK))
+                    HttpsMitm_H2WriteFrame(
+                        up, HTTP2_FRAME_PING, HTTP2_FLAG_ACK, 0, payload, 8);
+                break;
+            case HTTP2_FRAME_HEADERS:
+                if (fh.flags & HTTP2_FLAG_END_HEADERS) {
+                    if (! gotInitialHeaders) {
+                        respHeaders = HttpsMitm_H2DecodeHeaders(
+                            &upDecoder, payload, fh.length, &respHeaderCount);
+                        if (! respHeaders)
+                            goto done;
+                        {
+                            const char *st = HttpsMitm_H2FindHeaderValue(
+                                respHeaders, respHeaderCount, ":status");
+                            if (st)
+                                respStatus = (ULONG)strtoul(st, NULL, 10);
+                        }
+                        gotInitialHeaders = TRUE;
+                    }
+                    else {
+                        /* trailers (gRPC): grpc-status / grpc-message */
+                        HPACK_HEADER *tr = HttpsMitm_H2DecodeHeaders(
+                            &upDecoder, payload, fh.length, &respHeaderCount);
+                        if (tr) {
+                            const char *gs = HttpsMitm_H2FindHeaderValue(
+                                tr, respHeaderCount, "grpc-status");
+                            const char *gm = HttpsMitm_H2FindHeaderValue(
+                                tr, respHeaderCount, "grpc-message");
+                            if (gs)
+                                strcpy_s(grpcStatus, sizeof(grpcStatus), gs);
+                            if (gm)
+                                strcpy_s(grpcMessage, sizeof(grpcMessage), gm);
+                            free(tr);
+                        }
+                    }
+                }
+                if (fh.flags & HTTP2_FLAG_END_STREAM)
+                    doneReading = TRUE;
+                break;
+            case HTTP2_FRAME_DATA:
+                if (fh.length > 0 &&
+                        respBodyLen + fh.length <= HTTPS_MITM_IO_CAP) {
+                    memcpy(respBody + respBodyLen, payload, fh.length);
+                    respBodyLen += fh.length;
+                }
+                if (fh.flags & HTTP2_FLAG_END_STREAM)
+                    doneReading = TRUE;
+                break;
+            case HTTP2_FRAME_GOAWAY:
+                doneReading = TRUE;
+                break;
+            default:
+                break;
+            }
+        }
+    }
+
+    if (isGrpc)
+        grpcMsgCount = HttpsMitm_GrpcMessageCount(respBody, respBodyLen);
+
+    /* 4. forward the response downstream */
+    {
+        UCHAR block[HTTP2_MAX_HEADER_BLOCK];
+        ULONG blockLen = 0;
+        char status[16];
+        BOOL hasBody = respBodyLen > 0;
+        BOOL hasTrailers = grpcStatus[0] != 0;
+
+        sprintf_s(status, sizeof(status), "%lu", respStatus ? respStatus : 200);
+        if (! HttpsMitm_H2EncodeOne(downEncoder, ":status", status,
+                block, sizeof(block), &blockLen))
+            goto done;
+        for (i = 0; i < respHeaderCount; ++i) {
+            char name[HTTP11_MAX_NAME];
+            if (respHeaders[i].name[0] == ':')
+                continue;
+            if (HttpsMitm_H2IsConnectionHeader(respHeaders[i].name))
+                continue;
+            strcpy_s(name, sizeof(name), respHeaders[i].name);
+            HttpsMitm_H2Lower(name);
+            if (! HttpsMitm_H2EncodeOne(downEncoder, name,
+                    respHeaders[i].value, block, sizeof(block), &blockLen))
+                goto done;
+        }
+
+        {
+            UCHAR flags = HTTP2_FLAG_END_HEADERS;
+            if (! hasBody && ! hasTrailers)
+                flags |= HTTP2_FLAG_END_STREAM;
+            if (! HttpsMitm_H2WriteFrame(down, HTTP2_FRAME_HEADERS, flags,
+                    stream->stream_id, block, blockLen))
+                goto done;
+        }
+        if (hasBody &&
+                ! HttpsMitm_H2WriteFrame(down, HTTP2_FRAME_DATA,
+                    hasTrailers ? 0 : HTTP2_FLAG_END_STREAM,
+                    stream->stream_id, respBody, respBodyLen))
+            goto done;
+        if (hasTrailers) {
+            UCHAR tblk[512];
+            ULONG tblkLen = 0;
+            if (! HttpsMitm_H2EncodeOne(downEncoder, "grpc-status", grpcStatus,
+                    tblk, sizeof(tblk), &tblkLen))
+                goto done;
+            if (grpcMessage[0] &&
+                    ! HttpsMitm_H2EncodeOne(downEncoder, "grpc-message",
+                        grpcMessage, tblk, sizeof(tblk), &tblkLen))
+                goto done;
+            if (! HttpsMitm_H2WriteFrame(down, HTTP2_FRAME_HEADERS,
+                    HTTP2_FLAG_END_HEADERS | HTTP2_FLAG_END_STREAM,
+                    stream->stream_id, tblk, tblkLen))
+                goto done;
+        }
+    }
+
+    /* 5. HAR */
+    {
+        HTTP11_REQUEST *request = (HTTP11_REQUEST *)malloc(sizeof(*request));
+        HTTP11_RESPONSE *response = (HTTP11_RESPONSE *)malloc(sizeof(*response));
+        MITM_HAR_META meta;
+
+        if (request && response) {
+            HttpsMitm_H2BuildH1RequestStruct(stream, request);
+            HttpsMitm_H2BuildH1Response(
+                respHeaders, respHeaderCount, respStatus, response);
+            response->content_length = respBodyLen;
+
+            memset(&meta, 0, sizeof(meta));
+            meta.stream_id = stream->stream_id;
+            if (isGrpc) {
+                meta.grpc_status = grpcStatus[0] ? grpcStatus : NULL;
+                meta.grpc_message = grpcMessage[0] ? grpcMessage : NULL;
+                meta.grpc_message_count = grpcMsgCount;
+            }
+            HttpsMitm_WriteHar(mitm, context, down, request, response,
+                (const char *)stream->body, stream->body_len,
+                (const char *)respBody, respBodyLen, &meta);
+        }
+        free(request);
+        free(response);
+    }
+
+    ok = 1;
+
+done:
+    free(respHeaders);
+    free(respBody);
+    return ok;
+}
+
+
 /* Relay one completed h2 request stream through an HTTP/1.1 upstream. */
 static int HttpsMitm_H2RelayStream(
     HTTPS_MITM *mitm,
@@ -1283,6 +1697,19 @@ static int HttpsMitm_H2RelayStream(
     if (SSL_connect(up) != 1)
         goto done;
 
+    /* origin negotiated h2: relay over h2 instead of translating to h1 */
+    {
+        const unsigned char *alpn = NULL;
+        unsigned int alpnLen = 0;
+
+        SSL_get0_alpn_selected(up, &alpn, &alpnLen);
+        if (alpn && alpnLen == 2 && alpn[0] == 'h' && alpn[1] == '2') {
+            ok = HttpsMitm_H2RelayStreamH2(
+                mitm, down, up, context, encoder, stream);
+            goto done;
+        }
+    }
+
     if (! HttpsMitm_SslWriteAll(up, h1Request, requestSize))
         goto done;
 
@@ -1300,8 +1727,13 @@ static int HttpsMitm_H2RelayStream(
             response, h1Response, responseSize))
         goto done;
 
-    HttpsMitm_WriteHar(mitm, context, down, request, response,
-        h1Request, requestSize, h1Response, responseSize, 0, 0);
+    {
+        MITM_HAR_META meta;
+        memset(&meta, 0, sizeof(meta));
+        meta.stream_id = stream->stream_id;
+        HttpsMitm_WriteHar(mitm, context, down, request, response,
+            h1Request, requestSize, h1Response, responseSize, &meta);
+    }
 
     ok = 1;
 
@@ -1560,6 +1992,9 @@ int HttpsMitm_ServeOnce(
         if (isWebSocket && response.status == 101) {
             ULONG64 wsIn = 0;
             ULONG64 wsOut = 0;
+            MITM_HAR_META wsMeta;
+
+            memset(&wsMeta, 0, sizeof(wsMeta));
 
             /* fold any bytes the readers already buffered past the handshake
                into the tunnel's byte accounting */
@@ -1583,8 +2018,10 @@ int HttpsMitm_ServeOnce(
             /* switch to a transparent byte tunnel until both sides close */
             HttpsMitm_Tunnel(down, up, &wsIn, &wsOut);
 
+            wsMeta.ws_tunnel_bytes_in = wsIn;
+            wsMeta.ws_tunnel_bytes_out = wsOut;
             HttpsMitm_WriteHar(mitm, context, down, &request, &response,
-                requestBuf, requestSize, responseBuf, responseSize, wsIn, wsOut);
+                requestBuf, requestSize, responseBuf, responseSize, &wsMeta);
 
             served = TRUE;
             break;   /* the tunneled connection is done; up/upstream are
@@ -1592,8 +2029,12 @@ int HttpsMitm_ServeOnce(
         }
 
         /* record the exchange (best-effort) */
-        HttpsMitm_WriteHar(mitm, context, down, &request, &response,
-            requestBuf, requestSize, responseBuf, responseSize, 0, 0);
+        {
+            MITM_HAR_META meta;
+            memset(&meta, 0, sizeof(meta));
+            HttpsMitm_WriteHar(mitm, context, down, &request, &response,
+                requestBuf, requestSize, responseBuf, responseSize, &meta);
+        }
 
         served = TRUE;
 
