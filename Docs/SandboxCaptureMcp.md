@@ -1,102 +1,73 @@
-# Sandbox Capture and MCP Architecture
+# 沙箱捕获与 MCP 架构
 
-## Status
+## 状态
 
-This document defines the architecture and delivery plan for sandbox-scoped
-network capture, optional HTTPS inspection, and a Model Context Protocol (MCP)
-interface.
+本文档定义沙箱作用域网络捕获、可选 HTTPS 检查与 Model Context Protocol（MCP）接口的架构与交付计划。
 
-The initial control-plane and connection-audit slices are implemented. They do not claim packet-capture support: connection-audit records describe authorization attempts and contain no packet payload, TCP stream, TLS plaintext, or HTTP data.
+初始控制面与连接审计 slice 已实现。它们不声称支持包捕获：连接审计记录描述授权尝试，不含任何包载荷、TCP 流、TLS 明文或 HTTP 数据。
 
-Current implementation status:
+当前实现状态：
 
-- Phase 1 control wire, owner-scoped service sessions, QSbieAPI wrappers, and the MCP stdio executable are implemented.
-- Phase 2 adds fixed-size nonpaged per-session driver queues for WFP ALE connect and receive/accept authorization metadata. SbieSvc is the only driver drain consumer and applies owner, box, SID, Windows-session, PID, and process-creation-time isolation before returning records.
-- Slice 1–8 packet-capture infrastructure is present. `CAPTURE_PACKET_CAPTURE_RELEASE_GATE` is `1`: when `NetworkEnablePacketCapture=y` and the payload callouts registered, MCP advertises `packetCapture`/`pcapngExport` and public packet start is allowed. Setting the gate to `0` hard-disables those bits and returns `STATUS_NOT_SUPPORTED`.
-- The shared section is versioned and bound to capture ID plus generation. The driver locks the mapped view with an MDL for `DISPATCH_LEVEL` writes. Driver-owned capacity/write state is kept outside the broker-writable header; ring overwrites increment `section->dropped_count`. SbieSvc copies that counter into the public session and must not replace it with the connection-audit drop count on packet stop. The broker remains the only payload consumer and PCAPNG writer.
-- x64 live evidence on this host accepted: Box A / Box B / host isolation; IPv4/IPv6 TCP and UDP; loopback/snaplen/size/rotate/time limits; process-scope excludes later children; box-scope includes later children; broker-stalled overflow reports `droppedCount=904` for 5000 datagrams on a 4096 ring; broker kill yields `state=5` / `0xC0000001`; cross-SID and cross-session process-scoped starts return `0xC0000022`.
-- SandMan can start with or without `translations.7z`. Language and troubleshooting archives are extracted through `CArchive::ExtractToCache` onto a real directory; SandMan no longer constructs `QAbstractFileEngineHandler`. HTTPS inspection remains out of scope.
-- Connection Audit remains an independent path and must be rerun after every driver swap.
+- Phase 1 控制线格式、所有者作用域服务会话、QSbieAPI 包装与 MCP stdio 可执行文件已实现。
+- Phase 2 为 WFP ALE connect 与 receive/accept 授权元数据新增固定大小非分页每会话驱动队列。SbieSvc 是唯一驱动排空消费者，并在返回记录前应用所有者、盒、SID、Windows 会话、PID 与进程创建时间隔离。
+- Slice 1–8 包捕获基础设施已就绪。`CAPTURE_PACKET_CAPTURE_RELEASE_GATE` 为 `1`：当 `NetworkEnablePacketCapture=y` 且载荷 callout 已注册时，MCP 通告 `packetCapture`/`pcapngExport` 且允许公开包启动。把门设为 `0` 硬禁用这些位并返回 `STATUS_NOT_SUPPORTED`。
+- 共享 section 已版本化并绑定到捕获 id 加 generation。驱动用 MDL 在 `DISPATCH_LEVEL` 写时锁定映射视图。驱动拥有的容量/写入状态保持在 broker 可写头之外；环覆盖递增 `section->dropped_count`。SbieSvc 把该计数器复制进公开会话，且不得在包停止时用连接审计丢弃计数替换它。broker 仍是唯一载荷消费者与 PCAPNG 写入器。
+- 本宿主 x64 实机证据已接受：Box A / Box B / 宿主隔离；IPv4/IPv6 TCP 与 UDP；loopback/snaplen/size/rotate/time 限制；进程作用域排除后来的子进程；盒作用域包含后来的子进程；broker 停滞溢出在 4096 环上报告 `droppedCount=904`（5000 数据报）；broker 击杀产生 `state=5` / `0xC0000001`；cross-SID 与 cross-session 进程作用域启动返回 `0xC0000022`。
+- SandMan 可带或不带 `translations.7z` 启动。语言与故障排除归档经 `CArchive::ExtractToCache` 解压到真实目录；SandMan 不再构造 `QAbstractFileEngineHandler`。HTTPS 检查仍超出范围。
+- Connection Audit 仍是独立路径，每次驱动更换后必须重跑。
 
+## 目标
 
-## Goals
+- 只捕获归属于选定沙箱或该沙箱中选定进程的流量。
+- 请求时包含在捕获启动后加入选定沙箱的进程。
+- 支持 IPv4、IPv6、TCP 与 UDP，不收集无关宿主流量。
+- 把被动捕获导出为 PCAPNG。
+- 可选检查 HTTPS 流量，不在宿主或其它沙箱安装信任材料。
+- 通过 SandMan 与本地 MCP 服务器暴露有界、可审计的捕获操作。
+- 把不可信包、TLS 与 HTTP 解析保持在 SbieDrv 与 SbieSvc 之外。
+- 为既有核心保留 Windows 7 支持。需要更新 WFP API 的功能必须在运行时能力门控。
 
-- Capture only traffic attributed to a selected sandbox or selected process in
-  that sandbox.
-- Include processes that join the selected sandbox after a capture starts when
-  requested.
-- Support IPv4, IPv6, TCP, and UDP without collecting unrelated host traffic.
-- Export passive captures as PCAPNG.
-- Optionally inspect HTTPS traffic without installing trust material on the
-  host or in another sandbox.
-- Expose bounded, auditable capture operations through SandMan and a local MCP
-  server.
-- Keep untrusted packet, TLS, and HTTP parsing outside SbieDrv and SbieSvc.
-- Preserve Windows 7 support for the existing core. Features that require newer
-  WFP APIs must be capability-gated at runtime.
+## 非目标
 
-## Non-Goals
+- 机器级包嗅探器。
+- 保证解密证书固定、相互认证、仅 ECH 或应用专属 TLS 实现的 HTTPS。
+- 首个版本中的 HTTP/3 解密。
+- 经 MCP 的任意命令执行、沙箱删除或无限制配置变更。
+- 把包解析器、OpenSSL 或其它大型第三方库加载进 SbieSvc 或内核驱动。
 
-- A machine-wide packet sniffer.
-- Guaranteed HTTPS decryption for certificate-pinned, mutually authenticated,
-  ECH-only, or application-specific TLS implementations.
-- HTTP/3 decryption in the first release.
-- Arbitrary command execution, sandbox deletion, or unrestricted configuration
-  mutation through MCP.
-- Loading packet parsers, OpenSSL, or other large third-party libraries into
-  SbieSvc or the kernel driver.
+## 既有基础
 
-## Existing Foundations
+Sandboxie 已提供若干积木：
 
-Sandboxie already provides several building blocks:
+- SbieDrv 跟踪沙箱进程创建、进程创建时间、盒名、用户 SID 与 Windows 会话。
+- `Sandboxie/core/drv/wfp.c` 维护非分页 PID 查找以用于网络策略，并分类出站 connect 与入站 accept 授权事件。
+- SbieDll 为兼容应用实现 TCP SOCKS5 重定向。
+- SbieSvc 经其 LPC 端口提供按上下文认证的请求路由。
+- QSbieAPI 提供分块 SbieSvc 请求以及 SandMan 侧进程与沙箱模型。
 
-- SbieDrv tracks sandbox process creation, process creation time, box name, user
-  SID, and Windows session.
-- `Sandboxie/core/drv/wfp.c` maintains a nonpaged PID lookup for network policy
-  and classifies outbound connect and inbound accept authorization events.
-- SbieDll implements TCP SOCKS5 redirection for compatible applications.
-- SbieSvc provides authenticated-by-context request routing over its LPC port.
-- QSbieAPI provides chunked SbieSvc requests and the SandMan-side process and
-  sandbox model.
+当前 WFP 实现是策略 callout，不是包捕获实现。它注册 ALE 授权层，不消费 `layerData` 或关联流上下文。当前监视环从分页池分配，因此不能在可能运行于 `DISPATCH_LEVEL` 的 WFP 分类路径上写入。
 
-The current WFP implementation is a policy callout, not a packet capture
-implementation. It registers ALE authorization layers and does not consume
-`layerData` or associate flow context. The current monitor ring is allocated
-from paged pool and therefore cannot be written from WFP classification paths
-that may run at DISPATCH_LEVEL.
+## 安全不变量
 
-## Security Invariants
+以下不变量是发布阻塞项：
 
-The following invariants are release blockers:
+1. Box A 的捕获不得包含宿主、Box B 或其它用户的流量。
+2. PID 单独永不足够作为身份。归属使用 PID 加进程创建时间，以及盒名、SID 与 Windows 会话组成的沙箱身份元组。
+3. 任何代理重定向前先评估原始网络策略。代理不能把被拒绝的目的地变成允许的目的地。
+4. 捕获 broker 只接受携带有效 WFP 重定向上下文或其它服务签发、一次性、绑定到原始进程与目的地的能力连接。
+5. broker 故障不得在 HTTPS 检查模式下静默恢复直连网络访问。
+6. 宿主证书存储与其它沙箱绝不信任捕获 CA。
+7. CA 私钥、生成的叶子私钥与捕获正文不可被沙箱化进程读取。
+8. SbieSvc 不解析包载荷、TLS 记录、HTTP 消息或 MCP JSON。
+9. 内核捕获缓冲区有界。被动捕获溢出递增丢弃计数器，而非阻断网络流量或分配无界内存。
+10. 所有服务请求使用 LPC 提供的调用方身份。请求载荷不能断言受信任的 PID、SID、会话或所有权身份。
 
-1. A capture for Box A must not contain host, Box B, or another user's traffic.
-2. A PID is never a sufficient identity by itself. Attribution uses PID plus
-   process creation time and the sandbox identity tuple of box name, SID, and
-   Windows session.
-3. Original network policy is evaluated before any proxy redirection. A proxy
-   cannot turn a denied destination into an allowed destination.
-4. A capture broker accepts only connections carrying a valid WFP redirect
-   context or another service-issued, single-use capability bound to the
-   original process and destination.
-5. Broker failure cannot silently restore direct network access in HTTPS
-   inspection mode.
-6. The host certificate stores and other sandboxes never trust a capture CA.
-7. CA private keys, generated leaf private keys, and captured bodies are not
-   readable by sandboxed processes.
-8. SbieSvc does not parse packet payloads, TLS records, HTTP messages, or MCP
-   JSON.
-9. Kernel capture buffers are bounded. Passive-capture overflow increments a
-   drop counter instead of blocking network traffic or allocating unbounded
-   memory.
-10. All service requests use the caller identity supplied by LPC. Request
-    payloads cannot assert a trusted PID, SID, session, or ownership identity.
-
-## Architecture
+## 架构
 
 ```text
-Sandboxed process
+沙箱化进程
     |
-    +-- ALE audit ------> SbieDrv WFP --> bounded nonpaged queue
+    +-- ALE 审计 ------> SbieDrv WFP --> 有界非分页队列
     |                                      |
     |                                      v
     |                               SbieSvc CaptureServer
@@ -104,137 +75,112 @@ Sandboxed process
     |                                      v
     |                               QSbieAPI / SbieMcp
     |
-    +-- future payload -> SbieDrv WFP --> SbieCaptureBroker --> PCAPNG
+    +-- 未来载荷 -> SbieDrv WFP --> SbieCaptureBroker --> PCAPNG
     |
-    +-- HTTPS path ----> WFP connect redirect --> SbieCaptureBroker
+    +-- HTTPS 路径 ----> WFP connect 重定向 --> SbieCaptureBroker
                                                   |          |
-                                                  |          +--> HTTP/HAR events
-                                                  +-------------> upstream TLS
+                                                  |          +--> HTTP/HAR 事件
+                                                  +-------------> 上游 TLS
 
 SandMan / SbieMcp
     |
-    +--> QSbieAPI --> SbieSvc CaptureServer --> session and authorization control
+    +--> QSbieAPI --> SbieSvc CaptureServer --> 会话与授权控制
 ```
 
 ### SbieDrv
 
-The driver owns authoritative process attribution and enforcement. The Phase 2
-backend observes the existing ALE authorization callouts without changing their
-permit/block result. Later WFP layers are:
+驱动拥有权威进程归属与强制。Phase 2 后端观察既有 ALE 授权 callout 而不改变它们的允许/拒绝结果。后续 WFP 层为：
 
-- ALE connect and receive/accept are implemented for policy and bounded
-  connection-attempt metadata.
-- ALE flow-established for associating stable flow context.
-- Stream layers for bidirectional TCP application bytes.
-- Datagram-data layers for UDP and QUIC datagrams.
-- Transport layers where PCAPNG output requires packet boundaries and headers.
-- Connect-redirect layers for transparent local HTTPS inspection where the OS
-  supports the required redirect APIs.
+- ALE connect 与 receive/accept 已实现，用于策略与有界连接尝试元数据。
+- ALE flow-established 用于关联稳定流上下文。
+- 流层用于双向 TCP 应用字节。
+- 数据报数据层用于 UDP 与 QUIC 数据报。
+- 传输层用于 PCAPNG 输出需要包边界与头之处。
+- Connect-redirect 层用于 OS 支持所需重定向 API 处的透明本地 HTTPS 检查。
 
-The flow context will contain only fixed-size data needed in hot paths:
+流上下文将只包含热路径所需固定大小数据：
 
 ```text
-capture session id
-box identity hash
-process id
-process creation time
-address family and protocol
-local and remote endpoints
-direction
-policy generation
+捕获会话 id
+盒身份 hash
+进程 id
+进程创建时间
+地址族与协议
+本地与远端端点
+方向
+策略 generation
 ```
 
-The driver will not perform TLS or application-protocol parsing.
+驱动不执行 TLS 或应用协议解析。
 
 ### SbieSvc CaptureServer
 
-`CaptureServer` is a separate SbieSvc message family. It owns:
+`CaptureServer` 是独立 SbieSvc 消息族。它拥有：
 
-- wire-version negotiation and capability reporting;
-- caller and target authorization;
-- capture-session identifiers and ownership;
-- backend lifecycle and health state;
-- event cursors, counters, and export-handle brokering;
-- cleanup when the owning client disconnects.
+- 线格式版本协商与能力报告；
+- 调用方与目标授权；
+- 捕获会话标识符与所有权；
+- 后端生命周期与健康状态；
+- 事件游标、计数器与导出句柄中介；
+- 拥有客户端断连时的清理。
 
-The LPC port is connectable by untrusted local processes, so every operation
-performs its own authorization. Initial policy is deliberately narrow:
+LPC 端口可被不可信本地进程连接，因此每个操作执行自身授权。初始策略刻意收窄：
 
-- sandboxed callers cannot create or control captures;
-- a normal caller can target only an enabled sandbox for the caller's exact
-  user SID and Windows session;
-- a PID target must currently belong to that sandbox, SID, and session;
-- cross-user and cross-session access is rejected in wire version 1, including
-  for elevated callers;
-- stop and status operations require the original owner process and process
-  creation time; administrator recovery is reserved for a later explicit API.
+- 沙箱化调用方不能创建或控制捕获；
+- 普通调用方只能以调用方的确切用户 SID 与 Windows 会话为目标已启用沙箱；
+- PID 目标当前必须属于该沙箱、SID 与会话；
+- 线格式版本 1 中拒绝跨用户与跨会话访问，包括提权调用方；
+- stop 与 status 操作要求原始所有者进程与进程创建时间；管理员恢复保留给后续显式 API。
 
-The control plane supports query, start, stop, status, owner-scoped listing, and
-bounded connection-event drain. Caller identity is obtained from the LPC
-client security context and cross-checked against the live primary process
-token and process creation time. Sandbox enablement is evaluated with the
-caller's SID and session rather than the LocalSystem service identity. Packet
-and HTTPS capabilities remain clear.
+控制面支持查询、启动、停止、状态、所有者作用域列举与有界连接事件排空。调用方身份从 LPC 客户端安全上下文获取，并与活动主进程令牌及进程创建时间交叉核对。沙箱启用以调用方的 SID 与会话评估，而非 LocalSystem 服务身份。包与 HTTPS 能力保持关闭。
 
-Capture requests are capped independently of the historical maximum LPC
-message size. Active sessions have per-owner and global limits, while stopped
-session history is evicted within fixed bounds.
+捕获请求独立于历史最大 LPC 消息大小设上限。活动会话有每所有者与全局限制，停止的会话历史在固定边界内淘汰。
 
 ### SbieCaptureBroker
 
-The broker is a signed, independently built process. It runs with the least
-privileged user token that can perform its job and is placed in a kill-on-close
-job controlled by SbieSvc.
+broker 是已签名、独立构建的进程。它以能完成工作所需的最低特权用户令牌运行，并置于 SbieSvc 控制的 kill-on-close job 中。
 
-Planned responsibilities:
+计划职责：
 
-- drain driver capture records;
-- write PCAPNG and indexed metadata;
-- terminate downstream and upstream TLS for explicitly enabled HTTPS sessions;
-- parse HTTP/1.1 first, then HTTP/2 and WebSocket in later phases;
-- enforce body-size, file-size, time, and memory limits;
-- redact sensitive headers by default;
-- expose records to CaptureServer through inherited or duplicated handles.
+- 排空驱动捕获记录；
+- 写 PCAPNG 与索引元数据；
+- 为显式启用的 HTTPS 会话终止下游与上游 TLS；
+- 先解析 HTTP/1.1，后续阶段再解析 HTTP/2 与 WebSocket；
+- 执行正文大小、文件大小、时间与内存限制；
+- 默认脱敏敏感头；
+- 通过继承或复制句柄向 CaptureServer 暴露记录。
 
-The broker executable path is fixed relative to Sandboxie's installation
-directory. A client cannot provide an executable path or command line for a
-LocalSystem launch.
+broker 可执行文件路径固定相对 Sandboxie 安装目录。客户端不能为 LocalSystem 启动提供可执行文件路径或命令行。
 
-### QSbieAPI and SandMan
+### QSbieAPI 与 SandMan
 
-QSbieAPI exposes typed capture requests and normalizes the versioned wire
-structures into Qt value types. SandMan receives a dedicated capture model and
-view rather than reusing `CTraceEntry`, because packet flows, HTTP exchanges,
-and dropped-record accounting have different identity and retention rules.
+QSbieAPI 暴露类型化捕获请求，并把版本化线格式结构规范化为 Qt 值类型。SandMan 接收专属捕获模型与视图，而非复用 `CTraceEntry`，因为包流、HTTP 交换与丢弃记录记账有不同身份与保留规则。
 
-The UI will distinguish:
+UI 将区分：
 
-- connection audit;
-- passive PCAPNG capture;
-- HTTPS inspection.
+- 连接审计；
+- 被动 PCAPNG 捕获；
+- HTTPS 检查。
 
-Unsupported features remain disabled based on service capability flags.
+不支持的功能基于服务能力标志保持禁用。
 
-### MCP Server
+### MCP 服务器
 
-`SbieMcp` is a separate, normal-user process. It uses QSbieAPI and never opens
-the driver device or talks to a privileged capture backend directly.
+`SbieMcp` 是独立、普通用户进程。它使用 QSbieAPI，绝不直接打开驱动设备或与特权捕获后端对话。
 
-The first transport is MCP stdio:
+首个传输是 MCP stdio：
 
-- stdin and stdout contain newline-delimited JSON-RPC messages only;
-- diagnostics go to stderr;
-- no listening socket is created;
-- input messages have a fixed size limit and tool arguments are validated at
-  runtime instead of relying only on the advertised JSON Schema;
-- normal operations are rejected until the initialize response is followed by
-  `notifications/initialized`;
-- capture-changing tools retain SbieSvc ownership and authorization checks.
+- stdin 与 stdout 只含换行分隔的 JSON-RPC 消息；
+- 诊断走 stderr；
+- 不创建监听套接字；
+- 输入消息有固定大小限制，工具参数在运行时验证而非仅依赖通告的 JSON Schema；
+- 在 initialize 响应之后跟随 `notifications/initialized` 之前拒绝正常操作；
+- 改变捕获的工具保留 SbieSvc 所有权与授权检查。
 
-Initial tools and resources are intentionally bounded:
+初始工具与资源刻意有界：
 
 ```text
-Tools
+工具
   sandboxie_list_boxes
   sandboxie_list_processes
   capture_capabilities
@@ -243,23 +189,20 @@ Tools
   capture_status
   capture_read_events
 
-Resources
+资源
   sandboxie://boxes
   sandboxie://boxes/{box}/processes
   capture://sessions
   capture://sessions/{id}/summary
 ```
 
-Packet lists and HTTP bodies will use cursor or offset pagination when their
-backends are implemented. Whole capture files are exported to user-selected
-files rather than embedded in a single MCP response.
+包列表与 HTTP 正文在其后端实现后使用游标或偏移分页。整个捕获文件导出到用户选择的文件，而非嵌入单个 MCP 响应。
 
-## Control Wire Version 1
+## 控制线格式版本 1
 
-The SbieSvc message family starts at `0x2000`. Low byte `0xFF` is reserved by
-PipeServer for process-disconnect notification.
+SbieSvc 消息族从 `0x2000` 开始。低字节 `0xFF` 由 PipeServer 保留用于进程断连通知。
 
-Every versioned request starts with:
+每个版本化请求以：
 
 ```c
 MSG_HEADER h;
@@ -267,211 +210,170 @@ ULONG wire_version;
 ULONG struct_size;
 ```
 
-Rules:
+开头。
 
-- wire fields use fixed-width Windows integer types;
-- 64-bit fields are explicitly aligned to 8 bytes;
-- structures contain no pointer, `HANDLE`, `size_t`, C++ `bool`, or compiler-
-  dependent enum values;
-- strings are fixed-size only for the v1 sandbox name; future variable data
-  uses checked offset and length pairs;
-- services accept a known minimum `struct_size` and ignore unknown trailing
-  fields when the wire version is supported;
-- clients validate both the advertised reply length and the actual number of
-  bytes received;
-- unknown operations return `STATUS_INVALID_SYSTEM_SERVICE`;
-- an unavailable backend returns `STATUS_DEVICE_NOT_READY` or a session error
-  state, never a successful active capture state.
+规则：
 
-## HTTPS Inspection
+- 线格式字段使用定宽 Windows 整数类型；
+- 64 位字段显式对齐到 8 字节；
+- 结构不含指针、`HANDLE`、`size_t`、C++ `bool` 或编译器相关枚举值；
+- 字符串仅对 v1 沙箱名使用固定大小；未来可变数据使用带检查的偏移与长度对；
+- 服务接受已知最小 `struct_size`，且当线格式版本受支持时忽略未知尾随字段；
+- 客户端验证通告的回复长度与实际收到字节数；
+- 未知操作返回 `STATUS_INVALID_SYSTEM_SERVICE`；
+- 后端不可用返回 `STATUS_DEVICE_NOT_READY` 或会话错误状态，绝不返回成功的活动捕获状态。
 
-### Preferred Path
+## HTTPS 检查
 
-On supported systems, SbieDrv uses WFP ALE connect redirection to a random
-loopback listener owned by the broker. The redirect context binds the original
-destination to the sandbox identity, process generation, policy generation,
-and capture session. The broker copies WFP redirect records to its upstream
-socket to prevent recursive redirection and preserve flow relationships.
+### 首选路径
 
-### Windows 7 Path
+在受支持系统上，SbieDrv 用 WFP ALE connect 重定向到 broker 拥有的随机 loopback 监听器。重定向上下文把原始目的地绑定到沙箱身份、进程 generation、策略 generation 与会话。broker 把 WFP 重定向记录复制到其上游套接字，以防止递归重定向并保持流关系。
 
-Windows 7 remains supported by the core, but the modern redirect-handle APIs
-used by the preferred path are not available. The first compatible fallback is
-the existing injected SOCKS5 path, augmented with a service-issued, single-use
-authorization that binds the original destination. Direct egress must remain
-blocked while that fallback is active.
+### Windows 7 路径
 
-### Certificate Isolation
+核心仍支持 Windows 7，但首选路径使用的现代重定向句柄 API 不可用。首个兼容回退是既有注入 SOCKS5 路径，辅以服务签发、一次性、绑定原始目的地的授权。该回退活动期间直连出口必须保持阻断。
 
-- Generate a unique CA per capture session or per disposable capture sandbox.
-- Keep private keys outside the sandbox.
-- Import only the CA public certificate into the selected sandbox's virtual
-  current-user Root store.
-- Perform the import through a helper launched inside that sandbox under the
-  original user's token.
-- Remove the sandboxed CA when the capture ends and require target applications
-  to restart when their trust cache requires it.
-- Verify by registry and file hashing that host certificate stores and Firefox
-  NSS databases are unchanged.
+### 证书隔离
 
-### Protocol Matrix
+- 为每次捕获会话或一次性捕获沙箱生成唯一 CA。
+- 私钥保留在沙箱之外。
+- 只把 CA 公钥证书导入选定沙箱的虚拟当前用户 Root store。
+- 通过在该沙箱内、以原始用户令牌启动的辅助进程执行导入。
+- 捕获结束时移除沙箱化 CA，并在目标应用信任缓存需要时要求其重启。
+- 通过注册表与文件哈希验证宿主证书存储与 Firefox NSS 数据库不变。
 
-| Capability | Planned support |
+### 协议矩阵
+
+| 能力 | 计划支持 |
 | --- | --- |
-| TLS 1.2 over TCP | HTTPS MVP |
-| TLS 1.3 over TCP | HTTPS MVP with bundled OpenSSL version from build variables |
-| HTTP/1.1 | HTTPS MVP (chunked + keep-alive) |
-| HTTP/2 and HPACK | Phase 5 (hand-rolled codec; downstream terminate, h1 or h2 upstream) |
-| WebSocket over HTTP/1.1 | Phase 5 (upgrade detect + transparent byte tunnel) |
-| gRPC framing | Phase 5 (metadata + trailers + message count); protobuf decoding needs descriptors |
-| HTTP/3 and QUIC decryption | Not in the first release; passive UDP capture only |
-| TLS key-log (SSLKEYLOGFILE) | Phase 5 (opt-in, caller-opened handle) |
-| Certificate pinning | Expected MITM failure; retain passive capture |
-| ECH without another trusted hostname source | Not guaranteed |
-| Mutual TLS | Not guaranteed for transparent MITM |
-| Firefox/NSS trust | Phase 5 (boxed-profile opt-in: enterprise roots or certutil) |
+| 基于 TCP 的 TLS 1.2 | HTTPS MVP |
+| 基于 TCP 的 TLS 1.3 | HTTPS MVP，用构建变量中的捆绑 OpenSSL 版本 |
+| HTTP/1.1 | HTTPS MVP（chunked + keep-alive） |
+| HTTP/2 与 HPACK | Phase 5（手写编解码器；下游终止，h1 或 h2 上游） |
+| 基于 HTTP/1.1 的 WebSocket | Phase 5（升级检测 + 透明字节隧道） |
+| gRPC 帧 | Phase 5（元数据 + trailers + 消息计数）；protobuf 解码需要描述符 |
+| HTTP/3 与 QUIC 解密 | 首个版本不做；仅被动 UDP 捕获 |
+| TLS key-log（SSLKEYLOGFILE） | Phase 5（opt-in，调用方打开的句柄） |
+| 证书固定 | 预期 MITM 失败；保留被动捕获 |
+| 无其它可信主机名来源的 ECH | 不保证 |
+| 相互 TLS | 透明 MITM 不保证 |
+| Firefox/NSS 信任 | Phase 5（boxed profile opt-in：enterprise roots 或 certutil） |
 
-## Data Retention and Redaction
+## 数据保留与脱敏
 
-Defaults are privacy-preserving:
+默认隐私保护：
 
-- metadata is captured before bodies;
-- `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, and common API
-  key headers are redacted;
-- bodies require explicit opt-in;
-- per-body, per-flow, per-session, and output-file limits are mandatory;
-- capture files are created in the caller's security context or through a file
-  handle opened by the caller and duplicated by SbieSvc;
-- LocalSystem never creates or overwrites an arbitrary client-supplied path.
+- 正文之前先捕获元数据；
+- `Authorization`、`Proxy-Authorization`、`Cookie`、`Set-Cookie` 与常见 API 密钥头被脱敏；
+- 正文要求显式 opt-in；
+- 每正文、每流、每会话与输出文件限制为强制；
+- 捕获文件在调用方安全上下文中创建，或通过调用方打开、SbieSvc 复制的文件句柄创建；
+- LocalSystem 绝不创建或覆盖任意客户端提供的路径。
 
-## Delivery Plan
+## 交付计划
 
-### Phase 0: Spikes and Safety Proofs
+### Phase 0：Spike 与安全证明
 
-- Prove stable sandbox flow attribution with PID reuse tests.
-- Prove nonpaged bounded buffering from WFP classification paths.
-- Prove Windows 8+ connect redirection and recursion prevention.
-- Prove sandbox-only certificate trust with host registry and NSS file diffs.
+- 用 PID 复用测试证明稳定沙箱流归属。
+- 证明来自 WFP 分类路径的非分页有界缓冲。
+- 证明 Windows 8+ connect 重定向与递归防止。
+- 证明仅沙箱证书信任，宿主注册表与 NSS 文件 diff 干净。
 
-Exit criteria: Box A, Box B, and host traffic remain distinguishable under
-process churn, IPv4/IPv6, and broker failure.
+退出标准：进程更替、IPv4/IPv6 与 broker 故障下 Box A、Box B 与宿主流量仍可区分。
 
-### Phase 1: Versioned Control Plane
+### Phase 1：版本化控制面
 
-- Add CaptureServer wire version 1.
-- Add caller authorization and owner-scoped session lifecycle.
-- Add QSbieAPI wrappers.
-- Add an MCP stdio skeleton exposing capability and lifecycle operations.
-- Keep packet and HTTPS capability bits clear until their backends exist.
+- 添加 CaptureServer 线格式版本 1。
+- 添加调用方授权与所有者作用域会话生命周期。
+- 添加 QSbieAPI 包装。
+- 添加暴露能力与生命周期操作的 MCP stdio 骨架。
+- 在其后端存在前保持包与 HTTPS 能力位关闭。
 
-Exit criteria: an unsandboxed same-SID, same-session client can create, query,
-list, and stop its own inactive-backend session; sandboxed, cross-user, and
-cross-session callers are rejected. Malformed wire messages and malformed MCP
-arguments cannot broaden a process-scoped request into a box-scoped request.
+退出标准：非沙箱化同 SID、同会话客户端可创建、查询、列举并停止自己的无后端会话；沙箱化、跨用户与跨会话调用方被拒绝。畸形线格式消息与畸形 MCP 参数不能把进程作用域请求扩大为盒作用域请求。
 
-### Phase 2: Connection Audit
+### Phase 2：连接审计
 
-- Add a dedicated fixed-capacity nonpaged connection-event queue. Implemented.
-- Associate box, SID, Windows session, PID, and process creation time with each
-  event. Implemented.
-- Allow only authenticated SbieSvc to destructively drain bounded batches and
-  expose them through QSbieAPI and MCP. Implemented.
-- Add the SandMan connection view. Implemented.
-- Complete real-driver Box A/Box B/host isolation and process-churn tests.
-  Isolation and process-churn were verified on a personal test host. The
-  churn run proved later boxed children appear in a box-scoped session,
-  host traffic does not, process-scoped sessions stay bound to PID plus
-  process creation time, and later boxed processes after the target exits
-  do not leak in. OS-level PID reuse was not observed in that run.
+- 添加专属固定容量非分页连接事件队列。已实现。
+- 每个事件关联盒、SID、Windows 会话、PID 与进程创建时间。已实现。
+- 只允许经认证的 SbieSvc 破坏性排空有界批次并经 QSbieAPI 与 MCP 暴露。已实现。
+- 添加 SandMan 连接视图。已实现。
+- 完成实机驱动 Box A/Box B/宿主隔离与进程更替测试。隔离与进程更替已在个人测试宿主验证。更替运行证明盒作用域会话中出现后来的盒内子进程、宿主流量不出现、进程作用域会话保持绑定 PID 加进程创建时间、目标退出后的后来的盒内进程不泄漏进来。该次运行未观察到 OS 级 PID 复用。
 
-Exit criteria: only selected sandbox connections appear, including later child
-processes, with correct dropped-event accounting.
+退出标准：只有选定沙箱连接出现，包括后来的子进程，且丢弃事件记账正确。
 
-### Phase 3: Passive Packet Capture
+### Phase 3：被动包捕获
 
-- Add TCP stream, UDP datagram, and transport capture layers.
-- Produce PCAPNG with IPv4/IPv6 and per-process metadata.
-- Add snap length, file rotation, and time limits.
+- 添加 TCP 流、UDP 数据报与传输捕获层。
+- 产出带 IPv4/IPv6 与每进程元数据的 PCAPNG。
+- 添加快照长度、文件轮转与时间限制。
 
-Exit criteria: Wireshark opens the output and no unrelated traffic is present.
+退出标准：Wireshark 打开输出且无无关流量。
 
-### Phase 4: HTTPS MVP
+### Phase 4：HTTPS MVP
 
-- Add connect redirect and broker authentication.
-- Add sandbox-only CA lifecycle.
-- Support TLS 1.2/1.3 and HTTP/1.1.
-- Add HAR export and default redaction.
+- 添加 connect 重定向与 broker 认证。
+- 添加仅沙箱 CA 生命周期。
+- 支持 TLS 1.2/1.3 与 HTTP/1.1。
+- 添加 HAR 导出与默认脱敏。
 
-Exit criteria: representative Chromium, WinHTTP, and curl traffic is decoded;
-pinning failures are reported; broker failure does not leak direct traffic.
+退出标准：代表性 Chromium、WinHTTP 与 curl 流量被解码；固定失败被报告；broker 故障不泄漏直连流量。
 
-### Phase 5: Protocol and Compatibility Expansion
+### Phase 5：协议与兼容性扩展
 
-- HTTP/2, HPACK, WebSocket, and gRPC framing.
-- Firefox/NSS compatibility.
-- Optional TLS key-log adapters for selected pinned applications.
-- Evaluate, but do not promise, QUIC termination and HTTP/3 parsing.
+- HTTP/2、HPACK、WebSocket 与 gRPC 帧。
+- Firefox/NSS 兼容性。
+- 为选定固定应用提供可选 TLS key-log 适配器。
+- 评估但不承诺 QUIC 终止与 HTTP/3 解析。
 
-### Firefox/NSS trust (boxed profile, opt-in)
+### Firefox/NSS 信任（boxed profile，opt-in）
 
-Firefox does not read the Windows Root store by default, so a boxed Firefox does
-not automatically trust the Phase 4 session CA even after
-`--https-import-host-root`.  Two opt-in mechanisms exist, both
-boxed-profile-only (never touch the host Firefox profile or host NSS databases):
+Firefox 默认不读 Windows Root store，因此 boxed Firefox 即使执行 `--https-import-host-root` 后也不会自动信任 Phase 4 会话 CA。存在两种 opt-in 机制，均仅限 boxed profile（绝不触碰宿主 Firefox profile 或宿主 NSS 数据库）：
 
-1. **Enterprise roots (primary).** Point Firefox at the host Root store (where
-   the session CA already lives):
+1. **Enterprise roots（首选）。** 让 Firefox 指向宿主 Root store（会话 CA 已在那里）：
 
    ```
    SbieCapture.exe --firefox-enterprise-roots <boxed-profile-dir>
    ```
 
-   This writes `user_pref("security.enterprise_roots.enabled", true);` into the
-   profile's `user.js` (idempotent; `prefs.js` is left untouched).
+   这会把 `user_pref("security.enterprise_roots.enabled", true);` 写入 profile 的 `user.js`（幂等；`prefs.js` 保持不动）。
 
-2. **NSS cert9.db injection (stronger, needs the NSS tools).** Import the CA
-   public certificate directly into the profile's `cert9.db` with `certutil`:
+2. **NSS cert9.db 注入（更强，需要 NSS 工具）。** 用 `certutil` 把 CA 公钥证书直接导入 profile 的 `cert9.db`：
 
    ```
    SbieCapture.exe --firefox-import-ca <boxed-profile-dir> \
        --import-ca-path <ca-public.pem> [--certutil <path-to-certutil>]
    ```
 
-   `certutil` defaults to resolving from PATH; the profile must be closed while
-   `cert9.db` is modified.
+   `certutil` 默认从 PATH 解析；修改 `cert9.db` 时 profile 必须关闭。
 
-Firefox must be (re)started after either change.  Removal restores the profile
-`user.js` / `cert9.db` and restarts Firefox.  Host-profile and host-NSS hashes
-must remain unchanged (verified in the live isolation suite).
+任一种改动后 Firefox 必须（重新）启动。移除则恢复 profile 的 `user.js` / `cert9.db` 并重启 Firefox。宿主 profile 与宿主 NSS 哈希必须保持不变（已在实机隔离套件中验证）。
 
-## Verification Matrix
+## 验证矩阵
 
-Required validation includes:
+必需验证包括：
 
-- host, other-sandbox, other-user, and other-session exclusion;
-- process exit and PID reuse;
-- future child inclusion and PID-only target behavior;
-- IPv4, IPv6, TCP, UDP, loopback, and proxy paths;
-- existing `NetworkAccess` decisions before and after redirection;
-- broker crash, SbieSvc restart, BFE restart, and policy reload;
-- VPN, firewall, antivirus, and other WFP redirect callout coexistence;
-- buffer exhaustion and output-file exhaustion;
-- host certificate-store and Firefox profile integrity;
-- malformed capture records, TLS records, HTTP messages, and compressed bodies;
-- Win32, x64, ARM64, and affected ARM64EC build configurations;
-- Windows 7 load compatibility when newer WFP APIs are absent.
+- 宿主、其它沙箱、其它用户与其它会话排除；
+- 进程退出与 PID 复用；
+- 未来子进程包含与仅 PID 目标行为；
+- IPv4、IPv6、TCP、UDP、loopback 与代理路径；
+- 重定向前后的既有 `NetworkAccess` 决策；
+- broker 崩溃、SbieSvc 重启、BFE 重启与策略重载；
+- VPN、防火墙、杀毒与其它 WFP 重定向 callout 共存；
+- 缓冲耗尽与输出文件耗尽；
+- 宿主证书存储与 Firefox profile 完整性；
+- 畸形捕获记录、TLS 记录、HTTP 消息与压缩正文；
+- Win32、x64、ARM64 与受影响的 ARM64EC 构建配置；
+- 缺少新 WFP API 时的 Windows 7 加载兼容性。
 
-## Change Isolation
+## 变更隔离
 
-Because SbieDrv and the driver/service protocol are security boundaries, work is
-split into independently reviewable changes:
+因为 SbieDrv 与驱动/服务协议是安全边界，工作拆分为可独立审查的变更：
 
-1. architecture document and control-plane ABI;
-2. QSbieAPI and MCP control clients;
-3. driver connection-audit queue;
-4. passive packet backend;
-5. HTTPS broker and certificate lifecycle;
-6. higher-level protocol parsers and UI.
+1. 架构文档与控制面 ABI；
+2. QSbieAPI 与 MCP 控制客户端；
+3. 驱动连接审计队列；
+4. 被动包后端；
+5. HTTPS broker 与证书生命周期；
+6. 更高层协议解析器与 UI。
 
-No phase may advertise a capability before its security and failure-mode tests
-pass.
+任何阶段不得在其安全与故障模式测试通过前通告能力。

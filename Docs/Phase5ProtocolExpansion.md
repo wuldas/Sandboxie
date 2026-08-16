@@ -1,260 +1,260 @@
-# Phase 5: Protocol & Compatibility Expansion Plan
+# Phase 5：协议与兼容性扩展计划
 
-> **For Hermes:** Implement only after the user accepts this plan and, if they want the usual stage gate, after this file is committed alone. Do not mix implementation into the plan commit. Do not `git reset` / `git clean`. Do not touch SbieDrv / SbieSvc / WFP in this phase.
+> **给 Hermes 的指示：** 仅在用户接受本计划后实施；如果用户需要常规的阶段门控，则在本文件单独提交之后实施。不要把实现混入计划提交。不要执行 `git reset` / `git clean`。本阶段不得触碰 SbieDrv / SbieSvc / WFP。
 
-**Goal:** Extend the Phase 4 HTTPS broker so that, in addition to HTTP/1.1, it inspects **HTTP/2** (with HPACK), tunnels and records **WebSocket** (over HTTP/1.1), and records **gRPC** stream framing; add **Firefox/NSS trust**, an optional **TLS key-log export** for pinned applications, and produce a written **QUIC/HTTP/3 evaluation** (no implementation promised). Exit: representative `curl --http2`, a Chromium h2 client, and a gRPC client in the selected sandbox are decoded into HAR (gRPC as metadata + trailers, no protobuf); WebSocket handshakes are recorded and tunneled; boxed Firefox trusts the session CA after an opt-in; `SSLKEYLOGFILE` decrypts the captured PCAPNG in Wireshark.
+**目标：** 扩展 Phase 4 的 HTTPS broker，使其在 HTTP/1.1 之外还能检查 **HTTP/2**（含 HPACK）、隧道并记录 **WebSocket**（基于 HTTP/1.1）、记录 **gRPC** 流帧；新增 **Firefox/NSS 信任**、面向证书固定应用的**可选 TLS key-log 导出**，并产出一份书面 **QUIC/HTTP/3 评估**（不承诺实现）。退出标准：选定沙箱内的代表性 `curl --http2`、Chromium h2 客户端与 gRPC 客户端被解码进 HAR（gRPC 只记元数据 + trailers，不解 protobuf）；WebSocket 握手被记录并隧道转发；boxed Firefox 在 opt-in 后信任会话 CA；`SSLKEYLOGFILE` 可在 Wireshark 中解密捕获的 PCAPNG。
 
-**Architecture:** All Phase 5 work lives in `SbieCapture.exe` and its user-mode test suites. SbieDrv, SbieSvc, the LPC wire, and the WFP redirect path are unchanged. The broker's ALPN callback advertises `h2` alongside `http/1.1`. A new HTTP/2 relay demultiplexes downstream streams, decodes HPACK into the existing logical request/response model, and writes one HAR entry per stream. Upstream stays HTTP/1.1 (translate) for the first deliverable; a later slice adds h2→h2 upstream so gRPC survives. WebSocket is an HTTP/1.1 upgrade that switches to a transparent byte tunnel after the 101. No new driver code, no new LPC message, no new advertised capability bit in the MVP.
+**架构：** Phase 5 的全部工作都在 `SbieCapture.exe` 及其用户态测试套件中。SbieDrv、SbieSvc、LPC 线格式与 WFP 重定向路径均不变。broker 的 ALPN 回调在 `http/1.1` 之外同时通告 `h2`。新的 HTTP/2 中继对下游流解复用、把 HPACK 解码进既有的逻辑请求/响应模型、并为每个流写一条 HAR 条目。上游在首个交付物中保持 HTTP/1.1（翻译模式）；后续 slice 增加 h2→h2 上游以让 gRPC 存活。WebSocket 是 HTTP/1.1 升级：101 之后切换到透明字节隧道。无新驱动代码、无新 LPC 消息、MVP 中不新增通告能力位。
 
-**Tech Stack:** Existing `SbieCapture.exe` (C, `cl.exe` /W4 /WX, Win32 sockets, no CRT in SbieDll but full CRT in the broker), OpenSSL 3.x from `D:\vcpkg\installed\x64-windows` (libssl-3-x64 / libcrypto-3-x64), hand-rolled parsers only (no nghttp2 in the default plan — see Open Questions).
-
----
-
-## Locked decisions
-
-These are not open questions. Do not re-litigate them while implementing.
-
-1. **Driver / SbieSvc / WFP unchanged.** Phase 5 is broker-only. Do not add callouts, LPC message IDs, or QSbieAPI virtuals. The only acceptable wire-surface change is a *trailing* start flag or a new SET-export handle for the key-log file, and that can be deferred until the broker pieces are proven.
-2. **Hand-rolled codecs, not libraries.** HPACK (RFC 7541) and HTTP/2 framing are implemented in `hpack.c` and `http2.c` with unit tests, exactly as `http11.c` / `redact.c` / `har.c` were in Phase 4. This keeps the security-relevant parser surface small and reviewable. nghttp2 is the documented escape hatch if Huffman/codec size becomes a blocker (Open Questions), and if adopted it links into `SbieCapture.exe` only.
-3. **HTTP/2 = terminate-and-translate first, h2→h2 later.** Downstream (client) HTTP/2 is fully terminated and mapped to logical request/response messages. For the first h2 deliverable the upstream (origin) leg speaks HTTP/1.1; this requires translating `:method`/`:scheme`/`:authority`/`:path` pseudo-headers to a request line and status back to `:status`, and dropping connection-specific headers. A later slice adds h2→h2 upstream for fidelity and because gRPC requires it.
-4. **gRPC = metadata + trailers + body tunnel, never protobuf.** A stream whose request `content-type` is `application/grpc` is recorded as a HAR entry with `:path` (method), request/response headers, `grpc-status`/`grpc-message` trailers, and a message count; body bytes are captured only under `CAPTURE_FLAG_INCLUDE_BODIES` and the per-body cap. Protobuf decoding is out of scope (needs descriptors, per the architecture doc).
-5. **WebSocket = upgrade detect + byte tunnel.** On HTTP/1.1, detect `Upgrade: websocket` + `Connection: Upgrade` + `Sec-WebSocket-Key`. Pass the handshake through unchanged, then switch to a transparent bidirectional relay. Record the handshake and final tunneled byte counts in HAR; no per-message framing/decoding in the MVP.
-6. **Firefox/NSS is opt-in and boxed-profile-only.** Primary mechanism: set `security.enterprise_roots.enabled = true` in the sandboxed Firefox profile so it trusts the host Root store where the Phase 4 persistent session CA already lives. Stronger mechanism (if NSS `certutil` is available): inject the CA public cert into the boxed profile's `cert9.db`. Never touch the host Firefox profile or host NSS databases. Document that Firefox must be (re)started after the CA is imported.
-7. **TLS key-log is explicit and off by default.** The broker attaches `SSL_CTX_set_keylog_callback` to both downstream and upstream contexts and appends `CLIENT_RANDOM` lines to a caller-opened key-log file. LocalSystem never creates or overwrites a client-supplied path. No key-log without an explicit opt-in at session start.
-8. **Capability bits stay as-is.** `CAPTURE_CAP_HTTPS_INSPECTION` / `CAPTURE_CAP_HAR_EXPORT` remain the only advertised bits. HTTP/2, WebSocket, and gRPC are "better HTTPS inspection", not new capabilities. Firefox trust and key-log are broker-internal/start-flag features and are not advertised until live-verified.
-9. **Phase 4 invariants are unchanged.** Redirect-context auth before any serve, fail-closed on broker death, default header redaction, bodies opt-in, 64 KiB per-body cap, 64 MiB HAR cap, 300 s max, 64 concurrent MITM connections (mapped to h2 streams), loopback-only listener, ALPN `http/1.1` remains offered so h1-only clients keep working.
-10. **Personal host constraints:** no ARM64 full link, no official driver signing, no `git reset` / `git clean`, keep `NetworkEnableWFP=y`, do not use installed `Start.exe`, do not load parsers/OpenSSL into `SbieDrv`/`SbieSvc`. Test-build with `cl.exe` + vcpkg OpenSSL as in `HttpsMitmTests/build_https_mitm_tests.cmd`.
+**技术栈：** 现有 `SbieCapture.exe`（C 语言，`cl.exe` /W4 /WX，Win32 sockets，SbieDll 无 CRT 但 broker 有完整 CRT），OpenSSL 3.x 来自 `D:\vcpkg\installed\x64-windows`（libssl-3-x64 / libcrypto-3-x64），仅手写解析器（默认计划不用 nghttp2——见开放问题）。
 
 ---
 
-## Current baseline (do not regress)
+## 已锁定的决策
 
-| Piece | Today (Phase 4, HEAD `3e6552c6`) |
+以下不是开放问题。实现过程中不得重新争论。
+
+1. **驱动 / SbieSvc / WFP 不变。** Phase 5 只改 broker。不新增 callout、LPC 消息 ID 或 QSbieAPI 虚函数。唯一可接受的线面改动是 key-log 文件的*尾部*启动标志或新的 SET-export 句柄，且可推迟到 broker 各部件被证明可用之后。
+2. **手写编解码器，不用库。** HPACK（RFC 7541）与 HTTP/2 帧在 `hpack.c` 与 `http2.c` 中实现并带单元测试，与 Phase 4 的 `http11.c` / `redact.c` / `har.c` 完全一致。这让安全相关的解析面保持小而可审查。若 Huffman/编解码器体量成为阻塞（见开放问题），nghttp2 是文档化的逃生通道；若采用，只链接进 `SbieCapture.exe`。
+3. **HTTP/2 = 先终止并翻译，h2→h2 后做。** 下游（客户端）HTTP/2 被完全终止并映射为逻辑请求/响应消息。首个 h2 交付物中上游（源站）腿说 HTTP/1.1；这需要把 `:method`/`:scheme`/`:authority`/`:path` 伪头翻译为请求行、把状态码翻译回 `:status`，并丢弃 connection 专属头。后续 slice 增加 h2→h2 上游以保真，且 gRPC 需要它。
+4. **gRPC = 元数据 + trailers + 正文隧道，绝不解 protobuf。** 请求 `content-type` 为 `application/grpc` 的流被记录为一条 HAR 条目，含 `:path`（方法）、请求/响应头、`grpc-status`/`grpc-message` trailers 与消息计数；正文字节仅在 `CAPTURE_FLAG_INCLUDE_BODIES` 且受每正文上限约束时捕获。protobuf 解码超出范围（按架构文档需要描述符）。
+5. **WebSocket = 升级检测 + 字节隧道。** 在 HTTP/1.1 上检测 `Upgrade: websocket` + `Connection: Upgrade` + `Sec-WebSocket-Key`。握手原样透传，然后切换到透明双向中继。HAR 中记录握手与最终隧道字节计数；MVP 不做逐消息帧/解码。
+6. **Firefox/NSS 是 opt-in 且仅限 boxed profile。** 主要机制：在沙箱化 Firefox profile 中设置 `security.enterprise_roots.enabled = true`，使其信任宿主 Root store（Phase 4 持久会话 CA 已在那里）。更强机制（若 NSS `certutil` 可用）：把 CA 公钥证书注入 boxed profile 的 `cert9.db`。绝不触碰宿主 Firefox profile 或宿主 NSS 数据库。文档须说明 Firefox 在 CA 导入后必须（重新）启动。
+7. **TLS key-log 显式启用且默认关闭。** broker 在两个上下文（下游与上游）都挂 `SSL_CTX_set_keylog_callback`，并把 `CLIENT_RANDOM` 行追加到调用方打开的 key-log 文件。LocalSystem 绝不创建或覆盖客户端提供的路径。会话启动时无显式 opt-in 则无 key-log。
+8. **能力位保持原样。** `CAPTURE_CAP_HTTPS_INSPECTION` / `CAPTURE_CAP_HAR_EXPORT` 仍是仅有的通告位。HTTP/2、WebSocket 与 gRPC 属于"更好的 HTTPS 检查"，不是新能力。Firefox 信任与 key-log 是 broker 内部/启动标志功能，在实机验证通过前不通告。
+9. **Phase 4 不变量不变。** 任何服务之前先做重定向上下文认证；broker 死亡 fail-closed；默认头脱敏；正文 opt-in；每正文 64 KiB 上限；HAR 64 MiB 上限；最长 300 s；64 路并发 MITM 连接（映射到 h2 流）；仅 loopback 监听；仍提供 ALPN `http/1.1` 让纯 h1 客户端继续可用。
+10. **个人宿主约束：** 无 ARM64 完整链接、无官方驱动签名、无 `git reset` / `git clean`、保持 `NetworkEnableWFP=y`、不使用已安装的 `Start.exe`、不把解析器/OpenSSL 加载进 `SbieDrv`/`SbieSvc`。按 `HttpsMitmTests/build_https_mitm_tests.cmd` 的方式用 `cl.exe` + vcpkg OpenSSL 测试构建。
+
+---
+
+## 当前基线（不得回归）
+
+| 部件 | 现状（Phase 4，HEAD `3e6552c6`） |
 | --- | --- |
-| Downstream ALPN | `http/1.1` only (`HttpsMitm_AlpnSelect`, `https_mitm.c:100`) |
-| Relay | single request/response per `HttpsMitm_ServeOnce`; reads header + `Content-Length` only; no chunked, no keep-alive, no multiplexing |
-| Upstream connect | IPv4 only (`HttpsMitm_ConnectTcp`) |
-| HAR | HTTP/1.1 only (`har.h` includes `http11.h`; `HAR_EXCHANGE` holds `HTTP11_REQUEST`/`HTTP11_RESPONSE`) |
-| Broker dispatch | `capture_https_broker.c` accept loop → `HttpsMitm_ServeOnce` |
-| Capability bits | `httpsInspection` / `harExport` on after Phase 4 Slice 8 (11/11 live isolation) |
-| Tests | `HarTests`, `HttpsMitmTests`, `CaptureQueueTests` (wire/lifecycle/view), `PcapngTests` |
+| 下游 ALPN | 仅 `http/1.1`（`HttpsMitm_AlpnSelect`，`https_mitm.c:100`） |
+| 中继 | 每个 `HttpsMitm_ServeOnce` 单请求/响应；只读头 + `Content-Length`；无 chunked、无 keep-alive、无多路复用 |
+| 上游连接 | 仅 IPv4（`HttpsMitm_ConnectTcp`） |
+| HAR | 仅 HTTP/1.1（`har.h` 包含 `http11.h`；`HAR_EXCHANGE` 持有 `HTTP11_REQUEST`/`HTTP11_RESPONSE`） |
+| broker 分发 | `capture_https_broker.c` accept 循环 → `HttpsMitm_ServeOnce` |
+| 能力位 | Phase 4 Slice 8 后（11/11 实机隔离）`httpsInspection` / `harExport` 开启 |
+| 测试 | `HarTests`、`HttpsMitmTests`、`CaptureQueueTests`（线格式/生命周期/视图）、`PcapngTests` |
 
-Known Phase 4 relay gaps that Phase 5 must close because the h2→h1 and WebSocket paths depend on them: chunked transfer decoding, and multiple sequential exchanges on one HTTP/1.1 connection (keep-alive). These are folded into Slice 3.
+Phase 5 必须补齐的已知 Phase 4 中继缺口（因为 h2→h1 与 WebSocket 路径依赖它们）：chunked 传输解码，以及单条 HTTP/1.1 连接上的多次顺序交换（keep-alive）。这些并入 Slice 3。
 
 ---
 
-## Data path (HTTP/2, downstream h2 → upstream h1, first deliverable)
+## 数据路径（HTTP/2，下游 h2 → 上游 h1，首个交付物）
 
 ```text
-boxed client → WFP redirect → broker listen socket (unchanged)
+boxed 客户端 → WFP 重定向 → broker 监听套接字（不变）
     |
-    +-- TLS accept (SNI leaf mint, ALPN: h2 | http/1.1)
+    +-- TLS accept（SNI 叶子签发，ALPN: h2 | http/1.1）
     |
-    +-- if ALPN == "h2":
-            demux frames (SETTINGS/WINDOW_UPDATE/PING handled locally)
-            per stream: collect HEADERS + CONTINUATION → HPACK decode
-                        → build logical request (method/authority/path/headers)
-            translate to HTTP/1.1 request → upstream h1 socket (existing)
-            read h1 response (incl. chunked) → translate to :status + headers
-            HPACK encode → downstream HEADERS + DATA frames
-            write HAR entry (serverIP = original remote, alpn = "h2")
-    +-- if ALPN == "http/1.1":
-            existing h1 relay, hardened for chunked + keep-alive
-            if Upgrade: websocket → 101 pass-through → byte tunnel
+    +-- 若 ALPN == "h2"：
+            解复用帧（SETTINGS/WINDOW_UPDATE/PING 本地处理）
+            每流：收集 HEADERS + CONTINUATION → HPACK 解码
+                        → 构建逻辑请求（method/authority/path/headers）
+            翻译为 HTTP/1.1 请求 → 上游 h1 套接字（既有）
+            读 h1 响应（含 chunked）→ 翻译为 :status + headers
+            HPACK 编码 → 下游 HEADERS + DATA 帧
+            写 HAR 条目（serverIP = 原始远端，alpn = "h2"）
+    +-- 若 ALPN == "http/1.1"：
+            既有 h1 中继，为 chunked + keep-alive 加固
+            若 Upgrade: websocket → 101 透传 → 字节隧道
 ```
 
-### HPACK scope (RFC 7541)
+### HPACK 范围（RFC 7541）
 
-- Static table: all 61 entries.
-- Dynamic table: bounded (default 4096 bytes), LRU eviction, per-direction encoder/decoder.
-- Integer and string representations (indexed, literal with/without indexing, never-indexed, dynamic-size-update).
-- Huffman encode/decode (Appendix B table).
-- Decode limits: reject oversized header blocks and name/value over `HTTP11_MAX_*` bounds; a malformed block fails the stream (RST_STREAM) and is recorded as a decode error, never a broker crash.
+- 静态表：全部 61 项。
+- 动态表：有界（默认 4096 字节）、LRU 淘汰、按方向独立编码器/解码器。
+- 整数与字符串表示（索引、带/不带索引的字面量、永不索引、动态表大小更新）。
+- Huffman 编解码（附录 B 表）。
+- 解码限制：拒绝超大头块及超过 `HTTP11_MAX_*` 边界的名/值；畸形块使该流失败（RST_STREAM）并记为解码错误，绝不导致 broker 崩溃。
 
-### HTTP/2 frame scope (RFC 7540)
+### HTTP/2 帧范围（RFC 7540）
 
-- Frame header (9 bytes) parse + serialize with length/type/flag/stream-id checks.
-- SETTINGS (both directions, ACK), WINDOW_UPDATE, PING, GOAWAY, RST_STREAM handled at the connection level.
-- HEADERS/CONTINUATION/DATA assembled per stream.
-- Flow control: honor peer WINDOW_UPDATE for downstream DATA we emit; a coarse flow-control pass is acceptable for the first deliverable (documented) as long as it does not deadlock typical clients.
-- `:authority` is required on downstream requests; use it as the SNI/HAR host when present.
+- 帧头（9 字节）解析与序列化，带长度/类型/标志/流 ID 检查。
+- SETTINGS（双向、ACK）、WINDOW_UPDATE、PING、GOAWAY、RST_STREAM 在连接级处理。
+- HEADERS/CONTINUATION/DATA 按流组装。
+- 流控：对下游发出的 DATA 尊重对端 WINDOW_UPDATE；首个交付物允许粗粒度流控实现（文档化），只要不使典型客户端死锁。
+- 下游请求必须带 `:authority`；存在时用作 SNI/HAR 主机。
 
-### HAR record additions (backward compatible)
+### HAR 记录新增（向后兼容）
 
-- `alpn` becomes `"h2"` / `"http/1.1"` / `"grpc"` as negotiated.
-- `httpVersion` is `"HTTP/2"` for h2 streams.
-- New `_sandboxie` fields: `streamId`, `grpcStatus`, `grpcMessage`, `wsTunnelBytesIn`, `wsTunnelBytesOut`, `decodeError` (set when HPACK/frame parsing failed but the connection was not torn down).
+- `alpn` 按协商结果变为 `"h2"` / `"http/1.1"` / `"grpc"`。
+- h2 流的 `httpVersion` 为 `"HTTP/2"`。
+- 新 `_sandboxie` 字段：`streamId`、`grpcStatus`、`grpcMessage`、`wsTunnelBytesIn`、`wsTunnelBytesOut`、`decodeError`（HPACK/帧解析失败但连接未拆除时置位）。
 
 ---
 
-## Control wire
+## 控制线格式
 
-No new message IDs. The only deferred additions (Slice 7, key-log) are:
+无新消息 ID。唯一推迟的增补（Slice 7，key-log）是：
 
 ```c
-#define CAPTURE_FLAG_KEYLOG             0x00000010  /* broker writes SSLKEYLOGFILE */
-#define MSGID_CAPTURE_SET_KEYLOG_EXPORT 0x200B      /* caller-opened key-log file handle */
+#define CAPTURE_FLAG_KEYLOG             0x00000010  /* broker 写 SSLKEYLOGFILE */
+#define MSGID_CAPTURE_SET_KEYLOG_EXPORT 0x200B      /* 调用方打开的 key-log 文件句柄 */
 ```
 
-These are not implemented until the broker key-log path is proven; unknown flag bits still return `STATUS_INVALID_PARAMETER` before then.
+在 broker key-log 路径被证明可用之前不实现；此前未知标志位仍返回 `STATUS_INVALID_PARAMETER`。
 
 ---
 
-## Slice-by-slice plan
+## 逐 slice 计划
 
-Each slice is one logical commit. Do not advertise anything new until Slice 9.
+每个 slice 是一个逻辑提交。Slice 9 之前不通告任何新东西。
 
-### Slice 0 — Plan only
+### Slice 0 — 仅计划
 
-This file. No code.
+本文件。无代码。
 
-### Slice 1 — HPACK codec (RFC 7541)
+### Slice 1 — HPACK 编解码器（RFC 7541）
 
-**Objective:** Deterministic user-mode tests for HPACK decode + encode.
+**目标：** HPACK 解码 + 编码的确定性用户态测试。
 
-**Files:** `SandboxieTools/SbieCapture/hpack.h` / `hpack.c`, `SandboxieTools/HpackTests/` (+ `build_hpack_tests.cmd`).
+**文件：** `SandboxieTools/SbieCapture/hpack.h` / `hpack.c`、`SandboxieTools/HpackTests/`（+ `build_hpack_tests.cmd`）。
 
-**Behaviour:** decode RFC 7541 Appendix C header blocks into name/value pairs; encode back; dynamic-table eviction; Huffman round-trip; reject malformed integers/strings. No sockets, no TLS.
+**行为：** 把 RFC 7541 附录 C 头块解码为名/值对；再编码回去；动态表淘汰；Huffman 往返；拒绝畸形整数/字符串。无 sockets、无 TLS。
 
-**Verify:** `HpackTests.exe` prints `hpack tests passed`; all Appendix C vectors match.
+**验证：** `HpackTests.exe` 打印 `hpack tests passed`；全部附录 C 向量匹配。
 
-### Slice 2 — HTTP/2 frame codec
+### Slice 2 — HTTP/2 帧编解码器
 
-**Objective:** Parse and serialize HTTP/2 frames and a per-connection stream table.
+**目标：** 解析与序列化 HTTP/2 帧，以及每连接流表。
 
-**Files:** `SandboxieTools/SbieCapture/http2.h` / `http2.c`, `SandboxieTools/Http2Tests/`.
+**文件：** `SandboxieTools/SbieCapture/http2.h` / `http2.c`、`SandboxieTools/Http2Tests/`。
 
-**Behaviour:** header parse/serialize with bounds; SETTINGS/WINDOW_UPDATE/PING/GOAWAY/RST_STREAM; HEADERS+CONTINUATION reassembly; DATA accumulation with flow-control accounting; stream state (idle/open/half-closed/closed). No sockets.
+**行为：** 带边界检查的头解析/序列化；SETTINGS/WINDOW_UPDATE/PING/GOAWAY/RST_STREAM；HEADERS+CONTINUATION 重组；带流控记账的 DATA 累积；流状态（idle/open/half-closed/closed）。无 sockets。
 
-**Verify:** `Http2Tests.exe` passes; malformed frames are rejected without overrun.
+**验证：** `Http2Tests.exe` 通过；畸形帧被拒绝且不越界。
 
-### Slice 3 — HTTP/1.1 chunked + keep-alive (relay hardening)
+### Slice 3 — HTTP/1.1 chunked + keep-alive（中继加固）
 
-**Objective:** Close the two Phase 4 relay gaps that h2→h1 and WebSocket depend on.
+**目标：** 关闭 h2→h1 与 WebSocket 依赖的两个 Phase 4 中继缺口。
 
-**Files:** `http11.c` / `http11.h` (chunked framing helpers), `https_mitm.c` (`HttpsMitm_ReadMessage` → chunked + multiple exchanges), `HarTests` + `HttpsMitmTests` additions.
+**文件：** `http11.c` / `http11.h`（chunked 帧辅助函数）、`https_mitm.c`（`HttpsMitm_ReadMessage` → chunked + 多次交换）、`HarTests` + `HttpsMitmTests` 增补。
 
-**Behaviour:** decode chunked request/response bodies; loop `ServeOnce` over keep-alive exchanges until close; preserve Phase 4 single-exchange tests.
+**行为：** 解码 chunked 请求/响应正文；`ServeOnce` 在 keep-alive 交换上循环直至关闭；保留 Phase 4 单交换测试。
 
-**Verify:** existing `HarTests` / `HttpsMitmTests` stay green; new chunked + two-exchange-in-one-connection tests pass.
+**验证：** 既有 `HarTests` / `HttpsMitmTests` 保持绿；新 chunked + 单连接两次交换测试通过。
 
-### Slice 4 — WebSocket upgrade tunnel
+### Slice 4 — WebSocket 升级隧道
 
-**Objective:** Detect and tunnel WebSocket over HTTP/1.1.
+**目标：** 检测并隧道转发基于 HTTP/1.1 的 WebSocket。
 
-**Files:** `https_mitm.c` (upgrade detect + relay), `har.c` (ws byte-count fields), `HttpsMitmTests` additions.
+**文件：** `https_mitm.c`（升级检测 + 中继）、`har.c`（ws 字节计数字段）、`HttpsMitmTests` 增补。
 
-**Behaviour:** after a valid 101, stop HTTP parsing and relay bytes bidirectionally until either side closes; record handshake + tunneled byte counts in HAR. No message decode.
+**行为：** 有效 101 之后停止 HTTP 解析，双向中继字节直至任一侧关闭；HAR 记录握手 + 隧道字节计数。不做消息解码。
 
-**Verify:** loopback WebSocket handshake test tunnels N bytes both ways; HAR shows `wsTunnelBytesIn/Out` and no body decode.
+**验证：** loopback WebSocket 握手测试双向隧道 N 字节；HAR 显示 `wsTunnelBytesIn/Out` 且无正文解码。
 
-### Slice 5 — HTTP/2 downstream termination → HAR (upstream h1)
+### Slice 5 — HTTP/2 下游终止 → HAR（上游 h1）
 
-**Objective:** Advertise `h2` and decode downstream HTTP/2 into HAR via h1 upstream.
+**目标：** 通告 `h2` 并通过 h1 上游把下游 HTTP/2 解码进 HAR。
 
-**Files:** `https_mitm.c` (ALPN offers `h2`; new h2 relay path), new `http2_relay.c` (or inside `https_mitm.c`), `har.c` (h2 fields), `HttpsMitmTests` h2-client additions.
+**文件：** `https_mitm.c`（ALPN 提供 `h2`；新 h2 中继路径）、新 `http2_relay.c`（或并入 `https_mitm.c`）、`har.c`（h2 字段）、`HttpsMitmTests` h2 客户端增补。
 
-**Behaviour:** full downstream h2 termination, pseudo-header → request-line translation, upstream h1, h1 response → h2 HEADERS/DATA, one HAR entry per stream, redaction applied, bodies opt-in.
+**行为：** 完整下游 h2 终止、伪头 → 请求行翻译、上游 h1、h1 响应 → h2 HEADERS/DATA、每流一条 HAR 条目、应用脱敏、正文 opt-in。
 
-**Verify:** an h2 client (curl `--http2` or a small test h2 client) against a local h1 upstream produces correct HAR; h1-only clients still work; pinning/handshake failures still retain PCAPNG.
+**验证：** 针对本地 h1 上游的 h2 客户端（curl `--http2` 或小型测试 h2 客户端）产生正确 HAR；纯 h1 客户端仍可用；pinning/握手失败仍保留 PCAPNG。
 
-### Slice 6 — h2 → h2 upstream + gRPC stream capture
+### Slice 6 — h2 → h2 上游 + gRPC 流捕获
 
-**Objective:** Upstream ALPN offers `h2`; when negotiated, h2 upstream; recognize gRPC.
+**目标：** 上游 ALPN 提供 `h2`；协商成功则 h2 上游；识别 gRPC。
 
-**Files:** `https_mitm.c` (upstream ALPN), `http2_relay.c` (upstream h2 + gRPC detection), `har.c` (grpc fields), `HttpsMitmTests` + a small gRPC echo fixture.
+**文件：** `https_mitm.c`（上游 ALPN）、`http2_relay.c`（上游 h2 + gRPC 检测）、`har.c`（grpc 字段）、`HttpsMitmTests` + 小型 gRPC echo fixture。
 
-**Behaviour:** upstream h2 for fidelity; `application/grpc` streams recorded with `:path`, headers, `grpc-status`/`grpc-message` trailers, and message count; body tunneled (opt-in bytes) without protobuf.
+**行为：** 上游 h2 保真；`application/grpc` 流记录 `:path`、头、`grpc-status`/`grpc-message` trailers 与消息计数；正文隧道转发（opt-in 字节）但不做 protobuf。
 
-**Verify:** local gRPC echo round-trips; HAR has `grpcStatus=0` and correct method; a non-gRPC h2 upstream still produces clean HAR.
+**验证：** 本地 gRPC echo 往返；HAR 有 `grpcStatus=0` 与正确方法；非 gRPC 的 h2 上游仍产出干净 HAR。
 
-### Slice 7 — TLS key-log export
+### Slice 7 — TLS key-log 导出
 
-**Objective:** Emit `CLIENT_RANDOM` key-log lines for Wireshark.
+**目标：** 为 Wireshark 输出 `CLIENT_RANDOM` key-log 行。
 
-**Files:** `https_mitm.c` (`SSL_CTX_set_keylog_callback` on both contexts), `capture_https_broker.c` / `main.c` (key-log handle/path plumbing), `HttpsMitmTests` additions.
+**文件：** `https_mitm.c`（两个上下文都挂 `SSL_CTX_set_keylog_callback`）、`capture_https_broker.c` / `main.c`（key-log 句柄/路径管道）、`HttpsMitmTests` 增补。
 
-**Behaviour:** on `CAPTURE_FLAG_KEYLOG`, append `CLIENT_RANDOM <hex> <hex>` per handshake to the caller-opened file; no key-log otherwise.
+**行为：** 在 `CAPTURE_FLAG_KEYLOG` 下，每次握手向调用方打开的文件追加 `CLIENT_RANDOM <hex> <hex>`；否则无 key-log。
 
-**Verify:** a loopback MITM session writes ≥2 `CLIENT_RANDOM` lines; Wireshark opens the Phase 4 PCAPNG with the key-log and decrypts.
+**验证：** loopback MITM 会话写出 ≥2 条 `CLIENT_RANDOM` 行；Wireshark 用 key-log 打开 Phase 4 PCAPNG 并解密。
 
-### Slice 8 — Firefox/NSS trust
+### Slice 8 — Firefox/NSS 信任
 
-**Objective:** Boxed Firefox trusts the session CA, opt-in, boxed-profile-only.
+**目标：** boxed Firefox 信任会话 CA，opt-in、仅限 boxed profile。
 
-**Files:** a small helper (extend `SbieCapture --import-ca` or a script) for `security.enterprise_roots.enabled` and optional `certutil` cert9.db injection; `Docs/SandboxCaptureMcp.md` guidance.
+**文件：** 小型辅助（扩展现有 `SbieCapture --import-ca` 或脚本）实现 `security.enterprise_roots.enabled` 与可选 `certutil` cert9.db 注入；`Docs/SandboxCaptureMcp.md` 指南。
 
-**Verify (live):** boxed Firefox loads `https://example.com` with the CA imported once (host Root already has it from Phase 4); host Firefox profile and NSS files hash-unchanged; removal/restart behaviour documented.
+**验证（实机）：** boxed Firefox 在 CA 导入一次后加载 `https://example.com`（宿主 Root 已有 Phase 4 的 CA）；宿主 Firefox profile 与 NSS 文件 hash 不变；移除/重启行为已文档化。
 
-### Slice 9 — Live isolation + docs
+### Slice 9 — 实机隔离 + 文档
 
-**Objective:** Prove no isolation regression, then update status docs.
+**目标：** 证明无隔离回归，然后更新状态文档。
 
-**Tests:** re-run the Phase 4 Slice 8 live isolation suite (Box A / Box B / host, pinning, broker kill, cross-SID) plus new h2/ws/grpc probes inside a box. Update `Docs/SandboxCaptureMcp.md` (Phase 5 status), `CHANGELOG.md`. Only then decide whether Firefox/key-log warrant new capability bits or MCP flags.
+**测试：** 重跑 Phase 4 Slice 8 实机隔离套件（Box A / Box B / 宿主、pinning、broker 击杀、cross-SID），外加盒内新的 h2/ws/grpc 探针。更新 `Docs/SandboxCaptureMcp.md`（Phase 5 状态）、`CHANGELOG.md`。之后才决定 Firefox/key-log 是否需要新能力位或 MCP 标志。
 
-**Verify:** Phase 4 isolation still 11/11; new h2/ws/grpc traffic appears only in the selected box's HAR; `git diff --check` clean.
+**验证：** Phase 4 隔离仍 11/11；新 h2/ws/grpc 流量只出现在选定盒的 HAR 中；`git diff --check` 干净。
 
 ---
 
-## Files likely to change
+## 可能变更的文件
 
-### New
+### 新增
 
 - `SandboxieTools/SbieCapture/hpack.h` / `hpack.c`
 - `SandboxieTools/SbieCapture/http2.h` / `http2.c`
-- `SandboxieTools/SbieCapture/http2_relay.c` (and header if needed)
+- `SandboxieTools/SbieCapture/http2_relay.c`（必要时带头文件）
 - `SandboxieTools/HpackTests/`
 - `SandboxieTools/Http2Tests/`
-- `Docs/Phase5ProtocolExpansion.md` — this file
+- `Docs/Phase5ProtocolExpansion.md` — 本文件
 
-### Modify
+### 修改
 
-- `SandboxieTools/SbieCapture/https_mitm.c` / `https_mitm.h` — ALPN h2, h2 relay, WebSocket, key-log
-- `SandboxieTools/SbieCapture/http11.c` / `http11.h` — chunked helpers
-- `SandboxieTools/SbieCapture/har.c` / `har.h` — h2/ws/grpc fields
-- `SandboxieTools/SbieCapture/capture_https_broker.c` / `main.c` — key-log handle (Slice 7)
-- `SandboxieTools/HttpsMitmTests/`, `HarTests/` — new cases
-- `Docs/SandboxCaptureMcp.md`, `CHANGELOG.md` — after the backend is real
+- `SandboxieTools/SbieCapture/https_mitm.c` / `https_mitm.h` — ALPN h2、h2 中继、WebSocket、key-log
+- `SandboxieTools/SbieCapture/http11.c` / `http11.h` — chunked 辅助函数
+- `SandboxieTools/SbieCapture/har.c` / `har.h` — h2/ws/grpc 字段
+- `SandboxieTools/SbieCapture/capture_https_broker.c` / `main.c` — key-log 句柄（Slice 7）
+- `SandboxieTools/HttpsMitmTests/`、`HarTests/` — 新用例
+- `Docs/SandboxCaptureMcp.md`、`CHANGELOG.md` — 后端真实落地之后
 
-### Do not touch unless a compile forces it
+### 除非编译强制，否则不触碰
 
-- `SbieDrv` / `SbieSvc` / `capture.c` / `wfp.c` / `api_defs.h` / `msgids.h` (except Slice 7's deferred flag/msgid, and only then after broker proof)
-- `NetworkAccess` permit/block logic
-- `CCaptureView` / `CPacketCaptureView` / `CHttpsCaptureView` behaviour (SandMan UI is out of Phase 5 scope unless explicitly requested)
-- installer packaging / signing / ARM64 defaults
-
----
-
-## Explicitly out of scope
-
-- QUIC termination and HTTP/3 parsing (evaluate only; UDP 443 stays ciphertext on the Phase 3 passive path)
-- Protobuf decoding of gRPC bodies (needs descriptors)
-- WebSocket per-message framing/decoding
-- Per-stream body content beyond the existing opt-in + cap
-- New advertised capability bits before Slice 9 live proof
-- Win7 SOCKS5 capture fallback
-- Machine-wide sniffing
-- Official EV signing, ARM64 full link, installer packaging
+- `SbieDrv` / `SbieSvc` / `capture.c` / `wfp.c` / `api_defs.h` / `msgids.h`（Slice 7 推迟的标志/消息 ID 除外，且须在 broker 证明之后）
+- `NetworkAccess` 允许/拒绝逻辑
+- `CCaptureView` / `CPacketCaptureView` / `CHttpsCaptureView` 行为（SandMan UI 不在 Phase 5 范围，除非明确要求）
+- 安装器打包 / 签名 / ARM64 默认值
 
 ---
 
-## Risks
+## 明确排除在范围之外
 
-| Risk | Mitigation |
+- QUIC 终止与 HTTP/3 解析（仅评估；UDP 443 在 Phase 3 被动路径上保持密文）
+- gRPC 正文的 protobuf 解码（需要描述符）
+- WebSocket 逐消息帧/解码
+- 超出既有 opt-in + 上限的逐流正文内容
+- Slice 9 实机证明前的新通告能力位
+- Win7 SOCKS5 捕获回退
+- 机器级嗅探
+- 官方 EV 签名、ARM64 完整链接、安装器打包
+
+---
+
+## 风险
+
+| 风险 | 缓解 |
 | --- | --- |
-| Hand-rolled HPACK/Huffman is large and bug-prone | Appendix C vectors + fuzz-ish malformed inputs; nghttp2 as documented fallback |
-| h2 multiplexing rewrites the single-exchange relay | Keep the h1 path intact; h2 is a separate relay path; regression-run Phase 4 tests every slice |
-| h2→h1 translation loses semantics (cookies, ordering, connection headers) | Strip connection-specific headers; document; h2→h2 upstream in Slice 6 restores fidelity |
-| Flow-control deadlock on downstream DATA | Coarse window accounting first; verify with a real browser client before claiming h2 works |
-| Firefox enterprise-roots changes trust scope beyond our CA | Boxed-profile-only preference; verify host profile + NSS hashes unchanged |
-| Key-log leaks session keys on disk | Explicit opt-in; caller-opened file; documented risk (standard Wireshark workflow) |
-| New parser crashes the broker | All parsers fuzz-bounded in unit tests before live; broker runs in the existing kill-on-close job |
+| 手写 HPACK/Huffman 体量大且易错 | 附录 C 向量 + 类模糊畸形输入；nghttp2 作为文档化回退 |
+| h2 多路复用重写单交换中继 | 保持 h1 路径完好；h2 是独立中继路径；每个 slice 回归跑 Phase 4 测试 |
+| h2→h1 翻译丢失语义（cookie、顺序、connection 头） | 剥离 connection 专属头；文档化；Slice 6 的 h2→h2 上游恢复保真 |
+| 下游 DATA 流控死锁 | 先做粗粒度窗口记账；声称 h2 可用前用真实浏览器客户端验证 |
+| Firefox enterprise-roots 把信任范围扩大到我们的 CA 之外 | 仅 boxed profile 的偏好；验证宿主 profile + NSS hash 不变 |
+| key-log 在磁盘泄漏会话密钥 | 显式 opt-in；调用方打开的文件；文档化风险（标准 Wireshark 工作流） |
+| 新解析器使 broker 崩溃 | 所有解析器在实机前于单元测试中做模糊边界测试；broker 运行在既有 kill-on-close job 中 |
 
 ---
 
-## Open questions (do not block Slice 1–2)
+## 开放问题（不阻塞 Slice 1–2）
 
-1. **Hand-roll HPACK vs nghttp2.** Default is hand-rolled for reviewability, matching Phase 4's no-library convention. If the Huffman table + codec balloons past ~1,500 lines or tests get flaky, switch to nghttp2 (link into `SbieCapture.exe` only) and note it here.
-2. **h2→h2 upstream priority.** Slice 6 (h2→h2 + gRPC) is the largest slice. Confirm with the user whether gRPC is a hard Phase 5 requirement or can slip to Phase 5.1; if it slips, Slice 5 (h2→h1) still delivers HTTP/2 inspection for browsers/curl.
-3. **Firefox mechanism.** `security.enterprise_roots.enabled` is the least invasive but trusts the whole host Root store; `certutil` cert9.db injection is more targeted but needs NSS tools in the box. Decide which is the MVP during Slice 8.
-4. **Key-log surface.** Whether key-log needs a new SET-export message or can ride on an existing handle is decided in Slice 7 after the broker callback works.
+1. **手写 HPACK 还是 nghttp2。** 默认手写以保证可审查性，延续 Phase 4 的不用库约定。若 Huffman 表 + 编解码器膨胀超过约 1,500 行或测试变得不稳定，切换到 nghttp2（仅链接进 `SbieCapture.exe`）并在此注明。
+2. **h2→h2 上游优先级。** Slice 6（h2→h2 + gRPC）是最大的 slice。与用户确认 gRPC 是 Phase 5 硬性要求还是可以滑到 Phase 5.1；若滑期，Slice 5（h2→h1）仍为浏览器/curl 交付 HTTP/2 检查。
+3. **Firefox 机制。** `security.enterprise_roots.enabled` 侵入最小但信任整个宿主 Root store；`certutil` cert9.db 注入更精准但盒内需要 NSS 工具。Slice 8 期间决定哪个是 MVP。
+4. **key-log 面。** key-log 需要新 SET-export 消息还是可复用既有句柄，在 Slice 7 broker 回调可用后决定。

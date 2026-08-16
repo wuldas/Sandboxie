@@ -1,60 +1,60 @@
-# Phase 3: Passive Packet Capture Implementation Plan
+# Phase 3：被动包捕获实施计划
 
-> **For Hermes:** Implement only after the user accepts this plan and, if they want the usual stage gate, after this file is committed alone. Do not mix implementation into the plan commit. Do not `git reset` / `git clean`. Do not start HTTPS / Phase 4.
+> **给 Hermes 的指示：** 仅在用户接受本计划后实施；如果用户需要常规的阶段门控，则在本文件单独提交之后实施。不要把实现混入计划提交。不要执行 `git reset` / `git clean`。不要开始 HTTPS / Phase 4。
 
-**Goal:** Deliver the full Phase 3 in `Docs/SandboxCaptureMcp.md`: TCP stream, UDP datagram, and transport capture, PCAPNG with IPv4/IPv6 plus per-process metadata, snap length, file rotation, time limits, and a SandMan Packet Capture view. Exit: Wireshark/tshark opens the file and it contains no host / other-box / other-SID / other-session traffic.
+**目标：** 交付 `Docs/SandboxCaptureMcp.md` 中的完整 Phase 3：TCP 流、UDP 数据报与传输捕获、带 IPv4/IPv6 与每进程元数据的 PCAPNG、快照长度、文件轮转、时间限制，以及 SandMan Packet Capture 视图。退出标准：Wireshark/tshark 可打开文件，且其中不含宿主 / 其它盒 / 其它 SID / 其它会话的流量。
 
-**Architecture:** Keep Phase 2 ALE connection-audit exactly as-is. Add a second, inspect-only WFP path: `ALE_FLOW_ESTABLISHED` binds a fixed flow context; `INBOUND/OUTBOUND_TRANSPORT` copies packet-shaped bytes into a bounded nonpaged ring; `STREAM` and `DATAGRAM_DATA` copy application bytes into a parallel bounded ring. `SbieCaptureBroker` (`SbieCapture.exe`) is the only payload consumer and the only PCAPNG writer. `SbieDrv` / `SbieSvc` never parse packet, TLS, or HTTP bytes. Capability bits stay clear until Box A / Box B / host isolation passes against a live driver.
+**架构：** Phase 2 ALE 连接审计完全保持原样。新增第二条仅检查的 WFP 路径：`ALE_FLOW_ESTABLISHED` 绑定固定流上下文；`INBOUND/OUTBOUND_TRANSPORT` 把包形字节复制进有界非分页环；`STREAM` 与 `DATAGRAM_DATA` 把应用字节复制进并行的有界环。`SbieCaptureBroker`（`SbieCapture.exe`）是唯一载荷消费者与唯一 PCAPNG 写入器。`SbieDrv` / `SbieSvc` 绝不解析包、TLS 或 HTTP 字节。能力位在 Box A / Box B / 宿主隔离对实机驱动通过之前保持关闭。
 
-**Tech Stack:** Existing SbieDrv WFP (`FwpsCalloutRegister1`, Windows 7), dual-compile C queues, SbieSvc CaptureServer LPC (`MSGID_CAPTURE` 0x2000), QSbieAPI non-virtual wrappers, new `SbieCapture.exe` under `SandboxieTools`, SandMan Qt 6.8.3 MSVC view. Personal host: x64 only, WDK test certificate, no official signing, no ARM64 full link.
-
----
-
-## Locked decisions
-
-These are not open questions. Do not re-litigate them while implementing.
-
-1. **Transport is the only PCAPNG source.** Stream/datagram records must not be written as extra packets. Otherwise UDP appears twice.
-2. **New classify functions.** Do not reuse `WFP_classify`. That function is registered on `FWP_ACTION_CALLOUT_TERMINATING` ALE filters and writes permit/block. Packet/flow/stream/datagram callouts are `FWP_ACTION_CALLOUT_INSPECTION` and must never change the verdict.
-3. **Inbound without flow context is not captured.** Do not invent a PID from the packet. Drop that classify as “no capture”, not as a network block.
-4. **Independent packet/stream queues.** Do not enlarge or reuse `CAPTURE_QUEUE_RECORD` (80 bytes) or `API_CAPTURE_READ`. Connection-audit drain stays exclusive to SbieSvc and 32×80-byte batches.
-5. **SbieSvc is control plane only for payloads.** It starts/stops sessions, authorizes the owner, duplicates the caller’s file handle and a driver section handle into the broker. It does not memcpy packet bytes and does not parse them.
-6. **Broker does not open `\\Device\\SandboxieDriverApi`.** SbieSvc is still the only driver client. The broker maps a section handle it inherited.
-7. **Caller opens the first output file.** LocalSystem never creates or overwrites a client-supplied path. Rotation files are created by the broker under the caller’s token in the same directory as that first file.
-8. **Capability bits stay off** (`CAPTURE_CAP_PACKET_CAPTURE`, `CAPTURE_CAP_PCAPNG_EXPORT`) until live isolation and churn tests pass. Until then `CAPTURE_MODE_PACKETS` remains `STATUS_NOT_SUPPORTED` on the public start path (a private/test start is allowed behind an explicit internal flag only if needed for bring-up, and must not be advertised).
-9. **New SandMan view.** `CPacketCaptureView` / `CPacketCaptureWindow`. Do not reuse `CCaptureView` or `CTraceEntry`. Do not change Connection Audit behaviour, filters, CSV, or context menus except to add *separate* Packet Capture actions.
-10. **QSbieAPI stays non-virtual.** Append fields to `SSbieCaptureStart` / add new non-virtual methods. Do not insert virtuals on `CSbieAPI`.
-11. **Wire v1 trailing fields.** Do not bump `CAPTURE_WIRE_VERSION` unless a breaking change is unavoidable. Old `CAPTURE_START_REQ` (112 bytes) must still start connection-audit.
-12. **Personal host constraints:** no ARM64 full link, no official driver signing, no `git reset` / `git clean`, keep `NetworkEnableWFP=y`, do not use installed `Start.exe`, and do not load parsers/OpenSSL into `SbieDrv`/`SbieSvc`. The user has explicitly authorized x64 driver replacement, reboot, and controlled `DefaultBox` changes for Slice 8; every live change still requires a rollback path and post-reboot hash check.
+**技术栈：** 现有 SbieDrv WFP（`FwpsCalloutRegister1`，Windows 7）、双编译 C 队列、SbieSvc CaptureServer LPC（`MSGID_CAPTURE` 0x2000）、QSbieAPI 非虚包装、`SandboxieTools` 下新 `SbieCapture.exe`、SandMan Qt 6.8.3 MSVC 视图。个人宿主：仅 x64、WDK 测试证书、无官方签名、无 ARM64 完整链接。
 
 ---
 
-## Current baseline (do not regress)
+## 已锁定的决策
 
-| Piece | Today |
+以下不是开放问题。实现过程中不得重新争论。
+
+1. **传输层是唯一 PCAPNG 来源。** 流/数据报记录不得作为额外包写入。否则 UDP 会出现两次。
+2. **新的 classify 函数。** 不要复用 `WFP_classify`。该函数注册在 `FWP_ACTION_CALLOUT_TERMINATING` 的 ALE 过滤器上并写允许/拒绝。包/流/传输/数据报 callout 是 `FWP_ACTION_CALLOUT_INSPECTION`，绝不改变裁决。
+3. **无流上下文的入站不捕获。** 不要从包中臆造 PID。把该 classify 当作"不捕获"丢弃，而非网络阻断。
+4. **独立的包/流队列。** 不要扩大或复用 `CAPTURE_QUEUE_RECORD`（80 字节）或 `API_CAPTURE_READ`。连接审计排空仍仅限 SbieSvc 且为 32×80 字节批次。
+5. **对载荷而言 SbieSvc 只是控制面。** 它启停会话、授权所有者、把调用方的文件句柄与驱动 section 句柄复制进 broker。它不 memcpy 包字节也不解析它们。
+6. **broker 不打开 `\\Device\\SandboxieDriverApi`。** SbieSvc 仍是唯一驱动客户端。broker 映射它继承的 section 句柄。
+7. **调用方打开第一个输出文件。** LocalSystem 绝不创建或覆盖客户端提供的路径。轮转文件由 broker 在调用方令牌下创建于该第一个文件的同一目录。
+8. **能力位保持关闭**（`CAPTURE_CAP_PACKET_CAPTURE`、`CAPTURE_CAP_PCAPNG_EXPORT`）直到实机隔离与进程更替测试通过。此前公开启动路径上 `CAPTURE_MODE_PACKETS` 保持 `STATUS_NOT_SUPPORTED`（仅在 bring-up 需要时允许在显式内部标志后做私有/测试启动，且不得通告）。
+9. **新 SandMan 视图。** `CPacketCaptureView` / `CPacketCaptureWindow`。不要复用 `CCaptureView` 或 `CTraceEntry`。除新增*独立* Packet Capture 动作外，不改变 Connection Audit 行为、过滤器、CSV 或上下文菜单。
+10. **QSbieAPI 保持非虚。** 向 `SSbieCaptureStart` 追加字段 / 追加新非虚方法。不要在 `CSbieAPI` 上插入虚函数。
+11. **Wire v1 尾部字段。** 除非不可避免的破坏性变更，否则不要提升 `CAPTURE_WIRE_VERSION`。旧 `CAPTURE_START_REQ`（112 字节）必须仍能启动连接审计。
+12. **个人宿主约束：** 无 ARM64 完整链接、无官方驱动签名、无 `git reset` / `git clean`、保持 `NetworkEnableWFP=y`、不使用已安装的 `Start.exe`、不把解析器/OpenSSL 加载进 `SbieDrv`/`SbieSvc`。用户已明确授权 Slice 8 的 x64 驱动更换、重启与受控 `DefaultBox` 改动；每次实机改动仍需回滚路径与重启后 hash 检查。
+
+---
+
+## 当前基线（不得回归）
+
+| 部件 | 现状 |
 | --- | --- |
-| ALE AUTH CONNECT/RECV_ACCEPT v4/v6 | Policy + 80-byte `connect_attempt` / `accept_attempt` |
-| `layerData` / `flowContext` | Ignored (`UNREFERENCED_PARAMETER`) |
-| `WFP_flow_delete` | Stub success |
-| Transport 5-tuple indexes | Already in `GetNetwork5TupleIndexesForLayer`, unused |
-| `capture_network.c` | IPv4 encode only |
-| Driver queue | 256 × 80 bytes, nonpaged, overwrite-oldest + drop |
+| ALE AUTH CONNECT/RECV_ACCEPT v4/v6 | 策略 + 80 字节 `connect_attempt` / `accept_attempt` |
+| `layerData` / `flowContext` | 忽略（`UNREFERENCED_PARAMETER`） |
+| `WFP_flow_delete` | Stub 成功 |
+| 传输 5 元组索引 | 已在 `GetNetwork5TupleIndexesForLayer`，未用 |
+| `capture_network.c` | 仅 IPv4 编码 |
+| 驱动队列 | 256 × 80 字节、非分页、覆盖最旧 + 丢弃 |
 | SbieSvc start | `mode & ~CONNECTIONS` → `STATUS_NOT_SUPPORTED` |
-| Caps | `CONTROL` + `CONNECTION_AUDIT` when WFP ready |
-| Broker | Does not exist |
-| SandMan | Connection Audit only |
+| 能力位 | WFP 就绪时 `CONTROL` + `CONNECTION_AUDIT` |
+| Broker | 不存在 |
+| SandMan | 仅 Connection Audit |
 | MCP `packetCapture` | false |
 
-Live-driver connection-audit isolation and process-churn already passed on this host. Treat those e2e scripts as a regression gate after every driver swap.
+实机驱动的连接审计隔离与进程更替已在本宿主通过。把这些 e2e 脚本视为每次驱动更换后的回归门。
 
 ---
 
-## Data path
+## 数据路径
 
 ```text
 boxed TCP/UDP
     |
-    +-- existing ALE AUTH -----> WFP_classify -----> 80-byte audit queue
+    +-- 既有 ALE AUTH -----> WFP_classify -----> 80 字节审计队列
     |                                                 |
     |                                                 v
     |                                          SbieSvc CaptureServer
@@ -63,173 +63,173 @@ boxed TCP/UDP
     |                                          Connection Audit UI / MCP
     |
     +-- ALE FLOW_ESTABLISHED --> WFP_flow_establish_classify
-    |                               FwpsFlowAssociateContext(fixed ctx)
+    |                               FwpsFlowAssociateContext(固定 ctx)
     |
     +-- TRANSPORT in/out -------> WFP_packet_classify
-    |                               copy NBL <= snaplen --> packet ring
+    |                               复制 NBL <= snaplen --> 包环
     |
     +-- STREAM / DATAGRAM ------> WFP_appdata_classify
-                                    copy app bytes <= snaplen --> stream ring
+                                    复制应用字节 <= snaplen --> 流环
 
 SbieSvc CaptureServer
-    |-- authorize owner (SID+session, box enabled, PID+createTime)
-    |-- API_CAPTURE_CONTROL start packet session
-    |-- spawn SbieCapture.exe in kill-on-close job, caller token
-    |-- DuplicateHandle(file) + DuplicateHandle(section) into broker
-    |-- stop / fail / owner disconnect => terminate job
+    |-- 授权所有者（SID+session、盒启用、PID+createTime）
+    |-- API_CAPTURE_CONTROL 启动包会话
+    |-- 在 kill-on-close job 中生成 SbieCapture.exe，调用方令牌
+    |-- DuplicateHandle(file) + DuplicateHandle(section) 进 broker
+    |-- stop / 失败 / 所有者断连 => 终止 job
 
 SbieCapture.exe
-    |-- map packet ring + stream ring
-    |-- write TRANSPORT records as PCAPNG EPB (LINKTYPE_RAW / 101)
-    |-- attach per-process metadata (PID, createTime, box, SID, session)
-    |-- rotate / stop on size and time
-    |-- never parse TLS/HTTP
+    |-- 映射包环 + 流环
+    |-- 把 TRANSPORT 记录写为 PCAPNG EPB（LINKTYPE_RAW / 101）
+    |-- 附加每进程元数据（PID、createTime、box、SID、session）
+    |-- 按大小与时间轮转 / 停止
+    |-- 绝不解析 TLS/HTTP
 ```
 
-### Flow context (fixed, nonpaged)
+### 流上下文（固定、非分页）
 
 ```text
-capture-generation / policy generation
-process id
-process creation time
-session id
-box name hash or inline box name (BOXNAME_COUNT)
-SID string or SID hash
-address family, protocol
-local/remote address[16], local/remote port
-direction
+捕获 generation / 策略 generation
+进程 id
+进程创建时间
+会话 id
+盒名 hash 或内联盒名（BOXNAME_COUNT）
+SID 字符串或 SID hash
+地址族、协议
+本地/远端地址[16]、本地/远端端口
+方向
 ```
 
-Copy the identity snapshot under the existing process/WFP lock, release that lock, then associate context. `WFP_flow_delete` frees the context. Cap live flow contexts (recommend 4096). On overflow: do not associate, do not capture that flow, do not touch permit/block.
+在既有进程/WFP 锁下复制身份快照、释放该锁、然后关联上下文。`WFP_flow_delete` 释放上下文。限制存活流上下文（建议 4096）。溢出时：不关联、不捕获该流、不触碰允许/拒绝。
 
-### Packet record (new queue)
+### 包记录（新队列）
 
-Fixed size = header + `CAPTURE_PACKET_SNAPLEN_MAX` (1514).
+固定大小 = 头 + `CAPTURE_PACKET_SNAPLEN_MAX`（1514）。
 
-Header must include: sequence, timestamp, PID, createTime, session, AF, proto, direction, local/remote endpoints, `original_length`, `captured_length`, layer (`transport` / `stream` / `datagram`), loopback, flags. Payload bytes follow. Session snaplen may be smaller than max; unused tail stays zero.
+头必须包含：序号、时间戳、PID、createTime、session、AF、proto、方向、本地/远端端点、`original_length`、`captured_length`、层（`transport` / `stream` / `datagram`）、loopback、标志。载荷字节随后。会话 snaplen 可小于最大值；未用尾部保持零。
 
-Recommend:
+建议：
 
-- packet ring capacity 4096
-- stream ring capacity 2048
-- max concurrent packet sessions: 2 per owner, 4 global
-- default snaplen 256 (headers + HTTP line / ClientHello SNI)
-- allowed snaplen 64..1514
-- default max file 64 MiB
-- default max time 300 s
-- `rotate_count = 0` means stop at the size limit; `N` keeps the last N files
+- 包环容量 4096
+- 流环容量 2048
+- 最大并发包会话：每所有者 2 个，全局 4 个
+- 默认 snaplen 256（头 + HTTP 行 / ClientHello SNI）
+- 允许 snaplen 64..1514
+- 默认最大文件 64 MiB
+- 默认最大时间 300 s
+- `rotate_count = 0` 表示到达大小限制即停止；`N` 保留最近 N 个文件
 
-Overflow overwrites the oldest record and saturates `dropped_count`. Never block the network. Never allocate on the classify path except by claiming a preallocated ring slot.
+溢出覆盖最旧记录并饱和 `dropped_count`。绝不阻断网络。除认领预分配环槽外，绝不在 classify 路径上分配。
 
-### Inbound transport copy
+### 入站传输复制
 
-`layerData` is `NET_BUFFER_LIST *`. Inbound transport NBL starts at the transport header. Use `FWPS_METADATA_FIELD_IP_HEADER_SIZE` (and transport header size when present), retreat, copy `min(snaplen, original)`, restore. Outbound typically already includes the IP header. Do not keep the NBL after classify returns. Do not clone-and-pend.
+`layerData` 是 `NET_BUFFER_LIST *`。入站传输 NBL 从传输头开始。用 `FWPS_METADATA_FIELD_IP_HEADER_SIZE`（存在时加传输头大小）回退、复制 `min(snaplen, original)`、恢复。出站通常已含 IP 头。classify 返回后不得保留 NBL。不要克隆并挂起。
 
-Stream classify uses `FWPS_STREAM_CALLOUT_IO_PACKET`. Copy then continue. Never `FWPS_STREAM_ACTION_NEED_MORE_DATA` in Phase 3 (that is Phase 4).
+流 classify 用 `FWPS_STREAM_CALLOUT_IO_PACKET`。复制后继续。Phase 3 中绝不 `FWPS_STREAM_ACTION_NEED_MORE_DATA`（那属于 Phase 4）。
 
 ---
 
-## Control wire
+## 控制线格式
 
-Keep family `0x2000`. Add:
+保持消息族 `0x2000`。新增：
 
 ```text
 MSGID_CAPTURE_SET_EXPORT   0x2007
 ```
 
-`0x20FF` remains disconnect notification.
+`0x20FF` 仍是断连通知。
 
-### `CAPTURE_START_REQ` trailing fields (after existing 112-byte v1)
+### `CAPTURE_START_REQ` 尾部字段（既有 112 字节 v1 之后）
 
 ```c
-ULONG snap_length;       /* 0 = default 256 */
-ULONG max_file_bytes;    /* 0 = default 64MiB */
-ULONG max_seconds;       /* 0 = default 300 */
-ULONG rotate_count;      /* 0 = stop at limit */
+ULONG snap_length;       /* 0 = 默认 256 */
+ULONG max_file_bytes;    /* 0 = 默认 64MiB */
+ULONG max_seconds;       /* 0 = 默认 300 */
+ULONG rotate_count;      /* 0 = 到达限制即停止 */
 ULONG reserved;
 ```
 
-Old clients send `struct_size == 112` and can only start `MODE_CONNECTIONS`. New packet start requires the extended size plus a successful `SET_EXPORT` before the session leaves `WAITING_FOR_BACKEND`.
+旧客户端发送 `struct_size == 112` 且只能启动 `MODE_CONNECTIONS`。新包启动要求扩展尺寸且会话离开 `WAITING_FOR_BACKEND` 前有一次成功的 `SET_EXPORT`。
 
 ### `CAPTURE_SET_EXPORT`
 
-Caller-relative file handle value + capture id. SbieSvc `DuplicateHandle` from the LPC client process. Reject if the handle is not a writable disk file, or if the process is sandboxed. No path string in the request.
+调用方相对文件句柄值 + 捕获 id。SbieSvc 从 LPC 客户端进程 `DuplicateHandle`。若句柄不是可写磁盘文件、或进程被沙箱化则拒绝。请求中无路径字符串。
 
-`CAPTURE_SESSION_INFO` already has `packet_count`, `byte_count`, `dropped_count`. Extend with trailing fields only if the UI needs current file index / current file bytes. Prefer putting those in status via reserved-then-trailing so old 184-byte info still parses.
+`CAPTURE_SESSION_INFO` 已有 `packet_count`、`byte_count`、`dropped_count`。仅当 UI 需要当前文件索引 / 当前文件字节数时才用尾部字段扩展。倾向把这些放进 status（reserved-后-尾部），使旧 184 字节 info 仍可解析。
 
-Do not add a “read packets over LPC” message. 64 KiB LPC cannot carry Baidu-rate traffic.
+不要加"经 LPC 读包"消息。64 KiB LPC 承载不了百度级流量。
 
 ---
 
-## Files likely to change
+## 可能变更的文件
 
-### New
+### 新增
 
 - `Sandboxie/core/drv/capture_packet.h`
-- `Sandboxie/core/drv/capture_packet.c` — ring + record (dual-compile, no `windows.h` in driver TU)
+- `Sandboxie/core/drv/capture_packet.c` — 环 + 记录（双编译，驱动 TU 无 `windows.h`）
 - `Sandboxie/core/drv/capture_stream.h`
-- `Sandboxie/core/drv/capture_stream.c` — stream/datagram ring (dual-compile)
+- `Sandboxie/core/drv/capture_stream.c` — 流/数据报环（双编译）
 - `SandboxieTools/SbieCapture/SbieCapture.vcxproj`
-- `SandboxieTools/SbieCapture/main.cpp` (or `.c`) — map rings, write PCAPNG, rotate, honor time/size
-- `SandboxieTools/SbieCapture/pcapng.c` + `pcapng.h` — no third-party lib
-- `SandboxieTools/PcapngTests/` — user-mode writer tests
+- `SandboxieTools/SbieCapture/main.cpp`（或 `.c`）— 映射环、写 PCAPNG、轮转、遵守时间/大小
+- `SandboxieTools/SbieCapture/pcapng.c` + `pcapng.h` — 无第三方库
+- `SandboxieTools/PcapngTests/` — 用户态写入器测试
 - `SandboxiePlus/SandMan/Views/PacketCaptureView.h`
 - `SandboxiePlus/SandMan/Views/PacketCaptureView.cpp`
 
-### Modify
+### 修改
 
-- `Sandboxie/core/drv/wfp.c` / `wfp.h` — new GUIDs, inspection callouts, split classify, implement `WFP_flow_delete`
-- `Sandboxie/core/drv/capture.c` / `capture.h` — packet-session start/stop, section objects, do not break ALE sessions
-- `Sandboxie/core/drv/api_defs.h` — `API_CAPTURE_MAP` or extend `API_CAPTURE_CONTROL` with a map operation; new packed structs; `C_ASSERT` sizes
-- `Sandboxie/core/drv/api.c` — register new API if added
-- `Sandboxie/core/drv/SboxDrv.vcxproj` — new ClCompile entries
-- `Sandboxie/core/drv/capture_network.c` / `.h` — IPv6 encode helper for tests if needed
+- `Sandboxie/core/drv/wfp.c` / `wfp.h` — 新 GUID、检查 callout、拆分 classify、实现 `WFP_flow_delete`
+- `Sandboxie/core/drv/capture.c` / `capture.h` — 包会话启停、section 对象、不破坏 ALE 会话
+- `Sandboxie/core/drv/api_defs.h` — `API_CAPTURE_MAP` 或给 `API_CAPTURE_CONTROL` 扩展映射操作；新打包结构；`C_ASSERT` 尺寸
+- `Sandboxie/core/drv/api.c` — 若新增则注册新 API
+- `Sandboxie/core/drv/SboxDrv.vcxproj` — 新 ClCompile 条目
+- `Sandboxie/core/drv/capture_network.c` / `.h` — 测试需要的 IPv6 编码辅助
 - `Sandboxie/core/svc/msgids.h` — `0x2007`
-- `Sandboxie/core/svc/capturewire.h` — trailing start fields, export req/rpl, static_asserts
-- `Sandboxie/core/svc/CaptureServer.cpp` — packet mode, broker job, handle duplication, still `NOT_SUPPORTED` until ready
-- `Sandboxie/core/dll/trace.c` — API name strings
+- `Sandboxie/core/svc/capturewire.h` — 尾部启动字段、导出请求/回复、static_asserts
+- `Sandboxie/core/svc/CaptureServer.cpp` — 包模式、broker job、句柄复制、就绪前仍 `NOT_SUPPORTED`
+- `Sandboxie/core/dll/trace.c` — API 名字符串
 - `SandboxiePlus/QSbieAPI/SbieCapture.h` / `SbieAPI.h` / `SbieAPI.cpp`
-- `SandboxiePlus/SbieMcp/main.cpp` — start args + still hide capability until tests pass
-- `SandboxiePlus/SandMan/SandMan.cpp` / `.h` / `SandMan.pri` — View menu, log tab, box/process context actions
-- `SandboxieTools/CaptureQueueTests/CaptureQueueTests.c` — packet/stream queue tests
-- `SandboxieTools/SandboxieTools.sln` — add SbieCapture + tests (x64 Release required; ARM64 configs may exist but this host does not build them)
-- `Docs/SandboxCaptureMcp.md` — status paragraph after the backend is real
-- `CHANGELOG.md` — after a working x64 path exists, not in the plan-only commit
+- `SandboxiePlus/SbieMcp/main.cpp` — 启动参数 + 测试通过前仍隐藏能力
+- `SandboxiePlus/SandMan/SandMan.cpp` / `.h` / `SandMan.pri` — View 菜单、日志标签页、盒/进程上下文动作
+- `SandboxieTools/CaptureQueueTests/CaptureQueueTests.c` — 包/流队列测试
+- `SandboxieTools/SandboxieTools.sln` — 添加 SbieCapture + 测试（x64 Release 必需；ARM64 配置可存在但本宿主不构建）
+- `Docs/SandboxCaptureMcp.md` — 后端真实落地后的状态段落
+- `CHANGELOG.md` — 在可用 x64 路径存在之后，而非仅计划提交中
 
-### Do not touch unless a compile forces it
+### 除非编译强制，否则不触碰
 
-- `CCaptureView.*` behaviour
-- `NetworkAccess` permit/block logic inside `WFP_classify`
-- `DefaultBox` / `Sandboxie.ini` contents
-- installer / official signing / ARM64 project defaults
+- `CCaptureView.*` 行为
+- `WFP_classify` 内部的 `NetworkAccess` 允许/拒绝逻辑
+- `DefaultBox` / `Sandboxie.ini` 内容
+- 安装器 / 官方签名 / ARM64 工程默认值
 
 ---
 
-## Slice-by-slice plan
+## 逐 slice 计划
 
-Implement in this order. Each slice is one logical commit. Do not advertise capability until Slice 8.
+按此顺序实现。每个 slice 是一个逻辑提交。Slice 8 之前不要通告能力。
 
-### Slice 0 — Plan only
+### Slice 0 — 仅计划
 
-This file. No code.
+本文件。无代码。
 
-### Slice 1 — User-mode PCAPNG writer + tests (no driver)
+### Slice 1 — 用户态 PCAPNG 写入器 + 测试（无驱动）
 
-**Objective:** A bounded writer that turns synthetic packet records into a file tshark can open.
+**目标：** 把合成包记录转成 tshark 可打开文件的有界写入器。
 
-**Files:** `SandboxieTools/SbieCapture/pcapng.*`, `SandboxieTools/PcapngTests/`
+**文件：** `SandboxieTools/SbieCapture/pcapng.*`、`SandboxieTools/PcapngTests/`
 
-**Behaviour:**
+**行为：**
 
-- SHB + IDB (`LINKTYPE_RAW` = 101)
-- One EPB per transport record
-- EPB comment or custom option: `pid=… createTime=… box=… sid=… session=…`
-- Snaplen respected; `original_length` vs `captured_length` both written
-- Rotation: close file, open next name, write a fresh SHB+IDB
-- Time/size stop
-- No protocol parsing
+- SHB + IDB（`LINKTYPE_RAW` = 101）
+- 每个传输记录一个 EPB
+- EPB 注释或自定义选项：`pid=… createTime=… box=… sid=… session=…`
+- 遵守 Snaplen；`original_length` 与 `captured_length` 都写入
+- 轮转：关闭文件、打开下一个名字、写全新 SHB+IDB
+- 时间/大小停止
+- 无协议解析
 
-**Verify:**
+**验证：**
 
 ```text
 cl /nologo /W4 /WX /DUNICODE /D_UNICODE PcapngTests.c pcapng.c
@@ -237,172 +237,172 @@ PcapngTests.exe
 tshark -r <out>.pcapng -T fields -e frame.number -e ip.src -e ip.dst -e tcp.dstport
 ```
 
-Expected: tshark exit 0, only the injected 5-tuples, no extra packets.
+预期：tshark 退出 0，只有注入的 5 元组，无额外包。
 
-### Slice 2 — Dual-compile packet/stream queues (no WFP yet)
+### Slice 2 — 双编译包/流队列（尚无 WFP）
 
-**Objective:** Fixed-capacity nonpaged-safe rings with push/drain/drop, same dual-compile rules as `capture_queue.c`.
+**目标：** 与 `capture_queue.c` 相同双编译规则的固定容量非分页安全环，带 push/drain/drop。
 
-**Files:** `capture_packet.*`, `capture_stream.*`, `CaptureQueueTests.c`, `SboxDrv.vcxproj`
+**文件：** `capture_packet.*`、`capture_stream.*`、`CaptureQueueTests.c`、`SboxDrv.vcxproj`
 
-**Rules:** Driver TU must not include `windows.h`. Detect `_NTDDK_` / `_NTIFS_` / `_WDMDDK_`. `/W4 /WX` user-mode tests.
+**规则：** 驱动 TU 不得包含 `windows.h`。检测 `_NTDDK_` / `_NTIFS_` / `_WDMDDK_`。`/W4 /WX` 用户态测试。
 
-**Verify:** overflow saturates drop, order preserved, snaplen clamp, remaining count, reset.
+**验证：** 溢出饱和 drop、顺序保留、snaplen 钳制、剩余计数、重置。
 
-### Slice 3 — Wire + QSbieAPI + MCP shapes (still NOT_SUPPORTED)
+### Slice 3 — 线格式 + QSbieAPI + MCP 形态（仍 NOT_SUPPORTED）
 
-**Objective:** Extended start fields, `MSGID_CAPTURE_SET_EXPORT`, QSbieAPI structs/methods, MCP argument validation. Service still returns `STATUS_NOT_SUPPORTED` for `MODE_PACKETS`. Capability bits still clear.
+**目标：** 扩展启动字段、`MSGID_CAPTURE_SET_EXPORT`、QSbieAPI 结构/方法、MCP 参数验证。服务对 `MODE_PACKETS` 仍返回 `STATUS_NOT_SUPPORTED`。能力位仍关闭。
 
-**Files:** `capturewire.h`, `msgids.h`, `CaptureServer.cpp` (parse-and-reject path only), `SbieCapture.h`, `SbieAPI.cpp`, `SbieMcp/main.cpp`
+**文件：** `capturewire.h`、`msgids.h`、`CaptureServer.cpp`（仅解析并拒绝路径）、`SbieCapture.h`、`SbieAPI.cpp`、`SbieMcp/main.cpp`
 
-**Verify:** existing connection-audit start/read still works against the current live driver. New packet start still `0xC00000BB`. `static_assert` sizes updated. No vtable change on `CSbieAPI`.
+**验证：** 既有连接审计启动/读取对当前实机驱动仍可用。新包启动仍 `0xC00000BB`。`static_assert` 尺寸更新。`CSbieAPI` 无 vtable 变化。
 
-### Slice 4 — SbieCapture.exe broker process (no live packets yet)
+### Slice 4 — SbieCapture.exe broker 进程（尚无实机包）
 
-**Objective:** Independently built x64 executable. Accept inherited handles (section + first file). Run as the caller. Enforce size/time/rotate. Exit when the section is closed or a stop event is signalled.
+**目标：** 独立构建的 x64 可执行文件。接受继承句柄（section + 第一个文件）。以调用方身份运行。执行大小/时间/轮转。section 关闭或 stop 事件发出时退出。
 
-**Files:** `SandboxieTools/SbieCapture/*`, `SandboxieTools.sln`
+**文件：** `SandboxieTools/SbieCapture/*`、`SandboxieTools.sln`
 
-**SbieSvc spawn rules (implemented in Slice 6, designed here):**
+**SbieSvc 生成规则（Slice 6 实现，此处设计）：**
 
-- Path is install-dir `SbieCapture.exe` only
-- Client cannot supply exe path or command line
+- 路径仅限安装目录 `SbieCapture.exe`
+- 客户端不能提供 exe 路径或命令行
 - Kill-on-close job
-- Caller primary token, not LocalSystem
-- stdin/stdout not a protocol surface
+- 调用方主令牌，而非 LocalSystem
+- stdin/stdout 不是协议面
 
-**Verify:** unit/harness with a fake mapped ring of Slice 2 records produces a tshark-readable PCAPNG and rotates.
+**验证：** 用 Slice 2 记录的假映射环做单元/harness，产出 tshark 可读 PCAPNG 并轮转。
 
-### Slice 5 — Driver inspection callouts (the dangerous slice)
+### Slice 5 — 驱动检查 callout（危险 slice）
 
-**Objective:** Register flow + transport + stream + datagram layers. Copy into the new rings. Do not change ALE policy.
+**目标：** 注册流 + 传输 + 流 + 数据报层。复制进新环。不改变 ALE 策略。
 
-**Files:** `wfp.c`, `wfp.h`, `capture.c`, `api_defs.h`
+**文件：** `wfp.c`、`wfp.h`、`capture.c`、`api_defs.h`
 
-**Required split:**
+**必需拆分：**
 
-| Callout | Layer | Action type | Classify |
+| Callout | 层 | 动作类型 | Classify |
 | --- | --- | --- | --- |
-| existing send/recv | ALE AUTH CONNECT/RECV_ACCEPT | TERMINATING (unchanged) | `WFP_classify` unchanged |
-| new | ALE FLOW_ESTABLISHED v4/v6 | INSPECTION | associate context only |
-| new | INBOUND/OUTBOUND TRANSPORT v4/v6 | INSPECTION | copy NBL to packet ring |
-| new | STREAM v4/v6 | INSPECTION | copy app bytes to stream ring |
-| new | DATAGRAM_DATA v4/v6 | INSPECTION | copy app bytes to stream ring |
+| 既有 send/recv | ALE AUTH CONNECT/RECV_ACCEPT | TERMINATING（不变） | `WFP_classify` 不变 |
+| 新 | ALE FLOW_ESTABLISHED v4/v6 | INSPECTION | 仅关联上下文 |
+| 新 | INBOUND/OUTBOUND TRANSPORT v4/v6 | INSPECTION | 复制 NBL 到包环 |
+| 新 | STREAM v4/v6 | INSPECTION | 复制应用字节到流环 |
+| 新 | DATAGRAM_DATA v4/v6 | INSPECTION | 复制应用字节到流环 |
 
-New GUIDs: follow the existing `0bf56435-71e4-4de7-bd0b-1af0b4cbb8f6` family; do not reuse ALE GUIDs.
+新 GUID：延续既有 `0bf56435-71e4-4de7-bd0b-1af0b4cbb8f6` 族；不复用 ALE GUID。
 
-`WFP_RegisterCallout` currently hardcodes `WFP_classify` and `FWP_ACTION_CALLOUT_TERMINATING`. Add a parameterised registrar. Unregister all new ids in `WFP_Uninstall_Callbacks`.
+`WFP_RegisterCallout` 目前硬编码 `WFP_classify` 与 `FWP_ACTION_CALLOUT_TERMINATING`。加参数化注册器。在 `WFP_Uninstall_Callbacks` 中注销全部新 id。
 
-Filter identity: reuse `CaptureFilter_Matches` (box + SID + session + PID + createTime + loopback flag). PID alone is never enough.
+过滤器身份：复用 `CaptureFilter_Matches`（盒 + SID + session + PID + createTime + loopback 标志）。仅 PID 永远不够。
 
-**Verify (compile only in this slice, unless a queued reboot is already planned):**
+**验证（本 slice 仅编译，除非已计划排队重启）：**
 
-- x64 `SbieDrv.sys` builds with WDK test signature
-- user-mode queue tests still pass
-- `git diff --check` clean
-- Do not claim “能抓包了”
+- x64 `SbieDrv.sys` 以 WDK 测试签名构建
+- 用户态队列测试仍通过
+- `git diff --check` 干净
+- 不要声称"能抓包了"
 
-Live load uses the existing `MoveFileEx(..., 5)` + reboot recipe in `sandboxie-core-build` `references/runtime-connection-audit.md`. Confirm SHA-256 after reboot. Then immediately re-run connection-audit `e2e_silent.py` — if that regresses, stop and fix before enabling packet start.
+实机加载使用 `sandboxie-core-build` `references/runtime-connection-audit.md` 中的既有 `MoveFileEx(..., 5)` + 重启配方。重启后确认 SHA-256。然后立即重跑连接审计 `e2e_silent.py`——若回归，先停止并修复再启用包启动。
 
-### Slice 6 — CaptureServer broker lifecycle
+### Slice 6 — CaptureServer broker 生命周期
 
-**Objective:** `MODE_PACKETS` start creates the driver packet session, maps the section, duplicates handles, spawns `SbieCapture.exe`, moves to `RUNNING` only when the broker is alive. Owner disconnect / stop / broker crash → `STOPPED` / `FAILED`, job killed, rings torn down. Network policy unchanged.
+**目标：** `MODE_PACKETS` 启动创建驱动包会话、映射 section、复制句柄、生成 `SbieCapture.exe`、仅当 broker 存活时进入 `RUNNING`。所有者断连 / stop / broker 崩溃 → `STOPPED` / `FAILED`、job 击杀、环拆除。网络策略不变。
 
-**Files:** `CaptureServer.cpp`, `api_defs.h`, `capture.c`
+**文件：** `CaptureServer.cpp`、`api_defs.h`、`capture.c`
 
-**Authorization:** identical to Phase 2. Sandboxed callers cannot start. Cross-SID / cross-session rejected. Process scope binds PID+createTime. Box scope requires `INCLUDE_FUTURE_PROCESSES`. Canonical box name (`DefaultBox`, not `defaultbox`).
+**授权：** 与 Phase 2 相同。沙箱化调用方不能启动。Cross-SID / cross-session 拒绝。进程作用域绑定 PID+createTime。盒作用域要求 `INCLUDE_FUTURE_PROCESSES`。规范盒名（`DefaultBox`，而非 `defaultbox`）。
 
-**Verify:** start without export handle stays `WAITING_FOR_BACKEND` or fails closed. Missing `SbieCapture.exe` → `FAILED`, not a successful running capture. Connection-audit sessions still start without a broker.
+**验证：** 无导出句柄的启动保持 `WAITING_FOR_BACKEND` 或 fail closed。缺 `SbieCapture.exe` → `FAILED`，而非成功的运行中捕获。无 broker 时连接审计会话仍可启动。
 
-### Slice 7 — SandMan Packet Capture view
+### Slice 7 — SandMan Packet Capture 视图
 
-**Objective:** A distinct view that can start a packet session, show a bounded packet table, and point at the PCAPNG output.
+**目标：** 可启动包会话、显示有界包表并指向 PCAPNG 输出的独立视图。
 
-**Files:** `PacketCaptureView.*`, `SandMan.cpp`, `SandMan.h`, `SandMan.pri`
+**文件：** `PacketCaptureView.*`、`SandMan.cpp`、`SandMan.h`、`SandMan.pri`
 
-**UI contract:**
+**UI 契约：**
 
-- `View → Packet Capture` and a log tab, separate from Connection Audit
-- Box combo uses `I.value()->GetName()`, never `I.key()`
-- Box context menu: Packet Capture (whole box + future processes)
-- Process context menu: Packet Capture for that PID+createTime only
-- Controls: snaplen, max time, max file size, rotate count, include loopback
-- User picks the output file *before* Start (so QSbieAPI can pass a handle)
-- Table columns: time, PID, process, proto, src, dst, orig len, captured len
-- Bounded UI queue (same idea as Connection Audit: cap pending, time-budgeted flush). No hex dump in the table
-- Status: packets / bytes / dropped / current file / “ciphertext for TLS; not HTTPS inspection”
-- Save is the PCAPNG the broker is already writing, not a CSV of metadata
-- Hide or disable Start until capability bits are on (Slice 8). Until then the view may exist but must not pretend the backend is ready
+- `View → Packet Capture` 与一个日志标签页，与 Connection Audit 分离
+- 盒下拉用 `I.value()->GetName()`，绝不用 `I.key()`
+- 盒上下文菜单：Packet Capture（整盒 + 未来进程）
+- 进程上下文菜单：仅该 PID+createTime 的 Packet Capture
+- 控件：snaplen、最大时间、最大文件大小、轮转数、包含 loopback
+- Start *之前*用户选择输出文件（这样 QSbieAPI 可传句柄）
+- 表列：时间、PID、进程、proto、src、dst、原始长度、捕获长度
+- 有界 UI 队列（与 Connection Audit 同思路：限制待处理、时间预算刷新）。表中无 hex dump
+- 状态：包数 / 字节数 / 丢弃数 / 当前文件 / "TLS 为密文；不是 HTTPS 检查"
+- Save 即 broker 已在写的 PCAPNG，而非元数据 CSV
+- 能力位开启（Slice 8）前隐藏或禁用 Start。此前视图可存在但不得假装后端就绪
 
-Deploy `SandMan.exe` **and** `QSbieAPI.dll` **and** `SbieCapture.exe` together. Community `vcvars64.bat`, not `qmake_plus.cmd`.
+`SandMan.exe` **和** `QSbieAPI.dll` **和** `SbieCapture.exe` 一起部署。Community `vcvars64.bat`，而非 `qmake_plus.cmd`。
 
-### Slice 8 — Live isolation, then capability bits
+### Slice 8 — 实机隔离，然后能力位
 
-**Objective:** Prove the security invariants on the personal host, then and only then advertise `packetCapture` / `pcapngExport`.
+**目标：** 在个人宿主机上证明安全不变量，然后才通告 `packetCapture` / `pcapngExport`。
 
-**Tests (silent boxed runner, not `Start.exe`):**
+**测试（静默盒内 runner，非 `Start.exe`）：**
 
-1. Connection-audit regression: `e2e_silent.py` still `eventCount > 0`.
-2. Box A curl to `1.1.1.1`, Box B curl to `8.8.8.8`, host curl to `9.9.9.9`. Each PCAPNG contains only its own PID, createTime, and remote. Host PID never appears.
-3. Process-scoped session: later boxed children do not appear. After target exit, a new boxed process with a recycled PID story is still excluded (createTime mismatch).
-4. Box-scoped session: later children *do* appear.
-5. Loopback excluded by default, included when flagged.
-6. IPv4 TCP and UDP. IPv6 registered in the driver; only claim IPv6 e2e if this host actually ran an IPv6 target.
-7. Snaplen: captured length ≤ snaplen, original length preserved, tshark still opens the file.
-8. Size limit + `rotate_count=0` stops. `rotate_count>=1` produces a second file that tshark also opens.
-9. Time limit stops the session.
-10. Ring overflow: drop counter increases, network still works, no BSOD.
-11. Broker kill: session `FAILED`, no direct-policy change, ALE audit still works.
-12. Cross-SID / cross-session start still denied.
+1. 连接审计回归：`e2e_silent.py` 仍 `eventCount > 0`。
+2. Box A curl 到 `1.1.1.1`、Box B curl 到 `8.8.8.8`、宿主 curl 到 `9.9.9.9`。每个 PCAPNG 只含自己的 PID、createTime 与远端。宿主 PID 绝不出现。
+3. 进程作用域会话：后来的盒内子进程不出现。目标退出后，复用 PID 的新盒内进程仍被排除（createTime 不匹配）。
+4. 盒作用域会话：后来的子进程*确实*出现。
+5. Loopback 默认排除，加标志后包含。
+6. IPv4 TCP 与 UDP。驱动中注册 IPv6；仅当本宿主实际跑过 IPv6 目标才声称 IPv6 e2e。
+7. Snaplen：捕获长度 ≤ snaplen、原始长度保留、tshark 仍打开文件。
+8. 大小限制 + `rotate_count=0` 停止。`rotate_count>=1` 产出第二个文件且 tshark 也能打开。
+9. 时间限制停止会话。
+10. 环溢出：丢弃计数增加、网络仍工作、无蓝屏。
+11. Broker 击杀：会话 `FAILED`、无直接策略变化、ALE 审计仍工作。
+12. Cross-SID / cross-session 启动仍被拒绝。
 
-**Live evidence (2026-08-15, x64, this host):** items 1–2 and 4–12 passed. Item 3 passed for “later boxed children do not appear” (process-scope PCAP comments contained only the target PID+createTime). A recycled-PID collision was not observed; the later child used a different PID. `CAPTURE_PACKET_CAPTURE_RELEASE_GATE` stays `1` so a healthy backend can advertise `packetCapture`/`pcapngExport`. Do not set the gate to `0` — that compiles packet start back to `STATUS_NOT_SUPPORTED`.
+**实机证据（2026-08-15，x64，本宿主）：** 第 1–2 项与第 4–12 项通过。第 3 项"后来的盒内子进程不出现"通过（进程作用域 PCAP 注释只含目标 PID+createTime）。未观察到复用 PID 碰撞；后来的子进程用了不同 PID。`CAPTURE_PACKET_CAPTURE_RELEASE_GATE` 保持 `1`，使健康后端可通告 `packetCapture`/`pcapngExport`。不要将该门设为 `0`——那会把包启动编译回 `STATUS_NOT_SUPPORTED`。
 
-Capability bits are on when the packet backend is healthy. MCP `packetCapture` is true. SandMan Start can enable. HTTPS remains out of scope. SandMan no longer constructs Qt's private `QAbstractFileEngineHandler`; archives extract to a cache directory.
-
----
-
-## Verification commands (personal host)
-
-Build / deploy follow `sandboxie-core-build` `references/x64-official-build.md` and `references/runtime-connection-audit.md`.
-
-- Driver swap: sign x64 `SbieDrv.sys`, `MoveFileEx` flags `5`, reboot, compare SHA-256. Do not loop on `KmdUtil stop`.
-- `SbieSvc` can be restarted without reboot; the driver usually cannot.
-- Qt: Community `vcvars64.bat` + `C:\Users\Wuldas\.AA\Qt\6.8.3\msvc2022_64`.
-- Evidence dir already used for Phase 2: `%LOCALAPPDATA%\Temp\hermes-sandbox-capture-red\`.
-- tshark via the local Wireshark install / `mcp__wireshark__*` tools.
-- `git diff --check` on every slice.
-- Report only architectures that were actually built (x64).
+包后端健康时能力位开启。MCP `packetCapture` 为 true。SandMan Start 可启用。HTTPS 仍超出范围。SandMan 不再构造 Qt 私有 `QAbstractFileEngineHandler`；归档解压到缓存目录。
 
 ---
 
-## Explicitly out of scope (Phase 4+)
+## 验证命令（个人宿主）
 
-- WFP connect-redirect, sandbox-only CA, TLS MITM, HAR, header redaction of plaintext HTTP
-- OpenSSL in any Sandboxie process
-- HTTP/2, HPACK, WebSocket, gRPC, HTTP/3 decryption
-- Machine-wide sniffing
-- Official EV signing, ARM64 full link, installer packaging
-- Changing `NetworkAccess` semantics so that capture can bypass a deny
+构建 / 部署遵循 `sandboxie-core-build` `references/x64-official-build.md` 与 `references/runtime-connection-audit.md`。
+
+- 驱动更换：签名 x64 `SbieDrv.sys`、`MoveFileEx` 标志 `5`、重启、比较 SHA-256。不要在 `KmdUtil stop` 上循环。
+- `SbieSvc` 可不重启直接重启动；驱动通常不行。
+- Qt：Community `vcvars64.bat` + `C:\Users\Wuldas\.AA\Qt\6.8.3\msvc2022_64`。
+- Phase 2 已用的证据目录：`%LOCALAPPDATA%\Temp\hermes-sandbox-capture-red\`。
+- tshark 经本地 Wireshark 安装 / `mcp__wireshark__*` 工具。
+- 每个 slice `git diff --check`。
+- 只报告实际构建过的架构（x64）。
 
 ---
 
-## Risks
+## 明确排除在范围之外（Phase 4+）
 
-| Risk | Mitigation |
+- WFP connect-redirect、仅沙箱 CA、TLS MITM、HAR、明文 HTTP 头脱敏
+- 任何 Sandboxie 进程中的 OpenSSL
+- HTTP/2、HPACK、WebSocket、gRPC、HTTP/3 解密
+- 机器级嗅探
+- 官方 EV 签名、ARM64 完整链接、安装器打包
+- 改变 `NetworkAccess` 语义使捕获可绕过拒绝
+
+---
+
+## 风险
+
+| 风险 | 缓解 |
 | --- | --- |
-| Reusing `WFP_classify` on transport accidentally TERMINates / blocks | Separate inspect classify; never write `classifyOut->action` on packet path |
-| Inbound PID missing → host or wrong-box leak | Flow context required; no context ⇒ no capture |
-| LPC drain of payloads | Not used. Mapped ring + broker |
-| Baidu-rate overflow / UI freeze | 4096-slot ring, drop counter, bounded SandMan table, snaplen default 256 |
-| `SbieSvc` copies payloads as SYSTEM | Forbidden. Broker runs as caller |
-| Path traversal via rotation | Broker uses caller token + directory of the caller-opened file |
-| Connection-audit regression after new callouts | e2e_silent / isolation / churn are a hard gate before capability bits |
-| `defaultbox` vs `DefaultBox` | Combo and MCP send `GetName()` |
-| `KmdUtil stop` loops | DELAY_UNTIL_REBOOT only |
-| Declaring packet capture after a compile | Capability bits and user-facing copy stay off until Slice 8 |
+| 在传输层复用 `WFP_classify` 意外 TERMINATE / 阻断 | 独立检查 classify；包路径上绝不写 `classifyOut->action` |
+| 入站 PID 缺失 → 宿主或错盒泄漏 | 需要流上下文；无上下文 ⇒ 不捕获 |
+| LPC 排空载荷 | 不用。映射环 + broker |
+| 百度级溢出 / UI 冻结 | 4096 槽环、丢弃计数、有界 SandMan 表、默认 snaplen 256 |
+| `SbieSvc` 以 SYSTEM 复制载荷 | 禁止。broker 以调用方身份运行 |
+| 轮转路径穿越 | broker 用调用方令牌 + 调用方打开文件所在目录 |
+| 新 callout 后连接审计回归 | e2e_silent / 隔离 / 更替在能力位前是硬门 |
+| `defaultbox` 对比 `DefaultBox` | 下拉与 MCP 发送 `GetName()` |
+| `KmdUtil stop` 循环 | 仅 DELAY_UNTIL_REBOOT |
+| 编译后就声称包捕获 | 能力位与用户可见文案在 Slice 8 前保持关闭 |
 
 ---
 
-## Open questions (do not block the plan)
+## 开放问题（不阻塞计划）
 
-None that change the first implementation. If a later slice hits a Win7 STREAM inspect limitation, keep TRANSPORT+PCAPNG (the exit criterion) and capability-gate STREAM rather than widening to Win8-only APIs in the core path.
+无改变首个实现的问题。若后续 slice 遇到 Win7 STREAM 检查限制，保留 TRANSPORT+PCAPNG（退出标准）并能力门控 STREAM，而不是在核心路径上扩大到仅 Win8 的 API。

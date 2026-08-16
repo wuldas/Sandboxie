@@ -1,446 +1,446 @@
-# Phase 4: HTTPS MVP Implementation Plan
+# Phase 4：HTTPS MVP 实施计划
 
-> **For Hermes:** Implement only after the user accepts this plan and, if they want the usual stage gate, after this file is committed alone. Do not mix implementation into the plan commit. Do not `git reset` / `git clean`. Do not start HTTP/2, HPACK, WebSocket, gRPC, HTTP/3, Firefox/NSS, or QUIC termination.
+> **给 Hermes 的指示：** 仅在用户接受本计划后实施；如果用户需要常规的阶段门控，则在本文件单独提交之后实施。不要把实现混入计划提交。不要执行 `git reset` / `git clean`。不要开始 HTTP/2、HPACK、WebSocket、gRPC、HTTP/3、Firefox/NSS 或 QUIC 终止。
 
-**Goal:** Deliver the Phase 4 HTTPS MVP in `Docs/SandboxCaptureMcp.md`: WFP connect-redirect plus broker authentication, sandbox-only CA lifecycle, TLS 1.2/1.3 and HTTP/1.1 inspection, HAR export, and default header redaction. Exit: representative Chromium, WinHTTP, and curl traffic in the selected sandbox is decoded into HAR; certificate pinning is reported as a MITM failure while ciphertext PCAPNG is retained; broker failure does not restore direct HTTPS egress.
+**目标：** 交付 `Docs/SandboxCaptureMcp.md` 中的 Phase 4 HTTPS MVP：WFP connect-redirect + broker 认证、仅限沙箱的 CA 生命周期、TLS 1.2/1.3 与 HTTP/1.1 检查、HAR 导出与默认头脱敏。退出标准：选定沙箱内的代表性 Chromium、WinHTTP 与 curl 流量被解码进 HAR；证书固定被报告为 MITM 失败且密文 PCAPNG 保留；broker 故障不会恢复直连 HTTPS 出口。
 
-**Architecture:** Keep Phase 2 ALE connection-audit and Phase 3 inspect-only packet/stream rings exactly as-is. Add a third path that is *not* driver TLS parsing: `ALE_CONNECT_REDIRECT` rewrites matching outbound TCP/443 to a random loopback listener owned by `SbieCapture.exe`. The broker authenticates the WFP redirect context, terminates downstream TLS with a session CA, opens the original destination with the WFP redirect records copied onto the upstream socket, parses HTTP/1.1, writes HAR, and keeps writing ciphertext PCAPNG from the existing transport ring. `SbieDrv` / `SbieSvc` never parse TLS or HTTP. OpenSSL lives only in `SbieCapture.exe`. Capability bits `CAPTURE_CAP_HTTPS_INSPECTION` and `CAPTURE_CAP_HAR_EXPORT` stay clear until live isolation, fail-closed, and host-store integrity tests pass.
+**架构：** Phase 2 ALE 连接审计与 Phase 3 仅检查的包/流环完全保持原样。新增第三条路径——*不是*驱动 TLS 解析：`ALE_CONNECT_REDIRECT` 把匹配的出站 TCP/443 重写到 `SbieCapture.exe` 拥有的随机 loopback 监听器。broker 认证 WFP 重定向上下文、用会话 CA 终止下游 TLS、把 WFP 重定向记录复制到上游套接字后打开原始目的地、解析 HTTP/1.1、写 HAR，并继续从既有传输环写密文 PCAPNG。`SbieDrv` / `SbieSvc` 绝不解析 TLS 或 HTTP。OpenSSL 只存在于 `SbieCapture.exe`。能力位 `CAPTURE_CAP_HTTPS_INSPECTION` 与 `CAPTURE_CAP_HAR_EXPORT` 在实机隔离、fail-closed 与宿主存储完整性测试通过前保持关闭。
 
-**Tech Stack:** Existing SbieDrv WFP (`FwpsCalloutRegister1` remains the Win7 baseline; redirect-handle APIs are Win8+ and capability-gated), SbieSvc CaptureServer LPC (`MSGID_CAPTURE` 0x2000), QSbieAPI non-virtual wrappers, `SbieCapture.exe` under `SandboxieTools` plus OpenSSL 3.4.0 from `Installer/buildVariables.cmd`, SandMan Qt 6.8.3 MSVC view. Personal host: x64 / Windows 11 only, WDK test certificate, no official signing, no ARM64 full link.
-
----
-
-## Locked decisions
-
-These are not open questions. Do not re-litigate them while implementing.
-
-1. **HTTPS is connect-redirect + broker MITM.** Do not implement `FWPS_STREAM_ACTION_NEED_MORE_DATA` in the driver. The Phase 3 comment that “NEED_MORE_DATA is Phase 4” is superseded: the driver still never parses TLS. STREAM/TRANSPORT stay copy-then-continue inspection.
-2. **Do not reuse `WFP_classify`.** That function is the ALE AUTH CONNECT/RECV_ACCEPT terminating policy callout. Redirect uses a new classify that may rewrite the remote endpoint. Packet/flow/stream/datagram callouts stay `FWP_ACTION_CALLOUT_INSPECTION` and must never change the verdict.
-3. **Original `NetworkAccess` / `AllowNetworkAccess` is evaluated first.** A denied destination stays denied. Redirect happens only after ALE AUTH has permitted the original 5-tuple.
-4. **Fail-closed.** While an HTTPS session is `RUNNING` or `FAILED`, matching TCP/443 continues to redirect to the broker listener even if the broker process is dead. Connections then fail. Do not unregister the redirect filter as a side-effect of broker death. Only an explicit stop tears the redirect down.
-5. **Broker accepts only redirected connections.** A connect that lacks a valid WFP redirect context bound to this capture id + generation is dropped. No “open proxy on loopback”.
-6. **Recursive redirect is prevented by WFP redirect records.** The broker copies the inbound redirect records onto the upstream socket. The driver classify must skip flows already redirected by its own `FwpsRedirectHandle`.
-7. **TCP 443 only.** Do not redirect all TCP. QUIC/UDP 443 stays on the Phase 3 passive path (ciphertext only). Non-443 TLS is out of MVP.
-8. **ALPN is `http/1.1` only.** The broker does not advertise `h2`. HTTP/2 clients that refuse HTTP/1.1 fail closed and still have PCAPNG.
-9. **`CAPTURE_MODE_HTTPS` also starts the existing packet backend.** Pinning / MITM failure must retain ciphertext PCAPNG. HTTPS is not a replacement for packet capture.
-10. **Two caller-opened export files.** `SET_EXPORT` remains PCAPNG. New `MSGID_CAPTURE_SET_HAR_EXPORT` (`0x200A`) is the HAR file. LocalSystem never creates or overwrites a client-supplied path. HTTPS start cannot leave `WAITING_FOR_BACKEND` until both handles are set.
-11. **Bodies are opt-in. Redaction is on by default.** `Authorization`, `Proxy-Authorization`, `Cookie`, `Set-Cookie`, and common API-key headers are replaced with `[REDACTED]` unless an explicit flag disables redaction. Body bytes are omitted unless `CAPTURE_FLAG_INCLUDE_BODIES` is set, and then only up to a per-body cap.
-12. **Persistent session CA.** A single SbieCapture CA (10-year validity) is generated on first use and stored under the owner's `%LOCALAPPDATA%\SbieCapture\` (`ca.crt` + `ca.key`), then reused across capture sessions. Only the CA *public* certificate is imported into the host user's Root store (via the SYSTEM store provider); the first import raises the Windows root-install prompt, later sessions are idempotent and do not re-prompt. The box's virtual Root store is not modified. The private key lives on disk in the owner's profile, so any process with that profile's read access could theoretically mint MITM certs — this is the standard mitmproxy/Fiddler trust model and is accepted and documented here.
-13. **OpenSSL 3.4.0 only in `SbieCapture.exe`.** Do not link OpenSSL, parsers, or HAR writers into `SbieDrv` or `SbieSvc`. Use the version in `Installer/buildVariables.cmd`; do not hard-code a different version in that file.
-14. **Win8+ redirect is the MVP path.** `FwpsRedirectHandleCreate0` / `FwpsQueryConnectionRedirectState0` are resolved at runtime. If they are absent, HTTPS capability stays clear and start returns `STATUS_NOT_SUPPORTED`. The Win7 SOCKS5 fallback from the architecture doc is Phase 4.1 / later, not this MVP.
-15. **Do not bump `CAPTURE_WIRE_VERSION`.** Old 112-byte `CAPTURE_START_REQ` still starts connection-audit. Extended start stays 132 bytes plus new *trailing* flags only if they fit without moving existing fields. Prefer a new flag bit and a new SET message over resizing start.
-16. **QSbieAPI stays non-virtual.** Append fields / add non-virtual methods. Do not insert virtuals on `CSbieAPI`.
-17. **New SandMan view.** `CHttpsCaptureView` / `CHttpsCaptureWindow`. Do not reuse `CCaptureView`, `CPacketCaptureView`, or `CTraceEntry` as the HAR table. Packet Capture and Connection Audit behaviour stay unchanged except for a separate HTTPS action.
-18. **Capability bits stay off** (`CAPTURE_CAP_HTTPS_INSPECTION`, `CAPTURE_CAP_HAR_EXPORT`) until Slice 8 live tests pass. Until then public `CAPTURE_MODE_HTTPS` remains `STATUS_NOT_SUPPORTED`.
-19. **Personal host constraints:** no ARM64 full link, no official driver signing, no `git reset` / `git clean`, keep `NetworkEnableWFP=y`, do not use installed `Start.exe`, do not load parsers/OpenSSL into `SbieDrv`/`SbieSvc`. Every live driver change still requires a rollback path and post-reload hash check. Use the `kmdutil-driver-reload` workflow; stop `SbieSvc` first; watch for `SandMan.exe` re-holding `\\Device\\SandboxieDriverApi`.
+**技术栈：** 现有 SbieDrv WFP（`FwpsCalloutRegister1` 仍是 Win7 基线；redirect-handle API 是 Win8+ 且须能力门控）、SbieSvc CaptureServer LPC（`MSGID_CAPTURE` 0x2000）、QSbieAPI 非虚包装、`SandboxieTools` 下的 `SbieCapture.exe` 加来自 `Installer/buildVariables.cmd` 的 OpenSSL 3.4.0、SandMan Qt 6.8.3 MSVC 视图。个人宿主：仅 x64 / Windows 11、WDK 测试证书、无官方签名、无 ARM64 完整链接。
 
 ---
 
-## Current baseline (do not regress)
+## 已锁定的决策
 
-| Piece | Today |
+以下不是开放问题。实现过程中不得重新争论。
+
+1. **HTTPS 是 connect-redirect + broker MITM。** 不要在驱动里实现 `FWPS_STREAM_ACTION_NEED_MORE_DATA`。Phase 3 注释里"NEED_MORE_DATA 属于 Phase 4"已被取代：驱动仍然绝不解析 TLS。STREAM/TRANSPORT 保持复制后放行的检查模式。
+2. **不要复用 `WFP_classify`。** 该函数是 ALE AUTH CONNECT/RECV_ACCEPT 的终止策略 callout。重定向使用新的 classify，可改写远端端点。包/流/传输/数据报 callout 保持 `FWP_ACTION_CALLOUT_INSPECTION`，绝不改变裁决。
+3. **先评估原始 `NetworkAccess` / `AllowNetworkAccess`。** 被拒绝的目的地保持拒绝。重定向只在 ALE AUTH 已允许原始五元组之后发生。
+4. **Fail-closed。** HTTPS 会话处于 `RUNNING` 或 `FAILED` 期间，即使 broker 进程已死，匹配的 TCP/443 仍继续重定向到 broker 监听器。连接随即失败。不要因 broker 死亡而注销重定向过滤器。只有显式 stop 才拆除重定向。
+5. **broker 只接受被重定向的连接。** 缺少绑定到本捕获 id + generation 的有效 WFP 重定向上下文的连接被丢弃。不存在"loopback 上的开放代理"。
+6. **递归重定向由 WFP 重定向记录防止。** broker 把入站重定向记录复制到上游套接字。驱动 classify 必须跳过已被自己 `FwpsRedirectHandle` 重定向的流。
+7. **仅 TCP 443。** 不要重定向所有 TCP。QUIC/UDP 443 留在 Phase 3 被动路径（仅密文）。非 443 的 TLS 超出 MVP。
+8. **ALPN 仅 `http/1.1`。** broker 不通告 `h2`。拒绝 HTTP/1.1 的 HTTP/2 客户端 fail closed 且仍有 PCAPNG。
+9. **`CAPTURE_MODE_HTTPS` 同时启动既有包后端。** 固定/ MITM 失败必须保留密文 PCAPNG。HTTPS 不是包捕获的替代品。
+10. **两个调用方打开的导出文件。** `SET_EXPORT` 仍是 PCAPNG。新 `MSGID_CAPTURE_SET_HAR_EXPORT`（`0x200A`）是 HAR 文件。LocalSystem 绝不创建或覆盖客户端提供的路径。两个句柄都设置之前，HTTPS 启动不能离开 `WAITING_FOR_BACKEND`。
+11. **正文 opt-in。脱敏默认开启。** `Authorization`、`Proxy-Authorization`、`Cookie`、`Set-Cookie` 与常见 API 密钥头在无显式标志禁用脱敏前被替换为 `[REDACTED]`。除非设置 `CAPTURE_FLAG_INCLUDE_BODIES`，否则省略正文字节，且即使设置也只到每正文上限。
+12. **持久会话 CA。** 单个 SbieCapture CA（10 年有效期）在首次使用时生成并存储在所有者 `%LOCALAPPDATA%\SbieCapture\` 下（`ca.crt` + `ca.key`），之后跨捕获会话复用。只有 CA *公钥*证书被导入宿主用户的 Root store（经 SYSTEM store provider）；首次导入会弹出 Windows 根证书安装提示，后续会话幂等且不再提示。盒的虚拟 Root store 不被修改。私钥存在于所有者 profile 的磁盘上，因此任何具有该 profile 读权限的进程理论上都能铸造 MITM 证书——这是标准 mitmproxy/Fiddler 信任模型，在此接受并文档化。
+13. **OpenSSL 3.4.0 仅存在于 `SbieCapture.exe`。** 不要把 OpenSSL、解析器或 HAR 写入器链接进 `SbieDrv` 或 `SbieSvc`。使用 `Installer/buildVariables.cmd` 中的版本；不要在该文件硬编码不同版本。
+14. **Win8+ 重定向是 MVP 路径。** `FwpsRedirectHandleCreate0` / `FwpsQueryConnectionRedirectState0` 在运行时解析。若缺失，HTTPS 能力保持关闭且 start 返回 `STATUS_NOT_SUPPORTED`。架构文档中的 Win7 SOCKS5 回退属于 Phase 4.1 / 之后，不是本 MVP。
+15. **不要提升 `CAPTURE_WIRE_VERSION`。** 旧的 112 字节 `CAPTURE_START_REQ` 仍可启动连接审计。扩展 start 保持 132 字节，且仅当新*尾部*标志不移动既有字段时才能添加。倾向新标志位 + 新 SET 消息，而不是调整 start 大小。
+16. **QSbieAPI 保持非虚。** 追加字段 / 追加非虚方法。不要在 `CSbieAPI` 上插入虚函数。
+17. **新 SandMan 视图。** `CHttpsCaptureView` / `CHttpsCaptureWindow`。不要复用 `CCaptureView`、`CPacketCaptureView` 或 `CTraceEntry` 作为 HAR 表。Packet Capture 与 Connection Audit 行为不变，除新增独立 HTTPS 动作外。
+18. **能力位保持关闭**（`CAPTURE_CAP_HTTPS_INSPECTION`、`CAPTURE_CAP_HAR_EXPORT`）直到 Slice 8 实机测试通过。此前公开的 `CAPTURE_MODE_HTTPS` 保持 `STATUS_NOT_SUPPORTED`。
+19. **个人宿主约束：** 无 ARM64 完整链接、无官方驱动签名、无 `git reset` / `git clean`、保持 `NetworkEnableWFP=y`、不使用已安装的 `Start.exe`、不把解析器/OpenSSL 加载进 `SbieDrv`/`SbieSvc`。每次实机驱动改动仍需回滚路径与重载后 hash 检查。使用 `kmdutil-driver-reload` 工作流；先停 `SbieSvc`；注意 `SandMan.exe` 重新持有 `\\Device\\SandboxieDriverApi`。
+
+---
+
+## 当前基线（不得回归）
+
+| 部件 | 现状 |
 | --- | --- |
-| ALE AUTH CONNECT/RECV_ACCEPT v4/v6 | Policy + 80-byte connection audit |
-| FLOW / TRANSPORT / STREAM / DATAGRAM | Inspection copy into packet/stream rings |
-| Connect-redirect layers | Not registered |
-| `FwpsRedirectHandle*` | Not used |
-| `SbieSvc` start | `mode` other than CONNECTIONS/PACKETS → `STATUS_NOT_SUPPORTED` |
-| Caps | CONTROL + CONNECTION_AUDIT + PACKET/PCAPNG when gate + payload callouts are healthy |
+| ALE AUTH CONNECT/RECV_ACCEPT v4/v6 | 策略 + 80 字节连接审计 |
+| FLOW / TRANSPORT / STREAM / DATAGRAM | 检查复制进包/流环 |
+| Connect-redirect 层 | 未注册 |
+| `FwpsRedirectHandle*` | 未使用 |
+| `SbieSvc` start | `mode` 非 CONNECTIONS/PACKETS → `STATUS_NOT_SUPPORTED` |
+| 能力位 | CONTROL + CONNECTION_AUDIT + PACKET/PCAPNG（门 + 载荷 callout 健康时） |
 | `httpsInspection` / `harExport` | false |
-| Broker | PCAPNG drain only; no listen socket; no OpenSSL |
+| Broker | 仅 PCAPNG 排空；无监听套接字；无 OpenSSL |
 | SandMan | Connection Audit + Packet Capture |
-| MCP `mode=https` | Accepted by schema, rejected by service |
-| OpenSSL | Bundled 3.4.0 for Qt/SandMan TLS plugin only |
-| SOCKS5 | Existing `SbieDll` `NetworkUseProxy` path; not a capture capability |
+| MCP `mode=https` | Schema 接受，服务拒绝 |
+| OpenSSL | 仅为 Qt/SandMan TLS 插件捆绑 3.4.0 |
+| SOCKS5 | 既有 `SbieDll` `NetworkUseProxy` 路径；不是捕获能力 |
 
-Phase 3 live evidence on this host already covers Box A / Box B / host isolation, IPv4/IPv6 TCP/UDP, snaplen/rotate/time, process- vs box-scope, overflow `droppedCount`, broker kill, and cross-SID / cross-session denial. Those scripts remain a hard gate after every driver swap.
+Phase 3 在本宿主上的实机证据已覆盖 Box A / Box B / 宿主隔离、IPv4/IPv6 TCP/UDP、snaplen/rotate/time、进程级与盒级作用域、溢出 `droppedCount`、broker 击杀与 cross-SID / cross-session 拒绝。这些脚本在每次驱动更换后仍是硬门。
 
 ---
 
-## Data path
+## 数据路径
 
 ```text
-boxed TCP/443 (ALE AUTH already permitted)
+boxed TCP/443（ALE AUTH 已允许）
     |
-    +-- existing ALE AUTH -----> WFP_classify -----> 80-byte audit queue
+    +-- 既有 ALE AUTH -----> WFP_classify -----> 80 字节审计队列
     |
-    +-- existing FLOW/TRANSPORT/STREAM --> packet/stream rings --> PCAPNG
+    +-- 既有 FLOW/TRANSPORT/STREAM --> 包/流环 --> PCAPNG
     |
     +-- ALE CONNECT_REDIRECT v4/v6
-            if redirected_by_self -> continue
-            if HTTPS session matches (box/SID/session/PID+createTime)
-               and proto=TCP and remote_port=443
-               and dest is not the broker listener
-               -> rewrite to 127.0.0.1/::1 : broker_port
-               -> attach redirect context
-            else continue
+            若已被自己重定向 -> 继续
+            若 HTTPS 会话匹配（box/SID/session/PID+createTime）
+               且 proto=TCP 且 remote_port=443
+               且目的不是 broker 监听器
+               -> 改写为 127.0.0.1/::1 : broker_port
+               -> 附加重定向上下文
+            否则继续
 
 SbieSvc CaptureServer
-    |-- authorize owner (unchanged Phase 2 rules)
-    |-- start packet session (existing)
-    |-- start HTTPS redirect session (new driver control)
-    |-- spawn SbieCapture.exe (packet drain + HTTPS listen)
+    |-- 授权所有者（Phase 2 规则不变）
+    |-- 启动包会话（既有）
+    |-- 启动 HTTPS 重定向会话（新驱动控制）
+    |-- 生成 SbieCapture.exe（包排空 + HTTPS 监听）
     |-- DuplicateHandle(pcapng) + DuplicateHandle(har) + section
-    |-- launch in-box helper to import CA public cert only
-    |-- stop / fail / owner disconnect => kill job, then drop redirect
+    |-- 在盒内启动辅助进程仅导入 CA 公钥证书
+    |-- stop / 失败 / 所有者断连 => 击杀 job，然后拆除重定向
 
 SbieCapture.exe
-    |-- map packet ring, write PCAPNG (existing)
-    |-- listen 127.0.0.1 and [::1] on an ephemeral port
-    |-- accept only WFP-redirected sockets
-    |-- SNI callback: mint leaf from session CA
-    |-- downstream TLS (OpenSSL 3.4.0)
-    |-- upstream TLS to original dest with redirect records copied
-    |-- HTTP/1.1 parse, redact, optional body, HAR writer
-    |-- pinning / handshake failure: log event, keep PCAPNG, do not leak
+    |-- 映射包环，写 PCAPNG（既有）
+    |-- 在临时端口的 127.0.0.1 与 [::1] 上监听
+    |-- 只接受 WFP 重定向的套接字
+    |-- SNI 回调：从会话 CA 铸造叶子
+    |-- 下游 TLS（OpenSSL 3.4.0）
+    |-- 带重定向记录复制的上游 TLS 到原始目的
+    |-- HTTP/1.1 解析、脱敏、可选正文、HAR 写入器
+    |-- 固定/握手失败：记录事件、保留 PCAPNG、不泄漏
 ```
 
-### Redirect context (fixed, copied into WFP classify context)
+### 重定向上下文（固定大小，复制进 WFP classify 上下文）
 
 ```text
-capture id high/low
-capture generation
-policy generation
-process id
-process creation time
-session id
-box name (BOXNAME_COUNT) or box hash
-original remote address[16]
-original remote port
-address family
+捕获 id 高/低
+捕获 generation
+策略 generation
+进程 id
+进程创建时间
+会话 id
+盒名（BOXNAME_COUNT）或盒 hash
+原始远端地址[16]
+原始远端端口
+地址族
 ```
 
-The broker reads this via `SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT` (or the documented equivalent) and refuses the socket if it does not match the inherited capture id + generation.
+broker 通过 `SIO_QUERY_WFP_CONNECTION_REDIRECT_CONTEXT`（或文档化等价物）读取它，若与继承的捕获 id + generation 不匹配则拒绝该套接字。
 
-### HAR record (broker-only, never LPC)
+### HAR 记录（仅 broker，绝不走 LPC）
 
-One HAR 1.2 `log.entries[]` object per HTTP/1.1 exchange:
+每个 HTTP/1.1 交换一个 HAR 1.2 `log.entries[]` 对象：
 
-- `startedDateTime`, `time`
-- `request.method`, `url` (from SNI + request-target), `httpVersion`
-- `request.headers` / `response.headers` after redaction
-- `request.queryString` parsed from the request-target
-- `response.status`, `statusText`
-- `serverIPAddress` = original remote, not 127.0.0.1
-- `_sandboxie` custom field: pid, createTime, box, sid, session, sni, alpn, tlsVersion, pinningFailed
-- `content.text` only when bodies are enabled and under the per-body cap; otherwise `text` omitted and `_omitted` / `size` recorded
+- `startedDateTime`、`time`
+- `request.method`、`url`（来自 SNI + 请求目标）、`httpVersion`
+- 脱敏后的 `request.headers` / `response.headers`
+- 从请求目标解析的 `request.queryString`
+- `response.status`、`statusText`
+- `serverIPAddress` = 原始远端，而非 127.0.0.1
+- `_sandboxie` 自定义字段：pid、createTime、box、sid、session、sni、alpn、tlsVersion、pinningFailed
+- 仅当启用正文且在每正文上限内时才有 `content.text`；否则省略 `text` 并记录 `_omitted` / `size`
 
-Do not send HAR entries over LPC. SandMan tails the caller-owned HAR file or a sidecar JSONL the broker appends next to it. Prefer JSONL-of-entries plus a closing HAR wrapper on stop, so a crash still leaves readable exchanges.
+不要把 HAR 条目经 LPC 发送。SandMan 尾随调用方拥有的 HAR 文件，或 broker 在其旁追加的 sidecar JSONL。倾向 JSONL 条目 + stop 时闭合的 HAR 包装，这样崩溃仍留下可读交换。
 
-### Limits
+### 限制
 
-- max concurrent HTTPS sessions: 1 per owner, 2 global
-- broker accept backlog: 32
-- max concurrent MITM connections: 64; overflow fails the new connect, does not drop redirect
-- default per-body cap: 64 KiB
-- default HAR max file: 64 MiB (same rotation rules as PCAPNG)
-- default max seconds: 300
-- CA key: 2048-bit RSA or P-256; leaf SAN = SNI; validity ≤ 24 h
-- listen address: loopback only
+- 最大并发 HTTPS 会话：每所有者 1 个，全局 2 个
+- broker accept 积压：32
+- 最大并发 MITM 连接：64；溢出使新连接失败，不拆除重定向
+- 默认每正文上限：64 KiB
+- 默认 HAR 最大文件：64 MiB（与 PCAPNG 相同的轮转规则）
+- 默认最大秒数：300
+- CA 密钥：2048 位 RSA 或 P-256；叶子 SAN = SNI；有效期 ≤ 24 h
+- 监听地址：仅 loopback
 
 ---
 
-## Control wire
+## 控制线格式
 
-Keep family `0x2000`. Add:
+保持消息族 `0x2000`。新增：
 
 ```text
 MSGID_CAPTURE_SET_HAR_EXPORT   0x200A
 ```
 
-`0x20FF` remains disconnect notification.
+`0x20FF` 仍是断连通知。
 
-### New start flags (existing `flags` field, no size change)
+### 新启动标志（既有 `flags` 字段，无尺寸变化）
 
 ```c
 #define CAPTURE_FLAG_INCLUDE_BODIES     0x00000004
 #define CAPTURE_FLAG_DISABLE_REDACTION  0x00000008
 ```
 
-Unknown flag bits still return `STATUS_INVALID_PARAMETER`. Old packet/connection clients that do not set these bits keep current behaviour.
+未知标志位仍返回 `STATUS_INVALID_PARAMETER`。不设置这些位的旧包/连接客户端保持现行为。
 
 ### `CAPTURE_SET_HAR_EXPORT`
 
-Same shape as `CAPTURE_SET_EXPORT`: caller-relative file handle + capture id. SbieSvc `DuplicateHandle` from the LPC client. Reject if the handle is not a writable disk file, or if the caller is sandboxed. No path string.
+与 `CAPTURE_SET_EXPORT` 同形：调用方相对文件句柄 + 捕获 id。SbieSvc 从 LPC 客户端 `DuplicateHandle`。若句柄不是可写磁盘文件、或调用方被沙箱化则拒绝。无路径字符串。
 
-HTTPS start sequence:
+HTTPS 启动序列：
 
-1. `START` with `mode = CAPTURE_MODE_HTTPS` → session `WAITING_FOR_BACKEND` (or `STATUS_NOT_SUPPORTED` until Slice 8).
-2. `SET_EXPORT` (PCAPNG) + `SET_HAR_EXPORT` (HAR), either order.
-3. Broker listen port is bound, CA minted, redirect handle created, in-box cert helper succeeds.
-4. Session becomes `RUNNING` only after those steps. Any failure is `FAILED` and fail-closed until `STOP`.
+1. 以 `mode = CAPTURE_MODE_HTTPS` `START` → 会话 `WAITING_FOR_BACKEND`（或直到 Slice 8 都是 `STATUS_NOT_SUPPORTED`）。
+2. `SET_EXPORT`（PCAPNG）+ `SET_HAR_EXPORT`（HAR），顺序任意。
+3. broker 监听端口绑定、CA 铸造、重定向句柄创建、盒内证书辅助成功。
+4. 只有这些步骤完成后会话才变 `RUNNING`。任何失败都是 `FAILED` 且 fail-closed 直到 `STOP`。
 
-Do not add “read HAR over LPC”.
+不要加"经 LPC 读 HAR"。
 
 ---
 
-## Files likely to change
+## 可能变更的文件
 
-### New
+### 新增
 
-- `SandboxieTools/SbieCapture/har.h` / `har.c` — HAR/JSONL writer, no third-party JSON lib if a tiny existing helper exists; otherwise a bounded writer with tests
-- `SandboxieTools/SbieCapture/http11.h` / `http11.c` — HTTP/1.1 request/response framing only
-- `SandboxieTools/SbieCapture/redact.h` / `redact.c` — header redaction
-- `SandboxieTools/SbieCapture/capture_ca.h` / `capture_ca.c` — session CA + SNI leaf (OpenSSL)
-- `SandboxieTools/SbieCapture/https_mitm.h` / `https_mitm.c` — listen, redirect-context auth, TLS, upstream
-- `SandboxieTools/HarTests/` — user-mode HAR / redact / http11 tests (no driver)
-- `SandboxieTools/HttpsMitmTests/` — loopback TLS 1.2/1.3 + HTTP/1.1 tests against a local OpenSSL server
-- `Sandboxie/core/drv/capture_https.h` / `capture_https.c` — redirect session table (dual-compile where possible)
+- `SandboxieTools/SbieCapture/har.h` / `har.c` — HAR/JSONL 写入器，若存在极小的既有辅助则不用第三方 JSON 库；否则用带测试的有界写入器
+- `SandboxieTools/SbieCapture/http11.h` / `http11.c` — 仅 HTTP/1.1 请求/响应帧
+- `SandboxieTools/SbieCapture/redact.h` / `redact.c` — 头脱敏
+- `SandboxieTools/SbieCapture/capture_ca.h` / `capture_ca.c` — 会话 CA + SNI 叶子（OpenSSL）
+- `SandboxieTools/SbieCapture/https_mitm.h` / `https_mitm.c` — 监听、重定向上下文认证、TLS、上游
+- `SandboxieTools/HarTests/` — 用户态 HAR / redact / http11 测试（无驱动）
+- `SandboxieTools/HttpsMitmTests/` — 针对本地 OpenSSL 服务器的 loopback TLS 1.2/1.3 + HTTP/1.1 测试
+- `Sandboxie/core/drv/capture_https.h` / `capture_https.c` — 重定向会话表（尽可能双编译）
 - `SandboxiePlus/SandMan/Views/HttpsCaptureView.h` / `.cpp`
-- `Docs/Phase4HttpsMvp.md` — this file
+- `Docs/Phase4HttpsMvp.md` — 本文件
 
-### Modify
+### 修改
 
-- `Sandboxie/core/drv/wfp.c` / `wfp.h` — new CONNECT_REDIRECT GUIDs, redirect classify, runtime resolve of Win8+ APIs
-- `Sandboxie/core/drv/capture.c` / `capture.h` / `api_defs.h` / `api.c` — HTTPS session start/stop, redirect handle, listen-port publish
-- `Sandboxie/core/drv/SboxDrv.vcxproj` — new TU
+- `Sandboxie/core/drv/wfp.c` / `wfp.h` — 新 CONNECT_REDIRECT GUID、重定向 classify、Win8+ API 运行时解析
+- `Sandboxie/core/drv/capture.c` / `capture.h` / `api_defs.h` / `api.c` — HTTPS 会话启停、重定向句柄、监听端口发布
+- `Sandboxie/core/drv/SboxDrv.vcxproj` — 新 TU
 - `Sandboxie/core/svc/msgids.h` — `0x200A`
-- `Sandboxie/core/svc/capturewire.h` — new flag bits, SET_HAR_EXPORT, static_asserts
-- `Sandboxie/core/svc/CaptureServer.cpp` — HTTPS mode, second export handle, cert helper, still `NOT_SUPPORTED` until ready
-- `SandboxieTools/SbieCapture/*` — HTTPS listen mode beside existing ring drain
-- `SandboxieTools/SbieCapture/SbieCapture.vcxproj` — OpenSSL include/lib for the broker only
-- `SandboxieTools/CaptureQueueTests/CaptureWireTests.cpp` — new msgid + flag contract
+- `Sandboxie/core/svc/capturewire.h` — 新标志位、SET_HAR_EXPORT、static_asserts
+- `Sandboxie/core/svc/CaptureServer.cpp` — HTTPS 模式、第二导出句柄、证书辅助、就绪前仍 `NOT_SUPPORTED`
+- `SandboxieTools/SbieCapture/*` — 既有环排空旁的 HTTPS 监听模式
+- `SandboxieTools/SbieCapture/SbieCapture.vcxproj` — 仅 broker 的 OpenSSL include/lib
+- `SandboxieTools/CaptureQueueTests/CaptureWireTests.cpp` — 新 msgid + 标志契约
 - `SandboxiePlus/QSbieAPI/SbieCapture.h` / `SbieAPI.h` / `SbieAPI.cpp`
-- `SandboxiePlus/SbieMcp/main.cpp` — HAR path + body/redact args; hide capability until Slice 8
+- `SandboxiePlus/SbieMcp/main.cpp` — HAR 路径 + 正文/脱敏参数；Slice 8 前隐藏能力
 - `SandboxiePlus/SandMan/SandMan.cpp` / `.h` / `SandMan.pri` / `Views/SbieView.*`
-- `Docs/SandboxCaptureMcp.md` — status paragraph after the backend is real
-- `CHANGELOG.md` — after a working x64 path exists, not in the plan-only commit
+- `Docs/SandboxCaptureMcp.md` — 后端真实落地后的状态段落
+- `CHANGELOG.md` — 在可用 x64 路径存在之后，而非仅计划提交中
 
-### Do not touch unless a compile forces it
+### 除非编译强制，否则不触碰
 
-- `CCaptureView.*` / `CPacketCaptureView.*` behaviour
-- `NetworkAccess` permit/block logic inside `WFP_classify`
-- `SbieDll` SOCKS5 (`net.c` / `proxy.c`) — not the MVP path
-- `DefaultBox` / `Sandboxie.ini` contents except a documented rollback-able test box
-- installer packaging / official signing / ARM64 project defaults
-- Firefox NSS databases
+- `CCaptureView.*` / `CPacketCaptureView.*` 行为
+- `WFP_classify` 内部的 `NetworkAccess` 允许/拒绝逻辑
+- `SbieDll` SOCKS5（`net.c` / `proxy.c`）— 不是 MVP 路径
+- `DefaultBox` / `Sandboxie.ini` 内容（可文档化回滚的测试盒除外）
+- 安装器打包 / 官方签名 / ARM64 工程默认值
+- Firefox NSS 数据库
 
 ---
 
-## Slice-by-slice plan
+## 逐 slice 计划
 
-Implement in this order. Each slice is one logical commit. Do not advertise HTTPS capability until Slice 8.
+按此顺序实现。每个 slice 是一个逻辑提交。Slice 8 之前不要通告 HTTPS 能力。
 
-### Slice 0 — Plan only
+### Slice 0 — 仅计划
 
-This file. No code.
+本文件。无代码。
 
-### Slice 1 — HAR writer, HTTP/1.1 framing, redaction (no driver, no OpenSSL)
+### Slice 1 — HAR 写入器、HTTP/1.1 帧、脱敏（无驱动、无 OpenSSL）
 
-**Objective:** Deterministic user-mode tests that turn synthetic HTTP/1.1 exchanges into a redacted HAR/JSONL file.
+**目标：** 把合成 HTTP/1.1 交换转成脱敏 HAR/JSONL 文件的确定性用户态测试。
 
-**Files:** `SandboxieTools/SbieCapture/http11.*`, `redact.*`, `har.*`, `SandboxieTools/HarTests/`
+**文件：** `SandboxieTools/SbieCapture/http11.*`、`redact.*`、`har.*`、`SandboxieTools/HarTests/`
 
-**Behaviour:**
+**行为：**
 
-- Parse one request and one response from byte buffers; reject folded headers and oversize lines
-- Default redact list applied case-insensitively
-- `DISABLE_REDACTION` keeps original header values
-- Bodies omitted by default; when included, truncate at cap and record original size
-- Writer produces a file `har.2` parsers / a small self-check can reopen
-- No TLS, no sockets
+- 从字节缓冲解析一个请求与一个响应；拒绝折叠头与超长行
+- 默认脱敏列表不区分大小写应用
+- `DISABLE_REDACTION` 保留原始头值
+- 默认省略正文；包含时在上限截断并记录原始大小
+- 写入器产出 `har.2` 解析器 / 小型自检可重开读的文件
+- 无 TLS、无 sockets
 
-**Verify:**
+**验证：**
 
 ```text
 cl /nologo /W4 /WX /DUNICODE /D_UNICODE HarTests.c http11.c redact.c har.c
 HarTests.exe
 ```
 
-Expected: all cases pass; a golden HAR contains `Authorization: [REDACTED]` and no cookie plaintext.
+预期：全部用例通过；golden HAR 含 `Authorization: ***` 且无 cookie 明文。
 
-### Slice 2 — Session CA + loopback MITM (OpenSSL in broker/tests only)
+### Slice 2 — 会话 CA + loopback MITM（OpenSSL 仅在 broker/测试中）
 
-**Objective:** `SbieCapture` can mint a session CA, present an SNI leaf, complete TLS 1.2 and TLS 1.3, proxy HTTP/1.1 to a local upstream, and write HAR.
+**目标：** `SbieCapture` 可铸造会话 CA、出示 SNI 叶子、完成 TLS 1.2 与 TLS 1.3、把 HTTP/1.1 代理到本地上游并写 HAR。
 
-**Files:** `capture_ca.*`, `https_mitm.*`, `HttpsMitmTests/`, broker vcxproj OpenSSL linkage
+**文件：** `capture_ca.*`、`https_mitm.*`、`HttpsMitmTests/`、broker vcxproj OpenSSL 链接
 
-**Rules:**
+**规则：**
 
-- Link OpenSSL 3.4.0 only into `SbieCapture` and the MITM test exe
-- Downstream ALPN = `http/1.1`
-- Upstream verifies the real local test-server cert
-- Tests use a fake redirect-context blob the acceptor would normally get from WFP
-- Acceptor without that blob is refused
+- 只把 OpenSSL 3.4.0 链接进 `SbieCapture` 与 MITM 测试 exe
+- 下游 ALPN = `http/1.1`
+- 上游验证真实本地测试服务器证书
+- 测试使用真实 WFP 会提供给 acceptor 的假重定向上下文 blob
+- 无该 blob 的 acceptor 被拒绝
 
-**Verify:**
+**验证：**
 
 ```text
 HttpsMitmTests.exe
 ```
 
-Expected: TLS 1.2 and 1.3 GET `/` round-trip; HAR URL uses the SNI host, not 127.0.0.1; missing context is rejected; CA private key never written under a sandbox path.
+预期：TLS 1.2 与 1.3 GET `/` 往返；HAR URL 使用 SNI 主机而非 127.0.0.1；缺失上下文被拒绝；CA 私钥绝不写入沙箱路径之下。
 
-### Slice 3 — Wire + QSbieAPI + MCP shapes (still NOT_SUPPORTED)
+### Slice 3 — 线格式 + QSbieAPI + MCP 形态（仍 NOT_SUPPORTED）
 
-**Objective:** Flag bits, `MSGID_CAPTURE_SET_HAR_EXPORT`, QSbieAPI methods, MCP `outputHarPath` / `includeBodies` / `disableRedaction`. Service still returns `STATUS_NOT_SUPPORTED` for `MODE_HTTPS`. Capability bits still clear.
+**目标：** 标志位、`MSGID_CAPTURE_SET_HAR_EXPORT`、QSbieAPI 方法、MCP `outputHarPath` / `includeBodies` / `disableRedaction`。服务对 `MODE_HTTPS` 仍返回 `STATUS_NOT_SUPPORTED`。能力位仍关闭。
 
-**Files:** `capturewire.h`, `msgids.h`, `CaptureServer.cpp` (parse-and-reject), `SbieCapture.h`, `SbieAPI.cpp`, `SbieMcp/main.cpp`, `CaptureWireTests.cpp`
+**文件：** `capturewire.h`、`msgids.h`、`CaptureServer.cpp`（解析并拒绝）、`SbieCapture.h`、`SbieAPI.cpp`、`SbieMcp/main.cpp`、`CaptureWireTests.cpp`
 
-**Verify:**
+**验证：**
 
-- Existing connection-audit and packet start still work against the current live service/driver
-- `mode=https` still `0xC00000BB`
-- `CaptureWireTests.exe` passes with `0x200A` and unchanged v1 start size 112 / start size 132
-- No vtable change on `CSbieAPI`
+- 既有连接审计与包启动对当前实机服务/驱动仍可用
+- `mode=https` 仍 `0xC00000BB`
+- `CaptureWireTests.exe` 带 `0x200A` 与不变的 v1 start 尺寸 112 / start 尺寸 132 通过
+- `CSbieAPI` 无 vtable 变化
 
-### Slice 4 — Broker HTTPS process mode (no live WFP yet)
+### Slice 4 — Broker HTTPS 进程模式（尚无实机 WFP）
 
-**Objective:** `SbieCapture.exe` accepts `--https-listen` plus inherited HAR handle, mints CA, writes the public cert to an inherited cert-file handle, drains PCAPNG as today, and serves the Slice 2 MITM path.
+**目标：** `SbieCapture.exe` 接受 `--https-listen` 加继承的 HAR 句柄、铸造 CA、把公钥证书写入继承的证书文件句柄、照常排空 PCAPNG、并服务 Slice 2 的 MITM 路径。
 
-**Files:** `SandboxieTools/SbieCapture/main.c`, `capture_broker.*`
+**文件：** `SandboxieTools/SbieCapture/main.c`、`capture_broker.*`
 
-**SbieSvc spawn rules (implemented in Slice 6, designed here):**
+**SbieSvc 生成规则（Slice 6 实现，此处设计）：**
 
-- Path is install-dir `SbieCapture.exe` only
-- Client cannot supply exe path or command line
-- Kill-on-close job
-- Caller primary token, not LocalSystem
-- Listen sockets are bound by the broker after spawn; port is published back through the existing shared section header or a tiny broker-owned field SbieSvc already maps (do not add a new LPC payload drain)
+- 路径仅限安装目录 `SbieCapture.exe`
+- 客户端不能提供 exe 路径或命令行
+- kill-on-close job
+- 调用方主令牌，而非 LocalSystem
+- 监听套接字由 broker 生成后绑定；端口通过既有共享 section 头或 SbieSvc 已映射的极小 broker 自有字段回传（不要新增 LPC 载荷排空）
 
-**Verify:** harness with a fake redirect context + local upstream produces HAR + PCAPNG. Killing the broker leaves the HAR JSONL readable.
+**验证：** 带假重定向上下文 + 本地上游的 harness 产出 HAR + PCAPNG。击杀 broker 后 HAR JSONL 仍可读。
 
-### Slice 5 — Driver connect-redirect (the dangerous slice)
+### Slice 5 — 驱动 connect-redirect（危险 slice）
 
-**Objective:** Register `FWPM_LAYER_ALE_CONNECT_REDIRECT_V4/V6`. Rewrite matching TCP/443 to the broker loopback port. Attach context. Skip self-redirected flows. Do not change ALE policy.
+**目标：** 注册 `FWPM_LAYER_ALE_CONNECT_REDIRECT_V4/V6`。把匹配 TCP/443 改写为 broker loopback 端口。附加上下文。跳过自身重定向的流。不改变 ALE 策略。
 
-**Files:** `wfp.c`, `wfp.h`, `capture.c`, `capture_https.*`, `api_defs.h`
+**文件：** `wfp.c`、`wfp.h`、`capture.c`、`capture_https.*`、`api_defs.h`
 
-**Required split:**
+**必需拆分：**
 
-| Callout | Layer | Action type | Classify |
+| Callout | 层 | 动作类型 | Classify |
 | --- | --- | --- | --- |
-| existing send/recv | ALE AUTH CONNECT/RECV_ACCEPT | TERMINATING (unchanged) | `WFP_classify` unchanged |
-| existing packet path | FLOW / TRANSPORT / STREAM / DATAGRAM | INSPECTION | unchanged |
-| new | ALE CONNECT_REDIRECT v4/v6 | TERMINATING rewrite | `WFP_https_redirect_classify` |
+| 既有 send/recv | ALE AUTH CONNECT/RECV_ACCEPT | TERMINATING（不变） | `WFP_classify` 不变 |
+| 既有包路径 | FLOW / TRANSPORT / STREAM / DATAGRAM | INSPECTION | 不变 |
+| 新 | ALE CONNECT_REDIRECT v4/v6 | TERMINATING 改写 | `WFP_https_redirect_classify` |
 
-New GUIDs: continue the `0bf56435-71e4-4de7-bd0b-1af0b4cbb8f6` family; do not reuse ALE or packet GUIDs.
+新 GUID：延续 `0bf56435-71e4-4de7-bd0b-1af0b4cbb8f6` 族；不复用 ALE 或包 GUID。
 
-Runtime: `MmGetSystemRoutineAddress` (or the project’s existing dynamic-resolve pattern) for `FwpsRedirectHandleCreate0`, `FwpsRedirectHandleDestroy0`, `FwpsQueryConnectionRedirectState0`. If missing, HTTPS start fails `STATUS_NOT_SUPPORTED` and no redirect callout is registered.
+运行时：用 `MmGetSystemRoutineAddress`（或工程既有动态解析模式）解析 `FwpsRedirectHandleCreate0`、`FwpsRedirectHandleDestroy0`、`FwpsQueryConnectionRedirectState0`。若缺失，HTTPS 启动失败 `STATUS_NOT_SUPPORTED` 且不注册重定向 callout。
 
-Filter identity: reuse `CaptureFilter_Matches`. PID alone is never enough. Remote port must be 443. Destination equal to the session listener is never redirected.
+过滤器身份：复用 `CaptureFilter_Matches`。仅 PID 永远不够。远端端口必须是 443。等于会话监听器的目的永不被重定向。
 
-**Verify (compile + load, do not claim HTTPS works):**
+**验证（编译 + 加载，不声称 HTTPS 可用）：**
 
-- x64 `SbieDrv.sys` builds with WDK test signature
-- user-mode HAR / wire / queue tests still pass
-- `git diff --check` clean
-- After reload: connection-audit `e2e_silent` and a Phase 3 packet isolation probe still pass
-- With no HTTPS session, TCP/443 from a box is unchanged (direct)
-- Do not claim “能解密了”
+- x64 `SbieDrv.sys` 以 WDK 测试签名构建
+- 用户态 HAR / 线格式 / 队列测试仍通过
+- `git diff --check` 干净
+- 重载后：连接审计 `e2e_silent` 与 Phase 3 包隔离探针仍通过
+- 无 HTTPS 会话时，盒内 TCP/443 不变（直连）
+- 不要声称"能解密了"
 
-### Slice 6 — CaptureServer HTTPS lifecycle + sandbox-only CA import
+### Slice 6 — CaptureServer HTTPS 生命周期 + 仅沙箱 CA 导入
 
-**Objective:** `MODE_HTTPS` start creates packet + HTTPS driver state, spawns the broker, waits for listen port + CA public cert, launches an in-box helper under the caller token to import only that cert into the virtual current-user Root store, then enables redirect. Owner disconnect / stop / helper failure → `FAILED` or `STOPPED`, job killed, redirect torn down only on stop.
+**目标：** `MODE_HTTPS` 启动创建包 + HTTPS 驱动状态、生成 broker、等待监听端口 + CA 公钥证书、在调用方令牌下启动盒内辅助仅把该证书导入虚拟当前用户 Root store、然后启用重定向。所有者断连 / stop / 辅助失败 → `FAILED` 或 `STOPPED`、job 击杀、仅 stop 时拆除重定向。
 
-**Files:** `CaptureServer.cpp`, `api_defs.h`, `capture.c`, small in-box cert helper (prefer a `SbieCapture --import-ca` mode launched *inside* the box via existing `MSGID_PROCESS_RUN_SANDBOXED`, not a second installed exe)
+**文件：** `CaptureServer.cpp`、`api_defs.h`、`capture.c`、小型盒内证书辅助（倾向用既有 `MSGID_PROCESS_RUN_SANDBOXED` 在盒*内*启动的 `SbieCapture --import-ca` 模式，而非第二个已安装 exe）
 
-**Authorization:** identical to Phase 2/3. Sandboxed callers cannot start. Cross-SID / cross-session rejected. Process scope binds PID+createTime. Box scope requires `INCLUDE_FUTURE_PROCESSES`. Canonical box name.
+**授权：** 与 Phase 2/3 相同。沙箱化调用方不能启动。Cross-SID / cross-session 拒绝。进程作用域绑定 PID+createTime。盒作用域要求 `INCLUDE_FUTURE_PROCESSES`。规范盒名。
 
-**Fail-closed:** broker kill while `RUNNING` → session `FAILED`, redirect filter stays, new 443 connects fail, ALE audit still works, packet ring still exists until `STOP`.
+**Fail-closed：** broker 在 `RUNNING` 期间被击杀 → 会话 `FAILED`、重定向过滤器保留、新 443 连接失败、ALE 审计仍工作、包环在 `STOP` 前仍存在。
 
-**Verify:**
+**验证：**
 
-- HTTPS start without both export handles stays `WAITING_FOR_BACKEND` or fails closed
-- Missing OpenSSL DLLs next to `SbieCapture.exe` → `FAILED`, not `RUNNING`
-- Connection-audit and packet-only sessions still start without a listen port
-- After a successful import, host Root store hash is unchanged; a second box’s virtual store is unchanged
+- 无两个导出句柄的 HTTPS 启动保持 `WAITING_FOR_BACKEND` 或 fail closed
+- `SbieCapture.exe` 旁缺 OpenSSL DLL → `FAILED`，而非 `RUNNING`
+- 无监听端口的连接审计与纯包会话仍可启动
+- 成功导入后宿主 Root store hash 不变；第二个盒的虚拟 store 不变
 
-### Slice 7 — SandMan HTTPS view
+### Slice 7 — SandMan HTTPS 视图
 
-**Objective:** A distinct view that starts an HTTPS session, shows a bounded HAR-entry table, and points at both output files.
+**目标：** 启动 HTTPS 会话、显示有界 HAR 条目表并指向两个输出文件的独立视图。
 
-**Files:** `HttpsCaptureView.*`, `SandMan.cpp`, `SandMan.h`, `SandMan.pri`, `SbieView.*`
+**文件：** `HttpsCaptureView.*`、`SandMan.cpp`、`SandMan.h`、`SandMan.pri`、`SbieView.*`
 
-**UI contract:**
+**UI 契约：**
 
-- `View → HTTPS Capture` and a log tab, separate from Packet Capture and Connection Audit
-- Box combo uses `I.value()->GetName()`, never `I.key()`
-- Box context: HTTPS Capture (whole box + future processes)
-- Process context: HTTPS Capture for that PID+createTime only
-- Controls: max time, max file, rotate, include loopback, include bodies (off), disable redaction (off, scary)
-- User picks *two* output files before Start (PCAPNG + HAR)
-- Table columns: time, PID, process, method, status, host, path, TLS, pinning
-- No cookie / authorization plaintext in the table
-- Bounded UI queue; no body dump in the table
-- Status: exchanges / dropped / current HAR / “pinning failures keep PCAPNG”
-- Hide or disable Start until capability bits are on (Slice 8)
+- `View → HTTPS Capture` 与一个日志标签页，与 Packet Capture 和 Connection Audit 分离
+- 盒下拉用 `I.value()->GetName()`，绝不用 `I.key()`
+- 盒上下文：HTTPS Capture（整盒 + 未来进程）
+- 进程上下文：仅该 PID+createTime 的 HTTPS Capture
+- 控件：最大时间、最大文件、轮转、包含 loopback、包含正文（关）、禁用脱敏（关，危险）
+- Start 前用户选*两个*输出文件（PCAPNG + HAR）
+- 表列：时间、PID、进程、方法、状态、主机、路径、TLS、pinning
+- 表中无 cookie / authorization 明文
+- 有界 UI 队列；表中不 dump 正文
+- 状态：交换数 / 丢弃数 / 当前 HAR / "pinning 失败保留 PCAPNG"
+- 能力位开启（Slice 8）前隐藏或禁用 Start
 
-Deploy `SandMan.exe`, `QSbieAPI.dll`, `SbieCapture.exe`, and the OpenSSL 3.4.0 DLLs the broker needs, together.
+`SandMan.exe`、`QSbieAPI.dll`、`SbieCapture.exe` 与 broker 需要的 OpenSSL 3.4.0 DLL 一起部署。
 
-### Slice 8 — Live isolation, then capability bits
+### Slice 8 — 实机隔离，然后能力位
 
-**Objective:** Prove the security invariants on the personal host, then and only then advertise `httpsInspection` / `harExport`.
+**目标：** 在个人宿主机上证明安全不变量，然后才通告 `httpsInspection` / `harExport`。
 
-**Tests (silent boxed runner, not installed `Start.exe`):**
+**测试（静默盒内 runner，非已安装 `Start.exe`）：**
 
-1. Connection-audit and packet-capture regressions still pass.
-2. Box A `curl -I https://example.com`, Box B `curl -I https://1.1.1.1`, host `curl -I https://9.9.9.9`. Box A HAR contains only Box A PID/createTime and example.com. Box B HAR does not contain example.com. Host PID never appears. Each PCAPNG still isolates ciphertext.
-3. Process-scoped session: later boxed children are not decrypted and do not appear in HAR.
-4. Box-scoped session: later children *do* appear after they restart / pick up the sandboxed CA (document if a running Chromium must be restarted).
-5. WinHTTP and a Chromium-based client in the box: at least one successful HTTP/1.1 HTTPS exchange each. If Chromium offers only HTTP/2 and refuses HTTP/1.1, record that as a known MVP limit and still require curl + WinHTTP.
-6. Pinning: a client that pins (or `curl --pinnedpubkey`) fails the MITM handshake; session stays up; PCAPNG has the ciphertext; HAR records `pinningFailed`.
-7. Broker kill: session `FAILED`, new boxed curl to 443 fails, host curl still works, ALE audit still works. After `STOP`, boxed curl to 443 works again.
-8. Direct connect to the broker loopback port without WFP context is refused.
-9. Denied `NetworkAccess` destination is still denied (no redirect bypass).
-10. Host `HKCU` Root store contains the persistent session CA during and after the run (idempotent, not removed on stop). A second sandbox’s virtual Root store unchanged. The box’s virtual Root store is not modified by capture.
-11. Cross-SID / cross-session **process-scoped** HTTPS start still `0xC0000022`.
-12. IPv4 and, if the host has working IPv6 egress, IPv6. Only claim the families actually run.
+1. 连接审计与包捕获回归仍通过。
+2. Box A `curl -I https://example.com`、Box B `curl -I https://1.1.1.1`、宿主 `curl -I https://9.9.9.9`。Box A HAR 只含 Box A PID/createTime 与 example.com。Box B HAR 不含 example.com。宿主 PID 绝不出现。每个 PCAPNG 仍隔离密文。
+3. 进程作用域会话：后来的盒内子进程不被解密且不出现于 HAR。
+4. 盒作用域会话：后来的子进程在重启 / 拾取沙箱 CA 后*确实*出现（若运行中的 Chromium 必须重启则文档化）。
+5. 盒内 WinHTTP 与 Chromium 系客户端：各自至少一次成功的 HTTP/1.1 HTTPS 交换。若 Chromium 只提供 HTTP/2 并拒绝 HTTP/1.1，记为已知 MVP 限制并仍要求 curl + WinHTTP。
+6. 固定：固定（或 `curl --pinnedpubkey`）的客户端使 MITM 握手失败；会话保持；PCAPNG 有密文；HAR 记录 `pinningFailed`。
+7. Broker 击杀：会话 `FAILED`、新盒内 curl 到 443 失败、宿主 curl 仍工作、ALE 审计仍工作。`STOP` 后盒内 curl 到 443 恢复。
+8. 无 WFP 上下文直连 broker loopback 端口被拒绝。
+9. 被拒绝的 `NetworkAccess` 目的仍被拒绝（无重定向绕过）。
+10. 宿主 `HKCU` Root store 运行期间与之后都含持久会话 CA（幂等，stop 不删除）。第二个沙箱的虚拟 Root store 不变。盒的虚拟 Root store 不被捕获修改。
+11. Cross-SID / cross-session **进程作用域** HTTPS 启动仍 `0xC0000022`。
+12. IPv4 与（若宿主有可用 IPv6 出口）IPv6。只声称实际跑过的地址族。
 
-Capability bits turn on only after 1–11 pass. MCP `httpsInspection` / `harExport` become true. SandMan HTTPS Start can enable. HTTP/2, Firefox/NSS, and Win7 SOCKS5 remain out of scope.
-
----
-
-## Verification commands (personal host)
-
-Build / deploy follow the Phase 3 recipes and `kmdutil-driver-reload`.
-
-- Driver swap: sign x64 `SbieDrv.sys`, stop `SbieSvc`, confirm no `SandMan` / leftover handle on `\\Device\\SandboxieDriverApi`, `KmdUtil stop SbieDrv`, copy, hash, `KmdUtil start SbieDrv`, start `SbieSvc`.
-- If only `SbieSvc` / `SbieCapture.exe` changed, do **not** unload the driver.
-- Building `SboxSvc.vcxproj` alone fails (`SbieDll.lib`); use `Sandbox.sln | SbieRelease|x64`.
-- Qt: Community `vcvars64.bat` + the machine’s Qt 6.8.3 MSVC kit (do not reuse the old-PC `C:\Users\Wuldas\.AA\Qt\...` path).
-- Evidence dir: `%LOCALAPPDATA%\Temp\hermes-sandbox-capture-red\`
-- `git diff --check` on every slice.
-- Report only architectures that were actually built (x64).
+只有 1–11 通过后能力位才开启。MCP `httpsInspection` / `harExport` 变 true。SandMan HTTPS Start 可启用。HTTP/2、Firefox/NSS 与 Win7 SOCKS5 仍超出范围。
 
 ---
 
-## Explicitly out of scope (Phase 5 / 4.1)
+## 验证命令（个人宿主）
 
-- HTTP/2, HPACK, WebSocket, gRPC, HTTP/3, QUIC termination
-- Firefox / NSS trust injection
-- Win7 SOCKS5 capture fallback
-- Redirect of ports other than TCP 443
-- Machine-wide sniffing
-- Guaranteed decryption of pinned, mTLS, or ECH-only clients
-- Official EV signing, ARM64 full link, installer packaging
-- Changing `NetworkAccess` semantics so capture can bypass a deny
-- OpenSSL or HTTP parsers in `SbieDrv` / `SbieSvc`
+构建 / 部署遵循 Phase 3 配方与 `kmdutil-driver-reload`。
+
+- 驱动更换：签名 x64 `SbieDrv.sys`、停 `SbieSvc`、确认无 `SandMan` / 残留句柄在 `\\Device\\SandboxieDriverApi`、`KmdUtil stop SbieDrv`、复制、hash、`KmdUtil start SbieDrv`、启动 `SbieSvc`。
+- 若只改了 `SbieSvc` / `SbieCapture.exe`，**不要**卸载驱动。
+- 单独构建 `SboxSvc.vcxproj` 会失败（`SbieDll.lib`）；用 `Sandbox.sln | SbieRelease|x64`。
+- Qt：Community `vcvars64.bat` + 本机 Qt 6.8.3 MSVC kit（不要复用旧 PC 的 `C:\Users\Wuldas\.AA\Qt\...` 路径）。
+- 证据目录：`%LOCALAPPDATA%\Temp\hermes-sandbox-capture-red\`
+- 每个 slice `git diff --check`。
+- 只报告实际构建过的架构（x64）。
+
+---
+
+## 明确排除在范围之外（Phase 5 / 4.1）
+
+- HTTP/2、HPACK、WebSocket、gRPC、HTTP/3、QUIC 终止
+- Firefox / NSS 信任注入
+- Win7 SOCKS5 捕获回退
+- 重定向 TCP 443 之外的端口
+- 机器级嗅探
+- 保证解密固定、mTLS 或仅 ECH 的客户端
+- 官方 EV 签名、ARM64 完整链接、安装器打包
+- 改变 `NetworkAccess` 语义使捕获可绕过拒绝
+- `SbieDrv` / `SbieSvc` 中的 OpenSSL 或 HTTP 解析器
 - `FWPS_STREAM_ACTION_NEED_MORE_DATA`
-- IP-literal HTTPS targets (e.g. `https://1.1.1.1`): Schannel omits SNI for IP addresses and matches the principal against the leaf's SAN, but the broker mints a `DNS:` SAN from the SNI; the handshake fails with `SEC_E_WRONG_PRINCIPAL`. DNS-name targets work and are what Slice 8 exercises.
-- Revocation soft-failure tolerance: sandboxed Schannel outbound credentials get `SCH_CRED_IGNORE_NO_REVOCATION_CHECK | SCH_CRED_IGNORE_REVOCATION_OFFLINE` unconditionally (the MITM leaf has no CRL/OCSP endpoint); this suppresses only "cannot check revocation" soft errors, never `CRYPT_E_REVOKED`, and does not change trust anchors.
+- IP 字面量 HTTPS 目标（如 `https://1.1.1.1`）：Schannel 对 IP 地址省略 SNI 并按叶子 SAN 匹配主体，但 broker 从 SNI 铸造 `DNS:` SAN；握手以 `SEC_E_WRONG_PRINCIPAL` 失败。DNS 名目标可用，且正是 Slice 8 所练习的。
+- 吊销软失败容忍：沙箱化 Schannel 出站凭据无条件获得 `SCH_CRED_IGNORE_NO_REVOCATION_CHECK | SCH_CRED_IGNORE_REVOCATION_OFFLINE`（MITM 叶子无 CRL/OCSP 端点）；这只抑制"无法检查吊销"软错误，绝不抑制 `CRYPT_E_REVOKED`，也不改变信任锚。
 
 ---
 
-## Risks
+## 风险
 
-| Risk | Mitigation |
+| 风险 | 缓解 |
 | --- | --- |
-| Redirect classify accidentally bypasses `NetworkAccess` | ALE AUTH remains first and unchanged; redirect only after permit |
-| Broker death restores direct 443 | Fail-closed: keep redirect to the dead listener until `STOP` |
-| Loopback listener becomes an open proxy | Reject sockets without matching redirect context |
-| Recursive redirect of broker upstream | Copy WFP redirect records; skip `REDIRECTED_BY_SELF` |
-| Host or other-box trusts the CA | Persistent CA imported only into the host user's Root store (once, prompted); the box's virtual Root is never modified |
-| CA private key lands in the box | Helper receives only the public cert bytes |
-| HTTP/2-only Chromium | Force ALPN http/1.1; document refusal as MVP limit; still require curl + WinHTTP |
-| Packet isolation regresses after new terminating callout | Slice 5 hard-gates Phase 2/3 e2e before any HTTPS traffic test |
-| OpenSSL pulled into SbieSvc | vcxproj linkage only on `SbieCapture` / MITM tests |
-| `SandMan` re-holds the driver during reload | Snapshot handles before every unload |
+| 重定向 classify 意外绕过 `NetworkAccess` | ALE AUTH 仍最先且不变；重定向只在允许之后 |
+| broker 死亡恢复直连 443 | Fail-closed：`STOP` 前保持重定向到死监听器 |
+| Loopback 监听器变成开放代理 | 拒绝无匹配重定向上下文的套接字 |
+| broker 上游的递归重定向 | 复制 WFP 重定向记录；跳过 `REDIRECTED_BY_SELF` |
+| 宿主或其它盒信任 CA | 持久 CA 只导入宿主用户 Root store（一次，弹窗）；盒的虚拟 Root 永不被修改 |
+| CA 私钥落进盒 | 辅助只接收公钥证书字节 |
+| 仅 HTTP/2 的 Chromium | 强制 ALPN http/1.1；把拒绝文档化为 MVP 限制；仍要求 curl + WinHTTP |
+| 新终止 callout 后包隔离回归 | Slice 5 在任何 HTTPS 流量测试前用 Phase 2/3 e2e 硬门 |
+| OpenSSL 被拉进 SbieSvc | vcxproj 只在 `SbieCapture` / MITM 测试上链接 |
+| 重载期间 `SandMan` 重新持有驱动 | 每次卸载前快照句柄 |
 
 ---
 
-## Open questions (do not block Slice 0–2)
+## 开放问题（不阻塞 Slice 0–2）
 
-1. If Chromium on this host refuses HTTP/1.1 after ALPN downgrade, Slice 8 still ships on curl + WinHTTP and records Chromium as “pinning-or-ALPN failure + PCAPNG retained”.
-2. Exact in-box cert helper launch API (`MSGID_PROCESS_RUN_SANDBOXED` vs an existing updater helper) is chosen in Slice 6 from the live service surface; Slice 2 only needs a user-mode import function.
-3. Shared-section field for publishing the listen port is chosen in Slice 4/5 next to the existing broker header; do not invent a second section.
+1. 若本宿主 Chromium 在 ALPN 降级后拒绝 HTTP/1.1，Slice 8 仍以 curl + WinHTTP 交付，并把 Chromium 记为"pinning-or-ALPN 失败 + PCAPNG 保留"。
+2. 精确的盒内证书辅助启动 API（`MSGID_PROCESS_RUN_SANDBOXED` 对比既有 updater 辅助）在 Slice 6 从实机服务面选择；Slice 2 只需要用户态导入函数。
+3. 发布监听端口的共享 section 字段在 Slice 4/5 于既有 broker 头旁选择；不要发明第二个 section。
